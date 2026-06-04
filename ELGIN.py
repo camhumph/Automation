@@ -10747,6 +10747,19 @@ a{color:var(--blue)}
     <div id="rl-result" class="mono" style="margin-top:14px;color:var(--green);min-height:24px"></div>
   </div>
 
+  <div class="panel" style="padding:20px;margin-bottom:18px;border-color:rgba(0,229,200,.35)">
+    <div class="phdr" style="margin:-20px -20px 18px">CMS XT SIGNATURE MATCHES</div>
+    <div class="notice" style="margin-bottom:14px">
+      Run the SolidWorks macro first. It auto-uploads XT_Export_Job_Signature.csv into ELGIN. Then enter that job here to see previous jobs with matching TCP/BCP, holders, and pots by size, mass, and center/COG.
+    </div>
+    <div class="row" style="gap:10px;align-items:end;margin-bottom:12px">
+      <div class="col" style="min-width:180px"><div class="lbl">Job Number</div><input id="sig-job" class="inp inp-g" placeholder="J8423"></div>
+      <div class="col" style="min-width:110px"><div class="lbl">Limit</div><input id="sig-limit" class="inp" type="number" min="1" max="50" value="10"></div>
+      <button class="btn-p" onclick="loadSignatureMatches()">SHOW SIGNATURE MATCHES</button>
+    </div>
+    <div id="sig-result" class="mono" style="min-height:32px;color:var(--dim)">No signature job loaded yet.</div>
+  </div>
+
   <div class="grid2">
     <div class="panel" style="overflow:hidden"><div class="phdr">MATCH HISTORY LOG</div><table class="itable"><thead><tr><th>TIME</th><th>SPECS</th><th>MATCHES</th></tr></thead><tbody id="mh-tbody"></tbody></table></div>
     <div class="panel" style="overflow:hidden"><div class="phdr">CATALOG</div><table class="itable"><thead><tr><th>JOB</th><th>DUE</th><th>W</th><th>X/Y/Z</th><th>NOTES</th></tr></thead><tbody id="cat-tbody"></tbody></table></div>
@@ -11219,6 +11232,41 @@ async function doLookup(){
 }
 function renderMH(data){document.getElementById('mh-tbody').innerHTML=data.map(h=>`<tr><td>${esc(h.timestamp||'')}</td><td>${esc(h.specs||'')}</td><td>${esc(h.matches||'')}</td></tr>`).join('');}
 function renderCat(data){document.getElementById('cat-tbody').innerHTML=data.map(r=>`<tr><td style="color:var(--blue);font-weight:800">J${r.job_id}</td><td>${r.due_date||'—'}</td><td>${r.weight||0}</td><td>${r.com_x||0}/${r.com_y||0}/${r.com_z||0}</td><td>${esc(r.notes||'')}</td></tr>`).join('');}
+
+function renderSignatureMatches(payload){
+  const el=document.getElementById('sig-result');
+  if(!el)return;
+  if(!payload){el.innerHTML='<span style="color:var(--dim)">No signature job loaded yet.</span>';return;}
+  if(!payload.has_signature){el.innerHTML=`<span style="color:var(--amber)">No signature has been uploaded for J${esc(payload.job_num||'')} yet. Run the SolidWorks macro or upload XT_Export_Job_Signature.csv.</span>`;return;}
+  const matches=payload.matches||[];
+  if(!matches.length){el.innerHTML=`<span style="color:var(--amber)">Signature found for J${esc(payload.job_num||'')}, but no previous signature jobs were available to compare.</span>`;return;}
+  el.innerHTML=matches.map(m=>{
+    const comps=(m.components||[]).map(c=>`<tr><td>${esc(c.component_role||'')}</td><td>${Number(c.similarity||0).toFixed(1)}%</td><td>${Number(c.size_diff_pct||0).toFixed(2)}%</td><td>${Number(c.mass_diff_pct||0).toFixed(2)}%</td><td>${Number(c.center_distance_in||0).toFixed(3)}</td></tr>`).join('');
+    const missing=(m.missing_candidate||[]).length?`<div style="color:var(--amber);margin-top:6px">Missing in old job: ${esc((m.missing_candidate||[]).join(', '))}</div>`:'';
+    return `<div class="panel" style="padding:12px;margin:10px 0;background:rgba(255,255,255,.03)">
+      <div style="display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap">
+        <div><span style="color:var(--blue);font-weight:900">J${esc(m.job_num||'')}</span> <span style="color:var(--dim)">matched components ${m.matched_components||0}/6</span></div>
+        <div style="font-size:1.2rem;color:var(--green);font-weight:900">${Number(m.score||0).toFixed(1)}%</div>
+      </div>
+      <table class="itable" style="margin-top:8px"><thead><tr><th>PART</th><th>MATCH</th><th>SIZE DIFF</th><th>MASS DIFF</th><th>CENTER DIST IN</th></tr></thead><tbody>${comps}</tbody></table>
+      ${missing}
+    </div>`;
+  }).join('');
+}
+
+async function loadSignatureMatches(){
+  const job=(document.getElementById('sig-job')?.value||'').trim();
+  const limit=Number(document.getElementById('sig-limit')?.value||10);
+  const el=document.getElementById('sig-result');
+  if(!job){if(el)el.innerHTML='<span style="color:var(--red)">Enter a job number first.</span>';return;}
+  if(el)el.innerHTML='<span style="color:var(--dim)">Loading signature matches...</span>';
+  try{
+    const r=await fetch(`/api/job-signatures/${encodeURIComponent(job)}/matches?limit=${encodeURIComponent(limit)}`,{credentials:'same-origin'});
+    const payload=await r.json();
+    if(!r.ok)throw new Error(payload.detail||'Signature match lookup failed');
+    renderSignatureMatches(payload);
+  }catch(e){if(el)el.innerHTML=`<span style="color:var(--red)">${esc(e.message||e)}</span>`;}
+}
 
 function renderEff(day,month,year,machines,series,comps){
   if(!adminOK()){document.getElementById('eff-content').innerHTML='';return;}
