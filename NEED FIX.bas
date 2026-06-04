@@ -112,7 +112,7 @@ Private Const FREEZE_DXF_DRAWING_GRAPHICS As Boolean = True
 Private Const FLIP_ID_HOLDER_CENTER_VIEW_180 As Boolean = True
 Private Const FLIP_ID_HOLDER_CENTER_VIEW_180_FROM_ASSEMBLY As Boolean = False
 
-Private Const OD_HOLDER_CENTER_ROTATION_DEG As Double = 180#
+Private Const OD_HOLDER_CENTER_ROTATION_DEG As Double = 0#
 
 Private Const DIMENSION_J_BLOCK As Boolean = True
 Private Const MULTIVIEW_FIT_SAFETY As Double = 0.9
@@ -3485,7 +3485,7 @@ On Error GoTo ErrHandler
 
             Case "IDHOLDER", "ODHOLDER"
                 If CreateHolderDxfFromAssemblyBottomView(assyModel, dxfPath, quoteName) = False Then
-                    LogLine "WARNING: " & quoteName & " assembly-bottom DXF failed; using part-based fallback."
+                    LogLine "WARNING: " & quoteName & " assembly holder-face DXF failed; using part-based fallback."
                     CreateStandardPrintDxfFromXtPath xtPath, dxfPath, quoteName
                 End If
 
@@ -4417,13 +4417,17 @@ On Error GoTo ErrHandler
     Dim parentPrimary As String
     Dim parentFallback As String
 
-    If NormalizeKey(quoteName) = "IDHOLDER" Then
-        parentPrimary = "*Bottom"
-        parentFallback = CMS_TOP_VIEW_NAME
-    Else
-        parentPrimary = CMS_TOP_VIEW_NAME
-        parentFallback = "*Top"
-    End If
+    Select Case NormalizeKey(quoteName)
+        Case "IDHOLDER"
+            parentPrimary = "*Bottom"
+            parentFallback = CMS_TOP_VIEW_NAME
+        Case "ODHOLDER"
+            parentPrimary = "*Top"
+            parentFallback = CMS_TOP_VIEW_NAME
+        Case Else
+            parentPrimary = CMS_TOP_VIEW_NAME
+            parentFallback = "*Top"
+    End Select
 
     CreateProjectedDxfFromXtPath xtPath, dxfPath, quoteName, _
                                  parentPrimary, parentFallback, True, False, False
@@ -4450,16 +4454,30 @@ On Error GoTo ErrHandler
     tempFolder = Environ$("TEMP") & "\CMS_HOLDER_DXF_" & Format(Now, "yyyymmdd_hhnnss") & "_" & NormalizeKey(quoteName)
     EnsureFolderDeep tempFolder
 
+    Dim holderViewName As String
+    Dim holderViewId As Long
+    Dim holderViewToken As String
+
+    If NormalizeKey(quoteName) = "ODHOLDER" Then
+        holderViewName = "*Top"
+        holderViewId = 5
+        holderViewToken = "TOPVIEW"
+    Else
+        holderViewName = "*Bottom"
+        holderViewId = 6
+        holderViewToken = "BOTTOMVIEW"
+    End If
+
     ' Native assembly, not X_T.
-    tempNativePath = tempFolder & "\" & CurrentJobNumber & "_" & NormalizeKey(quoteName) & "_BOTTOMVIEW_TEMP.sldasm"
+    tempNativePath = tempFolder & "\" & CurrentJobNumber & "_" & NormalizeKey(quoteName) & "_" & holderViewToken & "_TEMP.sldasm"
 
     ApplyCmsTopView assyModel
     StabilizeActiveView assyModel, 100
 
-    assyModel.ShowNamedView2 "*Bottom", 6
+    assyModel.ShowNamedView2 holderViewName, holderViewId
     StabilizeActiveView assyModel, 100
 
-    LogLine quoteName & " holder DXF: saving native temp SLDASM:"
+    LogLine quoteName & " holder DXF: saving native temp SLDASM from " & holderViewName & ":"
     LogLine "  " & tempNativePath
 
     If SaveModelCopyAs(assyModel, tempNativePath) = False Then GoTo CleanExit
@@ -4468,14 +4486,14 @@ On Error GoTo ErrHandler
     Set fso = CreateObject("Scripting.FileSystemObject")
 
     If fso.FileExists(tempNativePath) = False Then
-        LogLine "Holder assembly-bottom DXF: temp native SLDASM was not created."
+        LogLine "Holder assembly " & holderViewName & " DXF: temp native SLDASM was not created."
         GoTo CleanExit
     End If
 
-    CurrentIdHolderDxfFromAssembly = True
+    CurrentIdHolderDxfFromAssembly = (NormalizeKey(quoteName) = "IDHOLDER")
 
     CreateProjectedDxfFromNativePath tempNativePath, dxfPath, quoteName, _
-                                     "*Bottom", "*Top", _
+                                     holderViewName, CMS_TOP_VIEW_NAME, _
                                      True, False, False, False, False
 
     CurrentIdHolderDxfFromAssembly = False
@@ -9058,7 +9076,7 @@ On Error GoTo ErrHandler
     ApplyCmsTopView swModel
     StabilizeActiveView swModel, 100
 
-    LogLine "J BLOCK DXF: saving isolated native SLDASM from corrected CMS_TOP orientation:"
+    LogLine "J BLOCK DXF: saving isolated native SLDASM for right-face center view:"
     LogLine "  " & tempNativePath
 
     If SaveModelCopyAs(swModel, tempNativePath) = False Then GoTo CleanExit
@@ -9071,15 +9089,10 @@ On Error GoTo ErrHandler
         GoTo CleanExit
     End If
 
-    ' If you want the J BLOCK center view to be the same top-down as BASE:
+    ' J BLOCK center/base view must be the right face. Projected views unfold from there.
     CreateProjectedDxfFromNativePath tempNativePath, dxfPath, "J BLOCK", _
-                                     CMS_TOP_VIEW_NAME, "*Top", _
+                                     "*Right", "*Right", _
                                      True, False, False, False, False
-
-    ' If shop later wants the old right-profile parent view instead, replace above with:
-    'CreateProjectedDxfFromNativePath tempNativePath, dxfPath, "J BLOCK", _
-    '                                 "*Right", "*Right", _
-    '                                 True, False, False, False, False
 
     CreateJBlockDxfFromAssemblyTopView = fso.FileExists(dxfPath)
 
