@@ -213,6 +213,8 @@ Private Const STRAIGHTEN_PULLCORE_DXF As Boolean = True
 Private Const PULLCORE_STRAIGHTEN_SIGN As Double = -1#
 Private Const PULLCORE_STRAIGHTEN_MIN_DEG As Double = 2#
 Private Const PULLCORE_FALLBACK_ANGLE_DEG As Double = 32.5
+Private Const CARBON_STEEL_DENSITY_LB_PER_CUIN As Double = 0.284
+Private Const USE_CARBON_STEEL_MASS_FOR_PULLCORE As Boolean = True
 
 ' ============================================================
 ' PULLCORE STOP / FLIPPER CAM COVER PACKAGE SETTINGS
@@ -7055,6 +7057,33 @@ Private Function HasPullcoreLocationToken(ByVal d As String) As Boolean
     Next i
 End Function
 
+Private Function CarbonSteelMassLbFromDims(ByVal L As Double, ByVal W As Double, ByVal T As Double) As Double
+On Error Resume Next
+
+    If L <= 0# Or W <= 0# Or T <= 0# Then Exit Function
+
+    CarbonSteelMassLbFromDims = L * W * T * CARBON_STEEL_DENSITY_LB_PER_CUIN
+End Function
+
+Private Function PullcoreStatusWithBBoxComment(ByRef b As BomInfo, _
+                                               ByVal cadL As Double, _
+                                               ByVal cadW As Double, _
+                                               ByVal cadT As Double, _
+                                               ByVal baseStatus As String) As String
+On Error Resume Next
+
+    PullcoreStatusWithBBoxComment = baseStatus
+
+    If b.hasDims = False Then Exit Function
+    If UCase(Left(baseStatus, 2)) = "OK" Then Exit Function
+
+    PullcoreStatusWithBBoxComment = baseStatus & _
+        " - BBOX BOM " & FormatNumberForCsv(b.BomLength) & "x" & _
+        FormatNumberForCsv(b.BomWidth) & "x" & FormatNumberForCsv(b.BomThickness) & _
+        " CAD " & FormatNumberForCsv(cadL) & "x" & _
+        FormatNumberForCsv(cadW) & "x" & FormatNumberForCsv(cadT)
+End Function
+
 Private Sub AddPullcoreMatchRow(ByRef b As BomInfo, ByVal cadIdx As Long, _
                                 ByVal cadL As Double, ByVal cadW As Double, ByVal cadT As Double)
 
@@ -7068,7 +7097,11 @@ Private Sub AddPullcoreMatchRow(ByRef b As BomInfo, ByVal cadIdx As Long, _
 
     PullcoreMatches(PullcoreMatchCount).quoteName = displayName
     PullcoreMatches(PullcoreMatchCount).Description = b.Description
-    PullcoreMatches(PullcoreMatchCount).material = b.material
+    If USE_CARBON_STEEL_MASS_FOR_PULLCORE Then
+        PullcoreMatches(PullcoreMatchCount).material = "Carbon Steel"
+    Else
+        PullcoreMatches(PullcoreMatchCount).material = b.material
+    End If
     PullcoreMatches(PullcoreMatchCount).Quantity = b.Quantity
 
     PullcoreMatches(PullcoreMatchCount).CadPartIndex = cadIdx
@@ -7098,7 +7131,11 @@ Private Sub AddPullcoreMatchRow(ByRef b As BomInfo, ByVal cadIdx As Long, _
             PullcoreMatches(PullcoreMatchCount).OriginalThickness = parts(cadIdx).Thickness
         End If
 
-        PullcoreMatches(PullcoreMatchCount).Status = ComparePullcoreDimsToBomStatus(b, cadL, cadW, cadT)
+        PullcoreMatches(PullcoreMatchCount).Status = PullcoreStatusWithBBoxComment(b, cadL, cadW, cadT, ComparePullcoreDimsToBomStatus(b, cadL, cadW, cadT))
+
+        If USE_CARBON_STEEL_MASS_FOR_PULLCORE Then
+            parts(cadIdx).massValue = CarbonSteelMassLbFromDims(cadL, cadW, cadT)
+        End If
 
         PullcoreMatches(PullcoreMatchCount).DetectedAngleDeg = _
             EstimatePullcoreAngleFromFittedAndOriginalDeg( _
@@ -7138,6 +7175,10 @@ Private Sub AddPullcoreMatchRow(ByRef b As BomInfo, ByVal cadIdx As Long, _
                 FormatNumberForCsv(cadL) & "/" & _
                 FormatNumberForCsv(cadW) & "/" & _
                 FormatNumberForCsv(cadT)
+
+        If USE_CARBON_STEEL_MASS_FOR_PULLCORE Then
+            LogLine "  Pullcore carbon-steel mass lb=" & FormatNumberForCsv(parts(cadIdx).massValue)
+        End If
 
         LogLine "  Pullcore angle=" & _
                 Format(PullcoreMatches(PullcoreMatchCount).DetectedAngleDeg, "0.00") & _

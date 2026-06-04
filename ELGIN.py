@@ -11233,22 +11233,34 @@ async function doLookup(){
 function renderMH(data){document.getElementById('mh-tbody').innerHTML=data.map(h=>`<tr><td>${esc(h.timestamp||'')}</td><td>${esc(h.specs||'')}</td><td>${esc(h.matches||'')}</td></tr>`).join('');}
 function renderCat(data){document.getElementById('cat-tbody').innerHTML=data.map(r=>`<tr><td style="color:var(--blue);font-weight:800">J${r.job_id}</td><td>${r.due_date||'—'}</td><td>${r.weight||0}</td><td>${r.com_x||0}/${r.com_y||0}/${r.com_z||0}</td><td>${esc(r.notes||'')}</td></tr>`).join('');}
 
+function signatureScoreColor(v){v=Number(v||0);return v>=92?'var(--green)':v>=80?'var(--amber)':'var(--red)';}
+function sigDims(r){return `${Number(r?.length||0).toFixed(3)} x ${Number(r?.width||0).toFixed(3)} x ${Number(r?.thickness||0).toFixed(3)}`;}
+function sigCenter(r){return `${Number(r?.center_x||0).toFixed(3)}, ${Number(r?.center_y||0).toFixed(3)}, ${Number(r?.center_z||0).toFixed(3)}`;}
+function sigMass(r){return `${Number(r?.mass||0).toFixed(3)} lb`;}
+
 function renderSignatureMatches(payload){
   const el=document.getElementById('sig-result');
   if(!el)return;
   if(!payload){el.innerHTML='<span style="color:var(--dim)">No signature job loaded yet.</span>';return;}
   if(!payload.has_signature){el.innerHTML=`<span style="color:var(--amber)">No signature has been uploaded for J${esc(payload.job_num||'')} yet. Run the SolidWorks macro or upload XT_Export_Job_Signature.csv.</span>`;return;}
   const matches=payload.matches||[];
-  if(!matches.length){el.innerHTML=`<span style="color:var(--amber)">Signature found for J${esc(payload.job_num||'')}, but no previous signature jobs were available to compare.</span>`;return;}
-  el.innerHTML=matches.map(m=>{
-    const comps=(m.components||[]).map(c=>`<tr><td>${esc(c.component_role||'')}</td><td>${Number(c.similarity||0).toFixed(1)}%</td><td>${Number(c.size_diff_pct||0).toFixed(2)}%</td><td>${Number(c.mass_diff_pct||0).toFixed(2)}%</td><td>${Number(c.center_distance_in||0).toFixed(3)}</td></tr>`).join('');
-    const missing=(m.missing_candidate||[]).length?`<div style="color:var(--amber);margin-top:6px">Missing in old job: ${esc((m.missing_candidate||[]).join(', '))}</div>`:'';
-    return `<div class="panel" style="padding:12px;margin:10px 0;background:rgba(255,255,255,.03)">
+  const have=(payload.signature_components||[]).join(', ');
+  if(!matches.length){el.innerHTML=`<div style="color:var(--amber)">Signature found for J${esc(payload.job_num||'')}, but no previous signature jobs were available to compare.</div><div style="color:var(--dim);margin-top:6px">Uploaded parts: ${esc(have||'none')}</div>`;return;}
+  el.innerHTML=`<div style="color:var(--dim);margin-bottom:10px">Current job J${esc(payload.job_num||'')} signature parts: ${esc(have||'none')}</div>`+
+  matches.map((m,idx)=>{
+    const comps=(m.components||[]).map(c=>{
+      const cur=c.current||{}, old=c.candidate||{};
+      const rowColor=Number(c.similarity||0)>=92?'rgba(0,255,170,.08)':Number(c.similarity||0)>=80?'rgba(255,193,7,.08)':'rgba(255,80,80,.08)';
+      return `<tr style="background:${rowColor}"><td style="font-weight:900;color:var(--cyan)">${esc(c.component_role||'')}</td><td style="color:${signatureScoreColor(c.similarity)};font-weight:900">${Number(c.similarity||0).toFixed(1)}%</td><td>${sigDims(cur)}<br><span style="color:var(--dim)">${sigDims(old)}</span></td><td>${sigMass(cur)}<br><span style="color:var(--dim)">${sigMass(old)}</span></td><td>${sigCenter(cur)}<br><span style="color:var(--dim)">${sigCenter(old)}</span></td><td>${Number(c.size_diff_pct||0).toFixed(2)}%</td><td>${Number(c.mass_diff_pct||0).toFixed(2)}%</td><td>${Number(c.center_distance_in||0).toFixed(3)}</td></tr>`;
+    }).join('');
+    const missing=(m.missing_candidate||[]).length?`<div style="color:var(--amber);margin-top:8px">Missing in old job: ${esc((m.missing_candidate||[]).join(', '))}</div>`:'';
+    const coverage=Number(m.coverage_pct||0).toFixed(1);
+    return `<div class="panel" style="padding:14px;margin:12px 0;background:rgba(255,255,255,.035);border-color:${signatureScoreColor(m.score)}">
       <div style="display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap">
-        <div><span style="color:var(--blue);font-weight:900">J${esc(m.job_num||'')}</span> <span style="color:var(--dim)">matched components ${m.matched_components||0}/6</span></div>
-        <div style="font-size:1.2rem;color:var(--green);font-weight:900">${Number(m.score||0).toFixed(1)}%</div>
+        <div><span style="color:var(--dim)">#${idx+1}</span> <span style="color:var(--blue);font-weight:900;font-size:1.15rem">J${esc(m.job_num||'')}</span> <span style="color:var(--dim)">components ${m.matched_components||0}/6, coverage ${coverage}%</span></div>
+        <div style="font-size:1.35rem;color:${signatureScoreColor(m.score)};font-weight:900">${Number(m.score||0).toFixed(1)}%</div>
       </div>
-      <table class="itable" style="margin-top:8px"><thead><tr><th>PART</th><th>MATCH</th><th>SIZE DIFF</th><th>MASS DIFF</th><th>CENTER DIST IN</th></tr></thead><tbody>${comps}</tbody></table>
+      <div style="overflow:auto;margin-top:10px"><table class="itable"><thead><tr><th>PART</th><th>MATCH</th><th>CURRENT DIMS / OLD DIMS</th><th>CURRENT MASS / OLD MASS</th><th>CURRENT CENTER / OLD CENTER</th><th>SIZE DIFF</th><th>MASS DIFF</th><th>CENTER DIST</th></tr></thead><tbody>${comps}</tbody></table></div>
       ${missing}
     </div>`;
   }).join('');
