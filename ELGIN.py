@@ -100,6 +100,10 @@ MACHINE_RENAME_MAP = {
 
 DB_PATH = os.environ.get("ELGIN_DB_PATH", os.environ.get("NEXUS_DB_PATH", "shop_analytics_pro.db"))
 ELGIN_SIGNATURE_API_KEY = os.environ.get("ELGIN_SIGNATURE_API_KEY", "cms-signature-upload")
+ELGIN_MATCHING_SOFTWARE_DIR = os.environ.get(
+    "ELGIN_MATCHING_SOFTWARE_DIR",
+    r"\\Mycloudex2ultra\mexico\Cameron's stuff\Matching software",
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(APP_SLUG)
@@ -4709,6 +4713,64 @@ def compare_job_signature_to_previous(conn, job_num: str, limit: int = JOB_SIGNA
     results.sort(key=lambda x: x["score"], reverse=True)
     return results[:max(1, int(limit or JOB_SIGNATURE_DEFAULT_LIMIT))]
 
+
+def sync_matching_software_signatures(conn, folder: str = ELGIN_MATCHING_SOFTWARE_DIR) -> dict:
+    """
+    Import every XT_Export_Job_Signature CSV found in the shared matching folder.
+    This makes newly exported SolidWorks jobs appear in ELGIN without a manual lookup/upload.
+    """
+    result = {"folder": folder, "scanned": 0, "imported_files": 0, "imported_components": 0, "errors": []}
+    if not folder or not os.path.isdir(folder):
+        return result
+
+    try:
+        names = [n for n in os.listdir(folder) if n.lower().endswith(".csv") and "job_signature" in n.lower()]
+    except Exception as exc:
+        result["errors"].append(str(exc))
+        return result
+
+    for name in sorted(names):
+        result["scanned"] += 1
+        path = os.path.join(folder, name)
+        try:
+            with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
+                data = f.read()
+            fallback_job = name.split("_")[0]
+            rows = parse_job_signature_csv_text(data, fallback_job_num=fallback_job)
+            if not rows:
+                continue
+            job_num = normalize_job_num(rows[0].get("job_num") or fallback_job)
+            if not job_num:
+                continue
+            imported = upsert_job_signature_rows(conn, job_num, rows, source_file=path)
+            result["imported_files"] += 1
+            result["imported_components"] += imported
+        except Exception as exc:
+            result["errors"].append(f"{name}: {exc}")
+    return result
+
+
+def recent_signature_match_summaries(conn, limit: int = 8) -> list[dict]:
+    jobs = _rowdicts(conn.execute("""
+        SELECT job_num, MAX(imported_at) AS imported_at
+        FROM job_signature_components
+        GROUP BY job_num
+        ORDER BY imported_at DESC
+        LIMIT ?
+    """, (max(1, int(limit or 8)),)))
+    out = []
+    for row in jobs:
+        job_num = normalize_job_num(row.get("job_num") or "")
+        if not job_num:
+            continue
+        matches = compare_job_signature_to_previous(conn, job_num, limit=3)
+        out.append({
+            "job_num": job_num,
+            "imported_at": row.get("imported_at") or "",
+            "matches": matches,
+        })
+    return out
+
 def job_family_root(conn, job_num: str) -> str:
     """
     Returns the physical/matched family root.
@@ -8701,6 +8763,10 @@ async def get_dashboard(request: Request):
             "urls": get_local_network_addresses(APP_PORT),
         }
 
+        signature_sync = sync_matching_software_signatures(conn)
+        signature_recent_matches = recent_signature_match_summaries(conn)
+        conn.commit()
+
         return {
             "app": {
                 "name": APP_NAME,
@@ -8723,6 +8789,8 @@ async def get_dashboard(request: Request):
             "job_status_log": job_status_log,
             "catalog": catalog,
             "match_history": match_history,
+            "signature_sync": signature_sync,
+            "signature_recent_matches": signature_recent_matches,
             "shop_board_rows": shop_board_rows,
             "eff_day": merge_efficiency_rows(eff_day, "day") if admin_ok else [],
             "eff_month": merge_efficiency_rows(eff_month, "month") if admin_ok else [],
@@ -10758,6 +10826,7 @@ a{color:var(--blue)}
       <button class="btn-p" onclick="loadSignatureMatches()">SHOW SIGNATURE MATCHES</button>
     </div>
     <div id="sig-result" class="mono" style="min-height:32px;color:var(--dim)">No signature job loaded yet.</div>
+    <div style="margin-top:16px"><div class="lbl" style="color:var(--cyan);margin-bottom:8px">RECENT AUTO-IMPORTED SIGNATURE MATCHES</div><div id="sig-recent">Loading recent signature matches...</div></div>
   </div>
 
   <div class="grid2">
@@ -10970,7 +11039,7 @@ function renderData(d){
   if(activeTab==='fleet')renderFleet(d.machines);
   if(activeTab==='jobs'){renderJobSeries(d.job_series||[],d.job_components||[]);renderJobLog(d.job_status_log||[]);}
   if(activeTab==='sched')renderSchedule(d.job_series||[],d.job_components||[],d.shop_board_rows||[]);
-  if(activeTab==='match'){renderMH(d.match_history||[]);renderCat(d.catalog||[]);}
+  if(activeTab==='match'){renderMH(d.match_history||[]);renderCat(d.catalog||[]);renderSignatureRecent(d.signature_recent_matches||[],d.signature_sync||{});}
   if(activeTab==='eff')renderEff(d.eff_day,d.eff_month,d.eff_year,d.machines,d.job_series||[],d.job_components||[]);
   if(activeTab==='tools')renderTools(d.tools||[]);
   if(activeTab==='inv')renderInv(d.inventory||[],d.summary||{});
@@ -11232,6 +11301,20 @@ async function doLookup(){
 }
 function renderMH(data){document.getElementById('mh-tbody').innerHTML=data.map(h=>`<tr><td>${esc(h.timestamp||'')}</td><td>${esc(h.specs||'')}</td><td>${esc(h.matches||'')}</td></tr>`).join('');}
 function renderCat(data){document.getElementById('cat-tbody').innerHTML=data.map(r=>`<tr><td style="color:var(--blue);font-weight:800">J${r.job_id}</td><td>${r.due_date||'—'}</td><td>${r.weight||0}</td><td>${r.com_x||0}/${r.com_y||0}/${r.com_z||0}</td><td>${esc(r.notes||'')}</td></tr>`).join('');}
+
+function renderSignatureRecent(items,sync){
+  const el=document.getElementById('sig-recent');
+  if(!el)return;
+  const syncNote=sync&&sync.folder?`<div style="color:var(--dim);margin-bottom:8px">Watching: ${esc(sync.folder)} · imported files ${sync.imported_files||0} · components ${sync.imported_components||0}</div>`:'';
+  if(!items.length){el.innerHTML=syncNote+'<div style="color:var(--amber)">No signature files found yet. Run the SolidWorks macro and make sure it saves into the Matching software folder.</div>';return;}
+  el.innerHTML=syncNote+items.map(it=>{
+    const best=(it.matches||[])[0];
+    if(!best)return `<div class="panel" style="padding:10px;margin:8px 0"><b>J${esc(it.job_num)}</b> <span style="color:var(--dim)">No previous signatures to compare yet.</span></div>`;
+    return `<div class="panel" style="padding:10px;margin:8px 0;cursor:pointer;border-color:${signatureScoreColor(best.score)}" onclick="document.getElementById('sig-job').value='${esc(it.job_num)}';loadSignatureMatches();">
+      <div style="display:flex;justify-content:space-between;gap:10px;align-items:center"><div><b style="color:var(--blue)">J${esc(it.job_num)}</b> best match <b>J${esc(best.job_num)}</b> <span style="color:var(--dim)">${best.matched_components||0}/6 parts</span></div><div style="color:${signatureScoreColor(best.score)};font-weight:900">${Number(best.score||0).toFixed(1)}%</div></div>
+    </div>`;
+  }).join('');
+}
 
 function signatureScoreColor(v){v=Number(v||0);return v>=92?'var(--green)':v>=80?'var(--amber)':'var(--red)';}
 function sigDims(r){return `${Number(r?.length||0).toFixed(3)} x ${Number(r?.width||0).toFixed(3)} x ${Number(r?.thickness||0).toFixed(3)}`;}

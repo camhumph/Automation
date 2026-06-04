@@ -31,6 +31,7 @@ Private Const LOCAL_WORKSPACE_ROOT As String = "C:\CMS_Local_Workspace"
 Private Const AUTO_UPLOAD_JOB_SIGNATURE_TO_ELGIN As Boolean = True
 Private Const ELGIN_API_BASE_URL As String = "http://localhost:2926"
 Private Const ELGIN_SIGNATURE_API_KEY As String = "cms-signature-upload"
+Private Const MATCHING_SOFTWARE_FOLDER As String = "\\Mycloudex2ultra\mexico\Cameron's stuff\Matching software"
 
 Private Const PUSH_OUTPUTS_TO_NETWORK As Boolean = False
 Private Const DELETE_EXTRACTED_ZIP_AFTER_FLATTEN As Boolean = True
@@ -838,6 +839,7 @@ On Error GoTo ErrHandler
     jobSignaturePath = CurrentJobFolder & "\" & JOB_SIGNATURE_REPORT_FILE
 
     WriteJobSignatureCsv jobSignaturePath
+    CopyJobSignatureToMatchingFolder jobSignaturePath
     UploadJobSignatureToElgin jobSignaturePath
 
     If CREATE_PULLCORE_DIMENSIONS_EXCEL And PullcoreMatchCount > 0 Then
@@ -8113,9 +8115,26 @@ On Error GoTo ErrHandler
     End If
 
     ' Fallback: allow extended/rotated assembly boxes so every pullcore can be tested.
-    If dL <= 1.5 And dW <= 0.9 And dT <= 0.45 Then
+    ' Examples seen from SolidWorks best-fit boxes: 4.69x2.25x1.50, 4.94x2.13x1.38,
+    ' 4.88x2.13x1.50 for a 4.00x2.50x1.375 cam, and 3.38x1.25x0.75 for keys.
+    If dL <= 2# And dW <= 1.25 And dT <= 0.65 Then
         IsRoughPullcoreCandidateForBom = True
         Exit Function
+    End If
+
+    Dim bomVol As Double
+    Dim cadVol As Double
+
+    bomVol = b.BomLength * b.BomWidth * b.BomThickness
+    cadVol = cadL * cadW * cadT
+
+    If bomVol > 0# And cadVol > 0# Then
+        If cadVol >= bomVol * 0.65 And cadVol <= bomVol * 1.85 Then
+            If dT <= 0.75 Then
+                IsRoughPullcoreCandidateForBom = True
+                Exit Function
+            End If
+        End If
     End If
 
     Exit Function
@@ -10889,6 +10908,36 @@ On Error Resume Next
               FormatNumberForCsv(centerZ) & "," & _
               CStr(hasCenter) & "," & _
               CsvText(statusText)
+End Sub
+
+Private Sub CopyJobSignatureToMatchingFolder(ByVal csvPath As String)
+On Error GoTo ErrHandler
+
+    If MATCHING_SOFTWARE_FOLDER = "" Then Exit Sub
+    If csvPath = "" Then Exit Sub
+
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    If fso.FileExists(csvPath) = False Then Exit Sub
+
+    EnsureFolderDeep MATCHING_SOFTWARE_FOLDER
+
+    Dim destPath As String
+    destPath = MATCHING_SOFTWARE_FOLDER & "\" & CurrentJobNumber & "_" & JOB_SIGNATURE_REPORT_FILE
+
+    fso.CopyFile csvPath, destPath, True
+
+    LogLine "Copied job signature to matching folder: " & destPath
+
+CleanExit:
+    On Error Resume Next
+    Set fso = Nothing
+    Exit Sub
+
+ErrHandler:
+    LogLine "WARNING: CopyJobSignatureToMatchingFolder error: " & Err.Description
+    Resume CleanExit
 End Sub
 
 Private Sub UploadJobSignatureToElgin(ByVal csvPath As String)
