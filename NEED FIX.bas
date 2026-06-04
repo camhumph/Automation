@@ -244,6 +244,7 @@ Private Const swOpenDocOptions_ReadOnly As Long = 2
 
 Private Const swSaveAsCurrentVersion As Long = 0
 Private Const swSaveAsOptions_Silent As Long = 1
+Private Const swSaveAsOptions_Copy As Long = 2
 
 Private Const swSolidBody As Long = 0
 
@@ -3916,6 +3917,41 @@ ErrHandler:
     LogLine "SaveModelAs error: " & Err.Description
 End Sub
 
+Private Function SaveModelCopyAs(ByVal model As Object, ByVal fullPath As String) As Boolean
+On Error GoTo ErrHandler
+
+    SaveModelCopyAs = False
+
+    If model Is Nothing Then Exit Function
+    If fullPath = "" Then Exit Function
+
+    Dim errs As Long
+    Dim warns As Long
+
+    LogLine "Saving copy: " & fullPath
+    EnsureSwHidden
+
+    ' Use Copy so temporary native drawing sources do not rename/repath the
+    ' live assembly document. Without this, the next export can keep using a
+    ' stale COM object after the temp DXF source is closed/deleted.
+    model.Extension.SaveAs3 fullPath, _
+                            swSaveAsCurrentVersion, _
+                            swSaveAsOptions_Silent + swSaveAsOptions_Copy, _
+                            Nothing, Nothing, errs, warns
+
+    LogLine "Save copy done. Errors=" & errs & " Warnings=" & warns
+
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    SaveModelCopyAs = fso.FileExists(fullPath)
+    Exit Function
+
+ErrHandler:
+    LogLine "SaveModelCopyAs error: " & Err.Description
+    SaveModelCopyAs = False
+End Function
+
 Private Sub ExportIndividualHolderAndClampingDxfs(ByVal outputFolder As String)
 On Error Resume Next
     LogLine "ExportIndividualHolderAndClampingDxfs skipped. DXFs created during XT export."
@@ -4087,7 +4123,7 @@ On Error GoTo ErrHandler
     LogLine "BASE DXF: saving selected-component native temp SLDASM:"
     LogLine "  " & tempNativePath
 
-    SaveModelAs swModel, tempNativePath
+    If SaveModelCopyAs(swModel, tempNativePath) = False Then GoTo CleanExit
 
     CreateProjectedDxfFromNativePath tempNativePath, mainDxfPath, "MAIN ASSEMBLY", _
                                      CMS_TOP_VIEW_NAME, "*Top", _
@@ -4299,7 +4335,7 @@ On Error GoTo ErrHandler
     LogLine "HOLDERS DXF: saving native temp SLDASM:"
     LogLine "  " & holdersTempNativePath
 
-    SaveModelAs swModel, holdersTempNativePath
+    If SaveModelCopyAs(swModel, holdersTempNativePath) = False Then GoTo CleanExit
 
     CreateProjectedDxfFromNativePath holdersTempNativePath, holdersDxfPath, "HOLDERS", _
                                      CMS_TOP_VIEW_NAME, "*Top", _
@@ -4426,7 +4462,7 @@ On Error GoTo ErrHandler
     LogLine quoteName & " holder DXF: saving native temp SLDASM:"
     LogLine "  " & tempNativePath
 
-    SaveModelAs assyModel, tempNativePath
+    If SaveModelCopyAs(assyModel, tempNativePath) = False Then GoTo CleanExit
 
     Dim fso As Object
     Set fso = CreateObject("Scripting.FileSystemObject")
@@ -4494,7 +4530,7 @@ On Error GoTo ErrHandler
     LogLine quoteName & " clamping plate DXF: saving native temp SLDASM:"
     LogLine "  " & tempNativePath
 
-    SaveModelAs assyModel, tempNativePath
+    If SaveModelCopyAs(assyModel, tempNativePath) = False Then GoTo CleanExit
 
     Dim fso As Object
     Set fso = CreateObject("Scripting.FileSystemObject")
@@ -9025,7 +9061,7 @@ On Error GoTo ErrHandler
     LogLine "J BLOCK DXF: saving isolated native SLDASM from corrected CMS_TOP orientation:"
     LogLine "  " & tempNativePath
 
-    SaveModelAs swModel, tempNativePath
+    If SaveModelCopyAs(swModel, tempNativePath) = False Then GoTo CleanExit
 
     Dim fso As Object
     Set fso = CreateObject("Scripting.FileSystemObject")
