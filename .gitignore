@@ -1,0 +1,4 @@
+__pycache__/
+*.py[cod]
+shop_analytics_pro.db
+uploads/
