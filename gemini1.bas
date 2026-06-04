@@ -7080,6 +7080,10 @@ Private Sub AddPullcoreMatchRow(ByRef b As BomInfo, ByVal cadIdx As Long, _
 
     If cadIdx > 0 Then
 
+        fitL = RoundDimInches(fitL)
+        fitW = RoundDimInches(fitW)
+        fitT = RoundDimInches(fitT)
+
         PullcoreMatches(PullcoreMatchCount).CadThickness = parts(cadIdx).Thickness
         PullcoreMatches(PullcoreMatchCount).CadWidth = parts(cadIdx).Width
         PullcoreMatches(PullcoreMatchCount).CadLength = parts(cadIdx).Length
@@ -7171,10 +7175,12 @@ On Error GoTo ErrHandler
 
     Dim worst As Double
 
-    worst = Abs(cadL - b.BomLength)
+    worst = Abs(RoundDimInches(cadL) - RoundDimInches(b.BomLength))
 
-    If Abs(cadW - b.BomWidth) > worst Then worst = Abs(cadW - b.BomWidth)
-    If Abs(cadT - b.BomThickness) > worst Then worst = Abs(cadT - b.BomThickness)
+    If Abs(RoundDimInches(cadW) - RoundDimInches(b.BomWidth)) > worst Then _
+        worst = Abs(RoundDimInches(cadW) - RoundDimInches(b.BomWidth))
+    If Abs(RoundDimInches(cadT) - RoundDimInches(b.BomThickness)) > worst Then _
+        worst = Abs(RoundDimInches(cadT) - RoundDimInches(b.BomThickness))
 
     If worst <= DIM_OK_TOL Then
         ComparePullcoreDimsToBomStatus = "OK"
@@ -8007,9 +8013,9 @@ NextPullcoreCandidate:
 
                             Dim d As Double
 
-                            d = Abs(candL(j) - BomRows(rIdx(i)).BomLength) * 3# _
-                              + Abs(candW(j) - BomRows(rIdx(i)).BomWidth) _
-                              + Abs(candT(j) - BomRows(rIdx(i)).BomThickness)
+                            d = Abs(RoundDimInches(candL(j)) - RoundDimInches(BomRows(rIdx(i)).BomLength)) * 3# _
+                              + Abs(RoundDimInches(candW(j)) - RoundDimInches(BomRows(rIdx(i)).BomWidth)) _
+                              + Abs(RoundDimInches(candT(j)) - RoundDimInches(BomRows(rIdx(i)).BomThickness))
 
                             If d < bestDist Then
                                 bestDist = d
@@ -8055,6 +8061,30 @@ ErrHandler:
     LogLine "AssignPullcoreClass error: " & Err.Description
 End Sub
 
+Private Function RoundDimInches(ByVal v As Double) As Double
+    RoundDimInches = Round(v, DIM_DECIMALS)
+End Function
+
+Private Function PullcoreDimMatchesBomAxis(ByVal cadVal As Double, _
+                                           ByVal bomVal As Double, _
+                                           ByVal axisTol As Double) As Boolean
+On Error GoTo ErrHandler
+
+    PullcoreDimMatchesBomAxis = False
+
+    If RoundDimInches(cadVal) = RoundDimInches(bomVal) Then
+        PullcoreDimMatchesBomAxis = True
+        Exit Function
+    End If
+
+    PullcoreDimMatchesBomAxis = (Abs(cadVal - bomVal) <= axisTol)
+
+    Exit Function
+
+ErrHandler:
+    PullcoreDimMatchesBomAxis = False
+End Function
+
 Private Function IsPullcoreFittedExactMatchForBom(ByRef b As BomInfo, _
                                                   ByVal fitL As Double, _
                                                   ByVal fitW As Double, _
@@ -8070,9 +8100,9 @@ On Error GoTo ErrHandler
 
     If fitL <= 0 Or fitW <= 0 Or fitT <= 0 Then Exit Function
 
-    If Abs(fitL - b.BomLength) <= PULLCORE_L_TOL And _
-       Abs(fitW - b.BomWidth) <= PULLCORE_W_TOL And _
-       Abs(fitT - b.BomThickness) <= PULLCORE_T_TOL Then
+    If PullcoreDimMatchesBomAxis(fitL, b.BomLength, PULLCORE_L_TOL) And _
+       PullcoreDimMatchesBomAxis(fitW, b.BomWidth, PULLCORE_W_TOL) And _
+       PullcoreDimMatchesBomAxis(fitT, b.BomThickness, PULLCORE_T_TOL) Then
         IsPullcoreFittedExactMatchForBom = True
     End If
 
@@ -8106,12 +8136,19 @@ On Error GoTo ErrHandler
     Dim dW As Double
     Dim dT As Double
 
-    dL = Abs(cadL - b.BomLength)
-    dW = Abs(cadW - b.BomWidth)
-    dT = Abs(cadT - b.BomThickness)
+    dL = Abs(RoundDimInches(cadL) - RoundDimInches(b.BomLength))
+    dW = Abs(RoundDimInches(cadW) - RoundDimInches(b.BomWidth))
+    dT = Abs(RoundDimInches(cadT) - RoundDimInches(b.BomThickness))
 
-    ' Primary match: exact/fitted bounding box should be very close to BOM.
-    If dL <= PULLCORE_L_TOL And dW <= PULLCORE_W_TOL And dT <= PULLCORE_T_TOL Then
+    ' Primary match: rounded raw geometry should match BOM at display precision.
+    If dL = 0# And dW = 0# And dT = 0# Then
+        IsRoughPullcoreCandidateForBom = True
+        Exit Function
+    End If
+
+    If PullcoreDimMatchesBomAxis(cadL, b.BomLength, PULLCORE_L_TOL) And _
+       PullcoreDimMatchesBomAxis(cadW, b.BomWidth, PULLCORE_W_TOL) And _
+       PullcoreDimMatchesBomAxis(cadT, b.BomThickness, PULLCORE_T_TOL) Then
         IsRoughPullcoreCandidateForBom = True
         Exit Function
     End If
