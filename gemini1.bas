@@ -22,17 +22,22 @@ Option Explicit
 ' USER SETTINGS
 ' ============================================================
 
-Private Const ROOT_JOB_PATH As String = "C:\Users\lenovo\Desktop\000000005.May 2026"
+Private Const ROOT_JOB_PATH As String = "\\Mycloudex2ultra\mexico\Downloads"
 Private Const EXTRACT_FOLDER_NAME As String = "_EXTRACTED_ZIP"
 Private Const OUTPUT_FOLDER_SUFFIX As String = " PRINTS"
 
 Private Const LOCAL_WORKSPACE_ROOT As String = "C:\CMS_Local_Workspace"
+
+Private Const AUTO_UPLOAD_JOB_SIGNATURE_TO_ELGIN As Boolean = True
+Private Const ELGIN_API_BASE_URL As String = "http://localhost:2926"
+Private Const ELGIN_SIGNATURE_API_KEY As String = "cms-signature-upload"
 
 Private Const PUSH_OUTPUTS_TO_NETWORK As Boolean = False
 Private Const DELETE_EXTRACTED_ZIP_AFTER_FLATTEN As Boolean = True
 
 Private Const USE_ACTIVE_SOLIDWORKS_DOC_FIRST As Boolean = False
 Private Const SHOW_ERROR_MESSAGES As Boolean = True
+Private Const LIMIT_JOB_SEARCH_TO_CURRENT_AND_PREVIOUS_MONTH As Boolean = True
 
 Private Const READ_PDF_BOM_WITH_PDFTOTEXT As Boolean = True
 Private Const PDFTOTEXT_EXE As String = "C:\Users\lenovo\Downloads\New folder (9)\poppler-26.02.0\Library\bin\pdftotext.exe"
@@ -86,6 +91,7 @@ Private Const PERSIST_CMS_TOP_AS_STANDARD_VIEWS_BEFORE_BASE_SAVE As Boolean = Tr
 Private Const DISABLE_STABILIZE_DELAYS As Boolean = True
 Private Const DISABLE_MAIN_VIEWPORT_GRAPHICS As Boolean = True
 Private Const RUN_SOLIDWORKS_INVISIBLE As Boolean = True
+Private Const ENABLE_EXPORT_LOG As Boolean = False
 
 ' ============================================================
 ' TOP/BOT INSERT GEOMETRY FALLBACK
@@ -112,7 +118,7 @@ Private Const FREEZE_DXF_DRAWING_GRAPHICS As Boolean = True
 Private Const FLIP_ID_HOLDER_CENTER_VIEW_180 As Boolean = True
 Private Const FLIP_ID_HOLDER_CENTER_VIEW_180_FROM_ASSEMBLY As Boolean = False
 
-Private Const OD_HOLDER_CENTER_ROTATION_DEG As Double = 180#
+Private Const OD_HOLDER_CENTER_ROTATION_DEG As Double = 0#
 
 Private Const DIMENSION_J_BLOCK As Boolean = True
 Private Const MULTIVIEW_FIT_SAFETY As Double = 0.9
@@ -133,6 +139,7 @@ Private Const PI_VALUE As Double = 3.14159265358979
 
 Private Const CREATE_PULLCORE_DIMENSIONS_EXCEL As Boolean = True
 Private Const PULLCORE_DIMENSIONS_REPORT_FILE As String = "Pull Core Dimensions.xlsx"
+Private Const JOB_SIGNATURE_REPORT_FILE As String = "XT_Export_Job_Signature.csv"
 
 ' ============================================================
 ' MAIN ASSEMBLY / HOLDERS PACKAGE SETTINGS
@@ -192,12 +199,14 @@ Private Const CREATE_PULLCORE_CAM_KEY_PACKAGE As Boolean = True
 Private Const PULLCORE_CAM_KEY_FOLDER_NAME As String = "PULLCORE CAM AND KEY"
 
 Private Const AUTO_LABEL_PULLCORE_ID_OD_BY_HEIGHT As Boolean = True
-Private Const PULLCORE_ID_OD_HEIGHT_AXIS As String = "AUTO"
+Private Const PULLCORE_ID_OD_HEIGHT_AXIS As String = "Y"
 Private Const PULLCORE_ID_IS_HIGHER As Boolean = True
 
 Private Const PULLCORE_T_TOL As Double = 0.175
 Private Const PULLCORE_W_TOL As Double = 0.25
 Private Const PULLCORE_L_TOL As Double = 0.35
+Private Const PULLCORE_COMPARE_DECIMALS As Long = 2
+Private Const PULLCORE_ROUND_MATCH_TOL As Double = 0.011
 
 Private Const USE_PULLCORE_BEST_FIT_BBOX As Boolean = True
 Private Const PULLCORE_BEST_FIT_ALL_PARTS As Boolean = False
@@ -244,11 +253,17 @@ Private Const swOpenDocOptions_ReadOnly As Long = 2
 
 Private Const swSaveAsCurrentVersion As Long = 0
 Private Const swSaveAsOptions_Silent As Long = 1
+Private Const swSaveAsOptions_Copy As Long = 2
 
 Private Const swSolidBody As Long = 0
 
 Private Const swComponentHidden As Long = 0
 Private Const swComponentVisible As Long = 1
+Private Const swComponentLightweight As Long = 2
+Private Const swComponentFullyResolved As Long = 3
+
+Private Const swBoundingBoxType_BestFit As Long = 1
+Private Const swBoundingBoxType_Centric As Long = 0
 
 Private Const xlCalculationManual As Long = -4135
 Private Const xlOpenXMLWorkbook As Long = 51
@@ -494,9 +509,11 @@ On Error GoTo ErrHandler
             CloseAllDocumentsSafely
             Set swModel = Nothing
             Set swAssy = Nothing
+            Set ExportFilePaths = Nothing
             Set SpecialBomCadMatches = Nothing
             Set SpecialBomCadQuoteNames = Nothing
             Set PullcoreBestFitDimCache = Nothing
+            ReleaseSolidWorksMemory "after batch job"
 
             Erase parts
             Erase BomRows
@@ -512,7 +529,7 @@ On Error GoTo ErrHandler
             PullcoreIdOdHeightAxisUsed = ""
 
             DoEvents
-            WaitMilliseconds 500
+            WaitMilliseconds 100
             DoEvents
 
         End If
@@ -822,7 +839,13 @@ On Error GoTo ErrHandler
 
     WriteExportCheckCsv CurrentJobFolder & "\XT_Export_BOM_Match_Report.csv"
 
-    If CREATE_PULLCORE_DIMENSIONS_EXCEL Then
+    Dim jobSignaturePath As String
+    jobSignaturePath = CurrentJobFolder & "\" & JOB_SIGNATURE_REPORT_FILE
+
+    WriteJobSignatureCsv jobSignaturePath
+    UploadJobSignatureToElgin jobSignaturePath
+
+    If CREATE_PULLCORE_DIMENSIONS_EXCEL And PullcoreMatchCount > 0 Then
         LogStart "Write Pull Core Dimensions Excel"
         WritePullCoreDimensionsExcel PullCoreDimensionsReportPath
         LogDone "Write Pull Core Dimensions Excel"
@@ -1046,6 +1069,26 @@ On Error Resume Next
         swApp.CloseDoc swDoc.GetTitle
         Set swDoc = nextDoc
     Loop
+
+    Set swDoc = Nothing
+    Set nextDoc = Nothing
+
+    ReleaseSolidWorksMemory "CloseAllDocumentsSafely"
+End Sub
+
+Private Sub ReleaseSolidWorksMemory(Optional ByVal reason As String = "")
+On Error Resume Next
+
+    If Not swModel Is Nothing Then swModel.ClearSelection2 True
+
+    If Not swApp Is Nothing Then
+        swApp.CommandInProgress = False
+        swApp.UserControl = False
+    End If
+
+    Set DxfFreezeDoc = Nothing
+
+    DoEvents
 End Sub
 
 Private Sub DeleteFolderSafe(ByVal folderPath As String)
@@ -1977,9 +2020,7 @@ On Error Resume Next
 
     If model Is Nothing Then Exit Sub
 
-    If DISABLE_STABILIZE_DELAYS Then
-        waitMs = 0
-    End If
+    If DISABLE_STABILIZE_DELAYS Then Exit Sub
 
     model.ViewZoomtofit2
     model.GraphicsRedraw2
@@ -3176,6 +3217,7 @@ On Error GoTo ErrHandler
     For i = 1 To ExportCount
         LogLine "Exporting item " & i & "/" & ExportCount & ": " & ExportRows(i).quoteName
         ExportOneMatchedPartAsXt ExportRows(i), outputFolder, i
+        ReleaseSolidWorksMemory "after export item"
         DoEvents
     Next i
 
@@ -3484,7 +3526,7 @@ On Error GoTo ErrHandler
 
             Case "IDHOLDER", "ODHOLDER"
                 If CreateHolderDxfFromAssemblyBottomView(assyModel, dxfPath, quoteName) = False Then
-                    LogLine "WARNING: " & quoteName & " assembly-bottom DXF failed; using part-based fallback."
+                    LogLine "WARNING: " & quoteName & " assembly holder-face DXF failed; using part-based fallback."
                     CreateStandardPrintDxfFromXtPath xtPath, dxfPath, quoteName
                 End If
 
@@ -3916,6 +3958,41 @@ ErrHandler:
     LogLine "SaveModelAs error: " & Err.Description
 End Sub
 
+Private Function SaveModelCopyAs(ByVal model As Object, ByVal fullPath As String) As Boolean
+On Error GoTo ErrHandler
+
+    SaveModelCopyAs = False
+
+    If model Is Nothing Then Exit Function
+    If fullPath = "" Then Exit Function
+
+    Dim errs As Long
+    Dim warns As Long
+
+    LogLine "Saving copy: " & fullPath
+    EnsureSwHidden
+
+    ' Use Copy so temporary native drawing sources do not rename/repath the
+    ' live assembly document. Without this, the next export can keep using a
+    ' stale COM object after the temp DXF source is closed/deleted.
+    model.Extension.SaveAs3 fullPath, _
+                            swSaveAsCurrentVersion, _
+                            swSaveAsOptions_Silent + swSaveAsOptions_Copy, _
+                            Nothing, Nothing, errs, warns
+
+    LogLine "Save copy done. Errors=" & errs & " Warnings=" & warns
+
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    SaveModelCopyAs = fso.FileExists(fullPath)
+    Exit Function
+
+ErrHandler:
+    LogLine "SaveModelCopyAs error: " & Err.Description
+    SaveModelCopyAs = False
+End Function
+
 Private Sub ExportIndividualHolderAndClampingDxfs(ByVal outputFolder As String)
 On Error Resume Next
     LogLine "ExportIndividualHolderAndClampingDxfs skipped. DXFs created during XT export."
@@ -4087,7 +4164,7 @@ On Error GoTo ErrHandler
     LogLine "BASE DXF: saving selected-component native temp SLDASM:"
     LogLine "  " & tempNativePath
 
-    SaveModelAs swModel, tempNativePath
+    If SaveModelCopyAs(swModel, tempNativePath) = False Then GoTo CleanExit
 
     CreateProjectedDxfFromNativePath tempNativePath, mainDxfPath, "MAIN ASSEMBLY", _
                                      CMS_TOP_VIEW_NAME, "*Top", _
@@ -4299,7 +4376,7 @@ On Error GoTo ErrHandler
     LogLine "HOLDERS DXF: saving native temp SLDASM:"
     LogLine "  " & holdersTempNativePath
 
-    SaveModelAs swModel, holdersTempNativePath
+    If SaveModelCopyAs(swModel, holdersTempNativePath) = False Then GoTo CleanExit
 
     CreateProjectedDxfFromNativePath holdersTempNativePath, holdersDxfPath, "HOLDERS", _
                                      CMS_TOP_VIEW_NAME, "*Top", _
@@ -4381,13 +4458,14 @@ On Error GoTo ErrHandler
     Dim parentPrimary As String
     Dim parentFallback As String
 
-    If NormalizeKey(quoteName) = "IDHOLDER" Then
-        parentPrimary = "*Bottom"
-        parentFallback = CMS_TOP_VIEW_NAME
-    Else
-        parentPrimary = CMS_TOP_VIEW_NAME
-        parentFallback = "*Top"
-    End If
+    Select Case NormalizeKey(quoteName)
+        Case "IDHOLDER", "ODHOLDER"
+            parentPrimary = "*Top"
+            parentFallback = CMS_TOP_VIEW_NAME
+        Case Else
+            parentPrimary = CMS_TOP_VIEW_NAME
+            parentFallback = "*Top"
+    End Select
 
     CreateProjectedDxfFromXtPath xtPath, dxfPath, quoteName, _
                                  parentPrimary, parentFallback, True, False, False
@@ -4414,32 +4492,41 @@ On Error GoTo ErrHandler
     tempFolder = Environ$("TEMP") & "\CMS_HOLDER_DXF_" & Format(Now, "yyyymmdd_hhnnss") & "_" & NormalizeKey(quoteName)
     EnsureFolderDeep tempFolder
 
+    Dim holderViewName As String
+    Dim holderViewId As Long
+    Dim holderViewToken As String
+
+    ' Shop wants both holder detail DXFs from the top face.
+    holderViewName = "*Top"
+    holderViewId = 5
+    holderViewToken = "TOPVIEW"
+
     ' Native assembly, not X_T.
-    tempNativePath = tempFolder & "\" & CurrentJobNumber & "_" & NormalizeKey(quoteName) & "_BOTTOMVIEW_TEMP.sldasm"
+    tempNativePath = tempFolder & "\" & CurrentJobNumber & "_" & NormalizeKey(quoteName) & "_" & holderViewToken & "_TEMP.sldasm"
 
     ApplyCmsTopView assyModel
     StabilizeActiveView assyModel, 100
 
-    assyModel.ShowNamedView2 "*Bottom", 6
+    assyModel.ShowNamedView2 holderViewName, holderViewId
     StabilizeActiveView assyModel, 100
 
-    LogLine quoteName & " holder DXF: saving native temp SLDASM:"
+    LogLine quoteName & " holder DXF: saving native temp SLDASM from " & holderViewName & ":"
     LogLine "  " & tempNativePath
 
-    SaveModelAs assyModel, tempNativePath
+    If SaveModelCopyAs(assyModel, tempNativePath) = False Then GoTo CleanExit
 
     Dim fso As Object
     Set fso = CreateObject("Scripting.FileSystemObject")
 
     If fso.FileExists(tempNativePath) = False Then
-        LogLine "Holder assembly-bottom DXF: temp native SLDASM was not created."
+        LogLine "Holder assembly " & holderViewName & " DXF: temp native SLDASM was not created."
         GoTo CleanExit
     End If
 
-    CurrentIdHolderDxfFromAssembly = True
+    CurrentIdHolderDxfFromAssembly = (NormalizeKey(quoteName) = "IDHOLDER")
 
     CreateProjectedDxfFromNativePath tempNativePath, dxfPath, quoteName, _
-                                     "*Bottom", "*Top", _
+                                     holderViewName, CMS_TOP_VIEW_NAME, _
                                      True, False, False, False, False
 
     CurrentIdHolderDxfFromAssembly = False
@@ -4494,7 +4581,7 @@ On Error GoTo ErrHandler
     LogLine quoteName & " clamping plate DXF: saving native temp SLDASM:"
     LogLine "  " & tempNativePath
 
-    SaveModelAs assyModel, tempNativePath
+    If SaveModelCopyAs(assyModel, tempNativePath) = False Then GoTo CleanExit
 
     Dim fso As Object
     Set fso = CreateObject("Scripting.FileSystemObject")
@@ -4642,6 +4729,9 @@ On Error GoTo ErrHandler
 
     On Error Resume Next
     swApp.CloseDoc mdl.GetTitle
+    Set mdl = Nothing
+    Set fso = Nothing
+    ReleaseSolidWorksMemory "after XT native conversion"
     Exit Function
 
 ErrHandler:
@@ -5042,6 +5132,8 @@ On Error GoTo ErrHandler
     Dim saveErrs As Long
     Dim saveWarns As Long
 
+    ForceAllDxfScales1To1 swDraw
+
     LogLine "Saving DXF: " & dxfPath
     EnsureSwHidden
 
@@ -5058,6 +5150,16 @@ CleanExit:
     End If
 
     If drawTitle <> "" Then swApp.CloseDoc drawTitle
+
+    Set viewBottom = Nothing
+    Set viewTop = Nothing
+    Set viewRight = Nothing
+    Set viewLeft = Nothing
+    Set parentView = Nothing
+    Set swDraw = Nothing
+    Set fso = Nothing
+
+    ReleaseSolidWorksMemory "after DXF save"
     Exit Sub
 
 ErrHandler:
@@ -5582,16 +5684,71 @@ On Error Resume Next
     Set swSheet = swDraw.GetCurrentSheet
 
     If Not swSheet Is Nothing Then
-
         swSheet.SetSize 12, E_SHEET_WIDTH_IN / INCHES_PER_METER, E_SHEET_HEIGHT_IN / INCHES_PER_METER
-
-        ' Force sheet scale 1:1 where supported.
-        Err.Clear
-        swSheet.SetScale 1#, 1#, True, True
-        Err.Clear
-
     End If
 
+    ForceDrawingSheetScale1To1 swDraw
+
+    swDraw.GraphicsRedraw2
+End Sub
+
+Private Sub ForceDrawingSheetScale1To1(ByVal swDraw As Object)
+On Error Resume Next
+
+    If swDraw Is Nothing Then Exit Sub
+
+    Dim swSheet As Object
+    Set swSheet = swDraw.GetCurrentSheet
+
+    If swSheet Is Nothing Then Exit Sub
+
+    ' SolidWorks templates and view insertion can reset the sheet to 1:2.
+    ' Force the sheet itself to 1:1 using multiple late-bound API paths.
+    Err.Clear
+    swSheet.SetScale 1#, 1#, False, False
+    Err.Clear
+    swSheet.SetScale 1#, 1#, True, True
+    Err.Clear
+
+    Dim sheetName As String
+    sheetName = ""
+    sheetName = CStr(swSheet.GetName)
+
+    If sheetName <> "" Then
+        Err.Clear
+        swDraw.SetupSheet5 sheetName, 12, 12, 1#, 1#, False, "", _
+                           E_SHEET_WIDTH_IN / INCHES_PER_METER, _
+                           E_SHEET_HEIGHT_IN / INCHES_PER_METER, "", False
+        Err.Clear
+
+        Err.Clear
+        swDraw.SetupSheet4 sheetName, 12, 12, 1#, 1#, False, "", _
+                           E_SHEET_WIDTH_IN / INCHES_PER_METER, _
+                           E_SHEET_HEIGHT_IN / INCHES_PER_METER, ""
+        Err.Clear
+    End If
+End Sub
+
+Private Sub ForceAllDxfScales1To1(ByVal swDraw As Object)
+On Error Resume Next
+
+    If swDraw Is Nothing Then Exit Sub
+
+    ForceDrawingSheetScale1To1 swDraw
+
+    Dim v As Object
+    Set v = swDraw.GetFirstView
+
+    If Not v Is Nothing Then Set v = v.GetNextView
+
+    Do While Not v Is Nothing
+        SetDrawingViewScale v, 1#
+        Set v = v.GetNextView
+    Loop
+
+    ForceDrawingSheetScale1To1 swDraw
+
+    swDraw.ForceRebuild3 False
     swDraw.GraphicsRedraw2
 End Sub
 
@@ -5630,8 +5787,20 @@ On Error Resume Next
     swView.ScaleDecimal = scaleVal
 
     If Abs(scaleVal - 1#) < 0.000001 Then
+        Dim scaleRatio(0 To 1) As Double
+        scaleRatio(0) = 1#
+        scaleRatio(1) = 1#
+
+        Err.Clear
+        swView.ScaleRatio = scaleRatio
+        Err.Clear
         swView.ScaleRatio = "1:1"
+        Err.Clear
     End If
+
+    ' Set this again last. Some SolidWorks view operations flip back to sheet scale.
+    swView.UseSheetScale = False
+    swView.ScaleDecimal = scaleVal
 End Sub
 
 ' ============================================================
@@ -6894,7 +7063,7 @@ Private Function HasPullcoreLocationToken(ByVal d As String) As Boolean
 End Function
 
 Private Sub AddPullcoreMatchRow(ByRef b As BomInfo, ByVal cadIdx As Long, _
-                                ByVal cadL As Double, ByVal cadW As Double, ByVal cadT As Double)
+                                ByVal fitL As Double, ByVal fitW As Double, ByVal fitT As Double)
 
     PullcoreMatchCount = PullcoreMatchCount + 1
     ReDim Preserve PullcoreMatches(1 To PullcoreMatchCount)
@@ -6918,13 +7087,17 @@ Private Sub AddPullcoreMatchRow(ByRef b As BomInfo, ByVal cadIdx As Long, _
 
     If cadIdx > 0 Then
 
-        PullcoreMatches(PullcoreMatchCount).CadThickness = cadT
-        PullcoreMatches(PullcoreMatchCount).CadWidth = cadW
-        PullcoreMatches(PullcoreMatchCount).CadLength = cadL
+        fitL = RoundDimInches(fitL)
+        fitW = RoundDimInches(fitW)
+        fitT = RoundDimInches(fitT)
 
-        PullcoreMatches(PullcoreMatchCount).FittedThickness = cadT
-        PullcoreMatches(PullcoreMatchCount).FittedWidth = cadW
-        PullcoreMatches(PullcoreMatchCount).FittedLength = cadL
+        PullcoreMatches(PullcoreMatchCount).CadThickness = parts(cadIdx).Thickness
+        PullcoreMatches(PullcoreMatchCount).CadWidth = parts(cadIdx).Width
+        PullcoreMatches(PullcoreMatchCount).CadLength = parts(cadIdx).Length
+
+        PullcoreMatches(PullcoreMatchCount).FittedThickness = fitT
+        PullcoreMatches(PullcoreMatchCount).FittedWidth = fitW
+        PullcoreMatches(PullcoreMatchCount).FittedLength = fitL
 
         If parts(cadIdx).hasOriginalAsmBBox Then
             PullcoreMatches(PullcoreMatchCount).OriginalLength = parts(cadIdx).OriginalAsmLength
@@ -6936,11 +7109,11 @@ Private Sub AddPullcoreMatchRow(ByRef b As BomInfo, ByVal cadIdx As Long, _
             PullcoreMatches(PullcoreMatchCount).OriginalThickness = parts(cadIdx).Thickness
         End If
 
-        PullcoreMatches(PullcoreMatchCount).Status = ComparePullcoreDimsToBomStatus(b, cadL, cadW, cadT)
+        PullcoreMatches(PullcoreMatchCount).Status = ComparePullcoreDimsToBomStatus(b, fitL, fitW, fitT)
 
         PullcoreMatches(PullcoreMatchCount).DetectedAngleDeg = _
             EstimatePullcoreAngleFromFittedAndOriginalDeg( _
-                cadL, cadW, cadT, _
+                fitL, fitW, fitT, _
                 PullcoreMatches(PullcoreMatchCount).OriginalLength, _
                 PullcoreMatches(PullcoreMatchCount).OriginalWidth, _
                 PullcoreMatches(PullcoreMatchCount).OriginalThickness)
@@ -6953,7 +7126,7 @@ Private Sub AddPullcoreMatchRow(ByRef b As BomInfo, ByVal cadIdx As Long, _
         End If
 
     Else
-        PullcoreMatches(PullcoreMatchCount).Status = "NO CAD MATCH"
+        PullcoreMatches(PullcoreMatchCount).Status = "NO CAD MATCH - BOUNDING BOX NOT FOUND"
     End If
 
     Dim cadNameForLog As String
@@ -6972,10 +7145,15 @@ Private Sub AddPullcoreMatchRow(ByRef b As BomInfo, ByVal cadIdx As Long, _
                 FormatNumberForCsv(PullcoreMatches(PullcoreMatchCount).OriginalWidth) & "/" & _
                 FormatNumberForCsv(PullcoreMatches(PullcoreMatchCount).OriginalThickness)
 
+        LogLine "  Raw assembly bbox L/W/T=" & _
+                FormatNumberForCsv(PullcoreMatches(PullcoreMatchCount).CadLength) & "/" & _
+                FormatNumberForCsv(PullcoreMatches(PullcoreMatchCount).CadWidth) & "/" & _
+                FormatNumberForCsv(PullcoreMatches(PullcoreMatchCount).CadThickness)
+
         LogLine "  Fitted bbox L/W/T=" & _
-                FormatNumberForCsv(cadL) & "/" & _
-                FormatNumberForCsv(cadW) & "/" & _
-                FormatNumberForCsv(cadT)
+                FormatNumberForCsv(fitL) & "/" & _
+                FormatNumberForCsv(fitW) & "/" & _
+                FormatNumberForCsv(fitT)
 
         LogLine "  Pullcore angle=" & _
                 Format(PullcoreMatches(PullcoreMatchCount).DetectedAngleDeg, "0.00") & _
@@ -7004,10 +7182,12 @@ On Error GoTo ErrHandler
 
     Dim worst As Double
 
-    worst = Abs(cadL - b.BomLength)
+    worst = Abs(RoundDimInches(cadL) - RoundDimInches(b.BomLength))
 
-    If Abs(cadW - b.BomWidth) > worst Then worst = Abs(cadW - b.BomWidth)
-    If Abs(cadT - b.BomThickness) > worst Then worst = Abs(cadT - b.BomThickness)
+    If Abs(RoundDimInches(cadW) - RoundDimInches(b.BomWidth)) > worst Then _
+        worst = Abs(RoundDimInches(cadW) - RoundDimInches(b.BomWidth))
+    If Abs(RoundDimInches(cadT) - RoundDimInches(b.BomThickness)) > worst Then _
+        worst = Abs(RoundDimInches(cadT) - RoundDimInches(b.BomThickness))
 
     If worst <= DIM_OK_TOL Then
         ComparePullcoreDimsToBomStatus = "OK"
@@ -7121,5 +7301,5950 @@ End Sub
 ' ============================================================
 ' END OF PART 5
 ' Paste Part 6 immediately after this.
+' ============================================================
+' ============================================================
+' PULLCORE MATCHING
+' ============================================================
+
+Private Sub MatchPullcoreRowsByClass()
+On Error GoTo ErrHandler
+
+    On Error Resume Next
+    If Not swModel Is Nothing Then
+        If swModel.GetType = swDocASSEMBLY Then
+            swModel.ResolveAllLightWeightComponents True
+        End If
+    End If
+    On Error GoTo ErrHandler
+
+    Dim camRows() As Long
+    Dim keyRows() As Long
+    Dim camN As Long
+    Dim keyN As Long
+
+    camN = 0
+    keyN = 0
+
+    ReDim camRows(1 To 1)
+    ReDim keyRows(1 To 1)
+
+    Dim i As Long
+
+    For i = 1 To BomCount
+
+        If IsPullcoreBomRow(BomRows(i)) Then
+
+            Dim reps As Long
+            reps = BomRows(i).Quantity
+
+            If reps < 1 Then reps = 1
+            If reps > 8 Then reps = 8
+
+            Dim isCamRow As Boolean
+            isCamRow = (InStr(NormalizeText(BomRows(i).Description), "CAM") > 0)
+
+            If (Not isCamRow) And reps < 2 Then reps = 2
+
+            Dim r As Long
+            For r = 1 To reps
+                If isCamRow Then
+                    camN = camN + 1
+                    ReDim Preserve camRows(1 To camN)
+                    camRows(camN) = i
+                Else
+                    keyN = keyN + 1
+                    ReDim Preserve keyRows(1 To keyN)
+                    keyRows(keyN) = i
+                End If
+            Next r
+
+        End If
+
+    Next i
+
+    LogLine "Pullcore BOM rows (qty-expanded): cams=" & camN & " keys=" & keyN
+
+    If camN > 0 Then AssignPullcoreClass camRows, camN, True
+    If keyN > 0 Then AssignPullcoreClass keyRows, keyN, False
+
+    If AUTO_LABEL_PULLCORE_ID_OD_BY_HEIGHT Then
+        If LabelPullcoreCamsAndKeysByHeight() = False Then
+            LabelPullcoreKeysByProximity
+        End If
+    Else
+        LabelPullcoreKeysByProximity
+    End If
+
+    On Error Resume Next
+    If Not swModel Is Nothing Then
+        Dim errs As Long
+        swApp.ActivateDoc3 swModel.GetTitle, False, 0, errs
+    End If
+    EnsureSwHidden
+    On Error GoTo ErrHandler
+
+    Exit Sub
+
+ErrHandler:
+    LogLine "MatchPullcoreRowsByClass error: " & Err.Description
+End Sub
+
+Private Function LabelPullcoreCamsAndKeysByHeight() As Boolean
+On Error GoTo ErrHandler
+
+    LabelPullcoreCamsAndKeysByHeight = False
+    PullcoreIdOdHeightAxisUsed = ""
+
+    If PullcoreMatchCount <= 0 Then Exit Function
+
+    Dim camMatches As Collection
+    Dim keyMatches As Collection
+
+    Set camMatches = New Collection
+    Set keyMatches = New Collection
+
+    Dim i As Long
+    Dim cadIdx As Long
+
+    For i = 1 To PullcoreMatchCount
+
+        cadIdx = PullcoreMatches(i).CadPartIndex
+
+        If cadIdx > 0 And cadIdx <= PartCount Then
+            If parts(cadIdx).hasAsmCenter Then
+
+                If PullcoreMatches(i).isCam Then
+                    camMatches.Add i
+                Else
+                    keyMatches.Add i
+                End If
+
+            End If
+        End If
+
+    Next i
+
+    If camMatches.count < 2 Then
+        LogLine "Pullcore ID/OD height labeling skipped: need at least 2 CAM matches with assembly centers."
+        Exit Function
+    End If
+
+    Dim axisName As String
+    axisName = DeterminePullcoreIdOdHeightAxis(camMatches, keyMatches)
+
+    If axisName = "" Then axisName = "Y"
+
+    PullcoreIdOdHeightAxisUsed = axisName
+
+    LogLine "Pullcore ID/OD height labeling axis selected: " & axisName
+
+    Dim highCamMatch As Long
+    Dim lowCamMatch As Long
+
+    FindHighLowPullcoreMatchesByAxis camMatches, axisName, highCamMatch, lowCamMatch
+
+    If highCamMatch <= 0 Or lowCamMatch <= 0 Then
+        LogLine "Pullcore ID/OD height labeling skipped: could not determine high/low CAM."
+        Exit Function
+    End If
+
+    Dim idCamMatch As Long
+    Dim odCamMatch As Long
+
+    If PULLCORE_ID_IS_HIGHER Then
+        idCamMatch = highCamMatch
+        odCamMatch = lowCamMatch
+    Else
+        idCamMatch = lowCamMatch
+        odCamMatch = highCamMatch
+    End If
+
+    SetPullcoreMatchLabel idCamMatch, "ID PULLCORE CAM", axisName
+    SetPullcoreMatchLabel odCamMatch, "OD PULLCORE CAM", axisName
+
+    If keyMatches.count > 0 Then
+        LabelPullcoreKeysToNearestLabeledCams keyMatches, idCamMatch, odCamMatch, axisName
+    End If
+
+    LabelPullcoreCamsAndKeysByHeight = True
+
+    Exit Function
+
+ErrHandler:
+    LogLine "LabelPullcoreCamsAndKeysByHeight error: " & Err.Description
+    LabelPullcoreCamsAndKeysByHeight = False
+End Function
+
+Private Function DeterminePullcoreIdOdHeightAxis(ByVal camMatches As Collection, _
+                                                 ByVal keyMatches As Collection) As String
+On Error GoTo ErrHandler
+
+    Dim setting As String
+    setting = UCase(Trim(PULLCORE_ID_OD_HEIGHT_AXIS))
+
+    If setting = "Y" Or setting = "Z" Then
+        DeterminePullcoreIdOdHeightAxis = setting
+        Exit Function
+    End If
+
+    Dim yMin As Double
+    Dim yMax As Double
+    Dim zMin As Double
+    Dim zMax As Double
+    Dim firstVal As Boolean
+
+    firstVal = True
+
+    Dim i As Long
+    Dim mi As Long
+    Dim cadIdx As Long
+
+    For i = 1 To camMatches.count
+
+        mi = CLng(camMatches(i))
+        cadIdx = PullcoreMatches(mi).CadPartIndex
+
+        If cadIdx > 0 And cadIdx <= PartCount Then
+            If parts(cadIdx).hasAsmCenter Then
+
+                If firstVal Then
+                    yMin = parts(cadIdx).AsmCenterY
+                    yMax = parts(cadIdx).AsmCenterY
+                    zMin = parts(cadIdx).AsmCenterZ
+                    zMax = parts(cadIdx).AsmCenterZ
+                    firstVal = False
+                Else
+                    If parts(cadIdx).AsmCenterY < yMin Then yMin = parts(cadIdx).AsmCenterY
+                    If parts(cadIdx).AsmCenterY > yMax Then yMax = parts(cadIdx).AsmCenterY
+                    If parts(cadIdx).AsmCenterZ < zMin Then zMin = parts(cadIdx).AsmCenterZ
+                    If parts(cadIdx).AsmCenterZ > zMax Then zMax = parts(cadIdx).AsmCenterZ
+                End If
+
+            End If
+        End If
+
+    Next i
+
+    If firstVal Then
+        DeterminePullcoreIdOdHeightAxis = "Y"
+        Exit Function
+    End If
+
+    If Abs(zMax - zMin) > Abs(yMax - yMin) + 0.001 Then
+        DeterminePullcoreIdOdHeightAxis = "Z"
+    Else
+        DeterminePullcoreIdOdHeightAxis = "Y"
+    End If
+
+    LogLine "Pullcore CAM center spread: Y=" & FormatNumberForCsv(Abs(yMax - yMin)) & _
+            " Z=" & FormatNumberForCsv(Abs(zMax - zMin))
+
+    Exit Function
+
+ErrHandler:
+    DeterminePullcoreIdOdHeightAxis = "Y"
+End Function
+
+Private Sub FindHighLowPullcoreMatchesByAxis(ByVal matches As Collection, _
+                                             ByVal axisName As String, _
+                                             ByRef highMatch As Long, _
+                                             ByRef lowMatch As Long)
+On Error GoTo ErrHandler
+
+    highMatch = 0
+    lowMatch = 0
+
+    If matches Is Nothing Then Exit Sub
+    If matches.count = 0 Then Exit Sub
+
+    Dim bestHigh As Double
+    Dim bestLow As Double
+
+    bestHigh = -1E+99
+    bestLow = 1E+99
+
+    Dim i As Long
+    Dim mi As Long
+    Dim h As Double
+
+    For i = 1 To matches.count
+
+        mi = CLng(matches(i))
+        h = GetPullcoreMatchHeightValue(mi, axisName)
+
+        If h > bestHigh Then
+            bestHigh = h
+            highMatch = mi
+        End If
+
+        If h < bestLow Then
+            bestLow = h
+            lowMatch = mi
+        End If
+
+    Next i
+
+    Exit Sub
+
+ErrHandler:
+    highMatch = 0
+    lowMatch = 0
+End Sub
+
+Private Function GetPullcoreMatchHeightValue(ByVal matchIdx As Long, ByVal axisName As String) As Double
+On Error GoTo ErrHandler
+
+    GetPullcoreMatchHeightValue = 0#
+
+    If matchIdx <= 0 Or matchIdx > PullcoreMatchCount Then Exit Function
+
+    Dim cadIdx As Long
+    cadIdx = PullcoreMatches(matchIdx).CadPartIndex
+
+    If cadIdx <= 0 Or cadIdx > PartCount Then Exit Function
+    If parts(cadIdx).hasAsmCenter = False Then Exit Function
+
+    If UCase(axisName) = "Z" Then
+        GetPullcoreMatchHeightValue = parts(cadIdx).AsmCenterZ
+    Else
+        GetPullcoreMatchHeightValue = parts(cadIdx).AsmCenterY
+    End If
+
+    Exit Function
+
+ErrHandler:
+    GetPullcoreMatchHeightValue = 0#
+End Function
+
+Private Function ShouldAutoRelabelPullcoreMatch(ByVal matchIdx As Long) As Boolean
+On Error GoTo ErrHandler
+
+    ShouldAutoRelabelPullcoreMatch = False
+
+    If matchIdx <= 0 Or matchIdx > PullcoreMatchCount Then Exit Function
+
+    Dim d As String
+    d = NormalizeText(PullcoreMatches(matchIdx).Description)
+
+    ' If the BOM already says ID/OD/LE/TE, keep that BOM name.
+    If GetPullcoreLocationCode(d) <> "" Then Exit Function
+
+    ShouldAutoRelabelPullcoreMatch = True
+    Exit Function
+
+ErrHandler:
+    ShouldAutoRelabelPullcoreMatch = False
+End Function
+
+Private Sub SetPullcoreMatchLabel(ByVal matchIdx As Long, _
+                                  ByVal newName As String, _
+                                  ByVal axisName As String)
+On Error Resume Next
+
+    If matchIdx <= 0 Or matchIdx > PullcoreMatchCount Then Exit Sub
+
+    If ShouldAutoRelabelPullcoreMatch(matchIdx) Then
+        PullcoreMatches(matchIdx).quoteName = newName
+    Else
+        PullcoreMatches(matchIdx).quoteName = CleanPullcoreDisplayName(PullcoreMatches(matchIdx).Description)
+    End If
+
+    Dim cadIdx As Long
+    cadIdx = PullcoreMatches(matchIdx).CadPartIndex
+
+    If cadIdx > 0 And cadIdx <= PartCount Then
+
+        LogLine "Pullcore labeled '" & newName & "' -> CAD '" & _
+                parts(cadIdx).componentName & "'  center X/Y/Z=" & _
+                FormatNumberForCsv(parts(cadIdx).AsmCenterX) & "/" & _
+                FormatNumberForCsv(parts(cadIdx).AsmCenterY) & "/" & _
+                FormatNumberForCsv(parts(cadIdx).AsmCenterZ) & _
+                "  ID/OD axis=" & axisName & _
+                "  height=" & FormatNumberForCsv(GetPullcoreMatchHeightValue(matchIdx, axisName))
+
+    Else
+
+        LogLine "Pullcore labeled '" & newName & "' with no CAD component."
+
+    End If
+End Sub
+
+Private Sub LabelPullcoreKeysToNearestLabeledCams(ByVal keyMatches As Collection, _
+                                                  ByVal idCamMatch As Long, _
+                                                  ByVal odCamMatch As Long, _
+                                                  ByVal axisName As String)
+On Error GoTo ErrHandler
+
+    If keyMatches Is Nothing Then Exit Sub
+    If keyMatches.count = 0 Then Exit Sub
+    If idCamMatch <= 0 Or odCamMatch <= 0 Then Exit Sub
+
+    If keyMatches.count = 1 Then
+
+        Dim onlyKey As Long
+        onlyKey = CLng(keyMatches(1))
+
+        If PullcoreMatchDistanceSq(onlyKey, idCamMatch) <= PullcoreMatchDistanceSq(onlyKey, odCamMatch) Then
+            SetPullcoreMatchLabel onlyKey, "ID PULLCORE KEY", axisName
+        Else
+            SetPullcoreMatchLabel onlyKey, "OD PULLCORE KEY", axisName
+        End If
+
+        Exit Sub
+
+    End If
+
+    If keyMatches.count = 2 Then
+
+        Dim k1 As Long
+        Dim k2 As Long
+
+        k1 = CLng(keyMatches(1))
+        k2 = CLng(keyMatches(2))
+
+        Dim optionA As Double
+        Dim optionB As Double
+
+        optionA = PullcoreMatchDistanceSq(k1, idCamMatch) + PullcoreMatchDistanceSq(k2, odCamMatch)
+        optionB = PullcoreMatchDistanceSq(k2, idCamMatch) + PullcoreMatchDistanceSq(k1, odCamMatch)
+
+        If optionA <= optionB Then
+            SetPullcoreMatchLabel k1, "ID PULLCORE KEY", axisName
+            SetPullcoreMatchLabel k2, "OD PULLCORE KEY", axisName
+        Else
+            SetPullcoreMatchLabel k2, "ID PULLCORE KEY", axisName
+            SetPullcoreMatchLabel k1, "OD PULLCORE KEY", axisName
+        End If
+
+        Exit Sub
+
+    End If
+
+    Dim i As Long
+    Dim mi As Long
+
+    For i = 1 To keyMatches.count
+
+        mi = CLng(keyMatches(i))
+
+        If PullcoreMatchDistanceSq(mi, idCamMatch) <= PullcoreMatchDistanceSq(mi, odCamMatch) Then
+            SetPullcoreMatchLabel mi, "ID PULLCORE KEY", axisName
+        Else
+            SetPullcoreMatchLabel mi, "OD PULLCORE KEY", axisName
+        End If
+
+    Next i
+
+    Exit Sub
+
+ErrHandler:
+    LogLine "LabelPullcoreKeysToNearestLabeledCams error: " & Err.Description
+End Sub
+
+Private Function PullcoreMatchDistanceSq(ByVal matchA As Long, ByVal matchB As Long) As Double
+On Error GoTo ErrHandler
+
+    PullcoreMatchDistanceSq = 1E+99
+
+    If matchA <= 0 Or matchA > PullcoreMatchCount Then Exit Function
+    If matchB <= 0 Or matchB > PullcoreMatchCount Then Exit Function
+
+    Dim cadA As Long
+    Dim cadB As Long
+
+    cadA = PullcoreMatches(matchA).CadPartIndex
+    cadB = PullcoreMatches(matchB).CadPartIndex
+
+    If cadA <= 0 Or cadA > PartCount Then Exit Function
+    If cadB <= 0 Or cadB > PartCount Then Exit Function
+
+    If parts(cadA).hasAsmCenter = False Then Exit Function
+    If parts(cadB).hasAsmCenter = False Then Exit Function
+
+    PullcoreMatchDistanceSq = _
+        (parts(cadA).AsmCenterX - parts(cadB).AsmCenterX) ^ 2 + _
+        (parts(cadA).AsmCenterY - parts(cadB).AsmCenterY) ^ 2 + _
+        (parts(cadA).AsmCenterZ - parts(cadB).AsmCenterZ) ^ 2
+
+    Exit Function
+
+ErrHandler:
+    PullcoreMatchDistanceSq = 1E+99
+End Function
+
+Private Sub LabelPullcoreKeysByProximity()
+On Error GoTo ErrHandler
+
+    Dim haveId As Boolean
+    Dim haveOd As Boolean
+
+    Dim idx As Double
+    Dim idy As Double
+    Dim idz As Double
+    Dim odx As Double
+    Dim ody As Double
+    Dim odz As Double
+
+    Dim i As Long
+    Dim ci As Long
+    Dim nm As String
+
+    For i = 1 To PullcoreMatchCount
+
+        If PullcoreMatches(i).isCam And PullcoreMatches(i).CadPartIndex > 0 Then
+
+            ci = PullcoreMatches(i).CadPartIndex
+
+            If parts(ci).hasAsmCenter Then
+
+                nm = NormalizeText(PullcoreMatches(i).Description)
+
+                If InStr(nm, "OD") > 0 Then
+                    odx = parts(ci).AsmCenterX
+                    ody = parts(ci).AsmCenterY
+                    odz = parts(ci).AsmCenterZ
+                    haveOd = True
+                ElseIf InStr(nm, "ID") > 0 Then
+                    idx = parts(ci).AsmCenterX
+                    idy = parts(ci).AsmCenterY
+                    idz = parts(ci).AsmCenterZ
+                    haveId = True
+                End If
+
+            End If
+
+        End If
+
+    Next i
+
+    If Not (haveId And haveOd) Then
+        LogLine "Pullcore key ID/OD labeling skipped (need both ID and OD cam centers)."
+        Exit Sub
+    End If
+
+    Dim keyIdx() As Long
+    Dim keyN As Long
+
+    keyN = 0
+    ReDim keyIdx(1 To PullcoreMatchCount)
+
+    For i = 1 To PullcoreMatchCount
+        If (Not PullcoreMatches(i).isCam) And PullcoreMatches(i).CadPartIndex > 0 Then
+            If parts(PullcoreMatches(i).CadPartIndex).hasAsmCenter Then
+                keyN = keyN + 1
+                keyIdx(keyN) = i
+            End If
+        End If
+    Next i
+
+    If keyN = 0 Then Exit Sub
+
+    Dim bias() As Double
+    ReDim bias(1 To keyN)
+
+    Dim k As Long
+
+    For k = 1 To keyN
+
+        ci = PullcoreMatches(keyIdx(k)).CadPartIndex
+
+        Dim dId As Double
+        Dim dOd As Double
+
+        dId = (parts(ci).AsmCenterX - idx) ^ 2 + (parts(ci).AsmCenterY - idy) ^ 2 + (parts(ci).AsmCenterZ - idz) ^ 2
+        dOd = (parts(ci).AsmCenterX - odx) ^ 2 + (parts(ci).AsmCenterY - ody) ^ 2 + (parts(ci).AsmCenterZ - odz) ^ 2
+
+        bias(k) = dId - dOd
+
+    Next k
+
+    If keyN = 2 Then
+
+        Dim idK As Long
+        Dim odK As Long
+
+        If bias(1) <= bias(2) Then
+            idK = 1
+            odK = 2
+        Else
+            idK = 2
+            odK = 1
+        End If
+
+        SetPullcoreKeyLabel keyIdx(idK), "ID PULLCORE KEY"
+        SetPullcoreKeyLabel keyIdx(odK), "OD PULLCORE KEY"
+
+    Else
+
+        For k = 1 To keyN
+            If bias(k) <= 0 Then
+                SetPullcoreKeyLabel keyIdx(k), "ID PULLCORE KEY"
+            Else
+                SetPullcoreKeyLabel keyIdx(k), "OD PULLCORE KEY"
+            End If
+        Next k
+
+    End If
+
+    Exit Sub
+
+ErrHandler:
+    LogLine "LabelPullcoreKeysByProximity error: " & Err.Description
+End Sub
+
+Private Sub SetPullcoreKeyLabel(ByVal matchIdx As Long, ByVal newName As String)
+On Error Resume Next
+
+    PullcoreMatches(matchIdx).quoteName = newName
+
+    LogLine "Pullcore key labeled '" & newName & "' -> CAD '" & _
+            parts(PullcoreMatches(matchIdx).CadPartIndex).componentName & "'"
+End Sub
+
+Private Sub AssignPullcoreClass(ByRef bomRowIdx() As Long, ByVal rowN As Long, ByVal wantCam As Boolean)
+On Error GoTo ErrHandler
+
+    Dim candIdx() As Long
+    Dim candL() As Double
+    Dim candW() As Double
+    Dim candT() As Double
+    Dim candN As Long
+
+    candN = 0
+
+    ReDim candIdx(1 To 1)
+    ReDim candL(1 To 1)
+    ReDim candW(1 To 1)
+    ReDim candT(1 To 1)
+
+    Dim i As Long
+    Dim j As Long
+
+    For i = 1 To PartCount
+
+        If parts(i).UsedForBomMatch = False Then
+
+            Dim isCand As Boolean
+            isCand = False
+
+            For j = 1 To rowN
+                If IsRoughPullcoreCandidateForBom(i, BomRows(bomRowIdx(j))) Then
+                    isCand = True
+                    Exit For
+                End If
+            Next j
+
+            If isCand Then
+
+                Dim bfL As Double
+                Dim bfW As Double
+                Dim bfT As Double
+                Dim gotFitted As Boolean
+
+                bfL = parts(i).Length
+                bfW = parts(i).Width
+                bfT = parts(i).Thickness
+                gotFitted = False
+
+                If USE_PULLCORE_BEST_FIT_BBOX Then
+                    gotFitted = TryGetPullcoreBestFitDims(i, bfL, bfW, bfT)
+                    If gotFitted = False Then
+                        LogLine "PULLCORE candidate fitted bbox unavailable for '" & parts(i).componentName & _
+                                "'; raw assembly bbox=" & FormatNumberForCsv(parts(i).Length) & "/" & _
+                                FormatNumberForCsv(parts(i).Width) & "/" & FormatNumberForCsv(parts(i).Thickness)
+                        GoTo NextPullcoreCandidate
+                    End If
+                Else
+                    gotFitted = True
+                End If
+
+                candN = candN + 1
+
+                ReDim Preserve candIdx(1 To candN)
+                ReDim Preserve candL(1 To candN)
+                ReDim Preserve candW(1 To candN)
+                ReDim Preserve candT(1 To candN)
+
+                candIdx(candN) = i
+                candL(candN) = bfL
+                candW(candN) = bfW
+                candT(candN) = bfT
+
+            End If
+
+NextPullcoreCandidate:
+
+        End If
+
+    Next i
+
+    LogLine "Pullcore " & IIf(wantCam, "CAM", "KEY") & " candidates found: " & candN & " for " & rowN & " BOM rows"
+
+    If candN = 0 Then
+        For j = 1 To rowN
+            LogLine "PULLCORE UNMATCHED (no candidate): " & BomRows(bomRowIdx(j)).Description
+            AddPullcoreMatchRow BomRows(bomRowIdx(j)), 0, 0, 0, 0
+        Next j
+        Exit Sub
+    End If
+
+    Dim rIdx() As Long
+    ReDim rIdx(1 To rowN)
+
+    For i = 1 To rowN
+        rIdx(i) = bomRowIdx(i)
+    Next i
+
+    Dim rowUsed() As Boolean
+    Dim candUsed() As Boolean
+
+    ReDim rowUsed(1 To rowN)
+    ReDim candUsed(1 To candN)
+
+    Dim pairCount As Long
+
+    pairCount = rowN
+    If candN < pairCount Then pairCount = candN
+
+    Dim pairStep As Long
+
+    For pairStep = 1 To pairCount
+
+        Dim bestR As Long
+        Dim bestC As Long
+        Dim bestDist As Double
+
+        bestR = 0
+        bestC = 0
+        bestDist = 1E+99
+
+        For i = 1 To rowN
+
+            If rowUsed(i) = False Then
+
+                For j = 1 To candN
+
+                    If candUsed(j) = False Then
+
+                        If IsPullcoreFittedExactMatchForBom(BomRows(rIdx(i)), candL(j), candW(j), candT(j)) Then
+
+                            Dim d As Double
+
+                            d = Abs(RoundDimInches(candL(j)) - RoundDimInches(BomRows(rIdx(i)).BomLength)) * 3# _
+                              + Abs(RoundDimInches(candW(j)) - RoundDimInches(BomRows(rIdx(i)).BomWidth)) _
+                              + Abs(RoundDimInches(candT(j)) - RoundDimInches(BomRows(rIdx(i)).BomThickness))
+
+                            If d < bestDist Then
+                                bestDist = d
+                                bestR = i
+                                bestC = j
+                            End If
+
+                        End If
+
+                    End If
+
+                Next j
+
+            End If
+
+        Next i
+
+        If bestR = 0 Or bestC = 0 Then
+            LogLine "Pullcore " & IIf(wantCam, "CAM", "KEY") & " exact-match pairing complete (no more fitted matches)."
+            Exit For
+        End If
+
+        AddPullcoreMatchRow BomRows(rIdx(bestR)), candIdx(bestC), _
+                            candL(bestC), candW(bestC), candT(bestC)
+
+        parts(candIdx(bestC)).UsedForBomMatch = True
+
+        rowUsed(bestR) = True
+        candUsed(bestC) = True
+
+    Next pairStep
+
+    For i = 1 To rowN
+        If rowUsed(i) = False Then
+            LogLine "PULLCORE UNMATCHED (no exact fitted bbox match): " & BomRows(rIdx(i)).Description
+            AddPullcoreMatchRow BomRows(rIdx(i)), 0, 0, 0, 0
+        End If
+    Next i
+
+    Exit Sub
+
+ErrHandler:
+    LogLine "AssignPullcoreClass error: " & Err.Description
+End Sub
+
+Private Function RoundDimInches(ByVal v As Double) As Double
+    RoundDimInches = Round(v, DIM_DECIMALS)
+End Function
+
+Private Function PullcoreDimMatchesBomAxis(ByVal cadVal As Double, _
+                                           ByVal bomVal As Double, _
+                                           ByVal axisTol As Double) As Boolean
+On Error GoTo ErrHandler
+
+    PullcoreDimMatchesBomAxis = False
+
+    If Abs(Round(cadVal, PULLCORE_COMPARE_DECIMALS) - Round(bomVal, PULLCORE_COMPARE_DECIMALS)) <= PULLCORE_ROUND_MATCH_TOL Then
+        PullcoreDimMatchesBomAxis = True
+        Exit Function
+    End If
+
+    If RoundDimInches(cadVal) = RoundDimInches(bomVal) Then
+        PullcoreDimMatchesBomAxis = True
+        Exit Function
+    End If
+
+    PullcoreDimMatchesBomAxis = (Abs(cadVal - bomVal) <= axisTol)
+
+    Exit Function
+
+ErrHandler:
+    PullcoreDimMatchesBomAxis = False
+End Function
+
+Private Function IsPullcoreFittedExactMatchForBom(ByRef b As BomInfo, _
+                                                  ByVal fitL As Double, _
+                                                  ByVal fitW As Double, _
+                                                  ByVal fitT As Double) As Boolean
+On Error GoTo ErrHandler
+
+    IsPullcoreFittedExactMatchForBom = False
+
+    If b.hasDims = False Then
+        IsPullcoreFittedExactMatchForBom = True
+        Exit Function
+    End If
+
+    If fitL <= 0 Or fitW <= 0 Or fitT <= 0 Then Exit Function
+
+    If PullcoreDimMatchesBomAxis(fitL, b.BomLength, PULLCORE_L_TOL) And _
+       PullcoreDimMatchesBomAxis(fitW, b.BomWidth, PULLCORE_W_TOL) And _
+       PullcoreDimMatchesBomAxis(fitT, b.BomThickness, PULLCORE_T_TOL) Then
+        IsPullcoreFittedExactMatchForBom = True
+    End If
+
+    Exit Function
+
+ErrHandler:
+    IsPullcoreFittedExactMatchForBom = False
+End Function
+
+Private Function IsRoughPullcoreCandidateForBom(ByVal cadIdx As Long, ByRef b As BomInfo) As Boolean
+On Error GoTo ErrHandler
+
+    IsRoughPullcoreCandidateForBom = False
+
+    If cadIdx <= 0 Or cadIdx > PartCount Then Exit Function
+    If parts(cadIdx).UsedForBomMatch Then Exit Function
+    If b.hasDims = False Then Exit Function
+
+    Dim cadL As Double
+    Dim cadW As Double
+    Dim cadT As Double
+
+    cadL = parts(cadIdx).Length
+    cadW = parts(cadIdx).Width
+    cadT = parts(cadIdx).Thickness
+
+    If parts(cadIdx).BBoxVolume > 500# Then Exit Function
+    If cadT < 0.25 Then Exit Function
+
+    Dim dL As Double
+    Dim dW As Double
+    Dim dT As Double
+
+    dL = Abs(RoundDimInches(cadL) - RoundDimInches(b.BomLength))
+    dW = Abs(RoundDimInches(cadW) - RoundDimInches(b.BomWidth))
+    dT = Abs(RoundDimInches(cadT) - RoundDimInches(b.BomThickness))
+
+    ' Primary match: rounded raw geometry should match BOM at display precision.
+    If dL = 0# And dW = 0# And dT = 0# Then
+        IsRoughPullcoreCandidateForBom = True
+        Exit Function
+    End If
+
+    If PullcoreDimMatchesBomAxis(cadL, b.BomLength, PULLCORE_L_TOL) And _
+       PullcoreDimMatchesBomAxis(cadW, b.BomWidth, PULLCORE_W_TOL) And _
+       PullcoreDimMatchesBomAxis(cadT, b.BomThickness, PULLCORE_T_TOL) Then
+        IsRoughPullcoreCandidateForBom = True
+        Exit Function
+    End If
+
+    ' Fallback: allow extended/rotated assembly boxes so every pullcore can be tested.
+    If dL <= 1.5 And dW <= 0.9 And dT <= 0.45 Then
+        IsRoughPullcoreCandidateForBom = True
+        Exit Function
+    End If
+
+    Exit Function
+
+ErrHandler:
+    IsRoughPullcoreCandidateForBom = False
+End Function
+
+' ============================================================
+' MATCHING HELPERS / EXPORT ROWS
+' ============================================================
+
+Private Sub AddExportRow(ByRef b As BomInfo, ByVal cadIdx As Long)
+On Error GoTo ErrHandler
+
+    If ShouldSkipExportQuoteName(b.quoteName) Then
+        LogLine "Export quote skipped (package-handled): " & b.quoteName
+        If cadIdx > 0 Then RecordSpecialBomCadMatch b, cadIdx
+        Exit Sub
+    End If
+
+    Dim isPyropel As Boolean
+    isPyropel = (InStr(NormalizeText(b.material), "PYROPEL") > 0 Or InStr(NormalizeText(b.Description), "PYROPEL") > 0)
+
+    If ONLY_INCLUDE_4140_BOM_ITEMS Then
+        If NormalizeSteelType(b.material) <> "4140" Then
+            If IsInsertQuoteName(b.quoteName) = False And isPyropel = False Then
+                LogLine "Non-4140 item skipped: " & b.Description & " (" & b.material & ")"
+                Exit Sub
+            End If
+        End If
+    End If
+
+    ExportCount = ExportCount + 1
+    ReDim Preserve ExportRows(1 To ExportCount)
+
+    ExportRows(ExportCount).quoteName = b.quoteName
+    ExportRows(ExportCount).Quantity = b.Quantity
+    ExportRows(ExportCount).material = b.material
+
+    ExportRows(ExportCount).CadPartIndex = cadIdx
+    ExportRows(ExportCount).HasCad = (cadIdx > 0)
+
+    ExportRows(ExportCount).BomThickness = b.BomThickness
+    ExportRows(ExportCount).BomWidth = b.BomWidth
+    ExportRows(ExportCount).BomLength = b.BomLength
+    ExportRows(ExportCount).HasBomDims = b.hasDims
+
+    If cadIdx > 0 Then
+
+        ExportRows(ExportCount).Thickness = parts(cadIdx).Thickness
+        ExportRows(ExportCount).Width = parts(cadIdx).Width
+        ExportRows(ExportCount).Length = parts(cadIdx).Length
+        ExportRows(ExportCount).Status = CompareBomToCadStatus(b, cadIdx)
+
+        parts(cadIdx).UsedForBomMatch = True
+
+    Else
+
+        ExportRows(ExportCount).Status = "NO CAD MATCH"
+
+    End If
+
+    Exit Sub
+
+ErrHandler:
+    LogLine "AddExportRow error: " & Err.Description
+End Sub
+
+Private Sub RecordSpecialBomCadMatch(ByRef b As BomInfo, ByVal cadIdx As Long)
+On Error Resume Next
+
+    If cadIdx <= 0 Then Exit Sub
+    If SpecialBomCadMatches Is Nothing Then Exit Sub
+
+    Dim k As String
+    k = NormalizeKey(b.quoteName)
+
+    SpecialBomCadMatches(k) = cadIdx
+    SpecialBomCadQuoteNames(k) = b.Description
+End Sub
+
+Private Function FindBestCadMatchForBom(ByRef b As BomInfo) As Long
+On Error GoTo ErrHandler
+
+    FindBestCadMatchForBom = 0
+
+    If ShouldUseTcpBcpMassPairRule(b) Then
+
+        Dim pref As String
+        Dim massIdx As Long
+
+        pref = GetMassPreferenceForQuoteName(b.quoteName)
+
+        If pref <> "" Then
+            massIdx = FindBestCadMatchForBomByDimsAndMassPreference(b, pref)
+
+            If massIdx > 0 Then
+                FindBestCadMatchForBom = massIdx
+                Exit Function
+            End If
+        End If
+
+    End If
+
+    Dim bestIdx As Long
+    Dim bestDiff As Double
+
+    bestIdx = 0
+    bestDiff = DIM_MAX_MATCH_TOTAL_DIFF + 1#
+
+    Dim i As Long
+
+    If b.hasDims Then
+
+        For i = 1 To PartCount
+
+            If parts(i).UsedForBomMatch = False Then
+
+                Dim dL As Double
+                Dim dW As Double
+                Dim dT As Double
+
+                dL = Abs(parts(i).Length - b.BomLength)
+                dW = Abs(parts(i).Width - b.BomWidth)
+                dT = Abs(parts(i).Thickness - b.BomThickness)
+
+                Dim totalDiff As Double
+                totalDiff = dL + dW + dT
+
+                Dim nameBonus As Double
+                nameBonus = 0#
+
+                If IsNameMatch(parts(i).cleanName, b.quoteName) Then nameBonus = nameBonus - 0.75
+                If IsNameMatch(parts(i).componentName, b.quoteName) Then nameBonus = nameBonus - 0.5
+
+                totalDiff = totalDiff + nameBonus
+
+                If dL <= DIM_REVIEW_TOL * 4 And dW <= DIM_REVIEW_TOL * 4 And dT <= DIM_REVIEW_TOL * 4 Then
+                    If totalDiff < bestDiff Then
+                        bestDiff = totalDiff
+                        bestIdx = i
+                    End If
+                End If
+
+            End If
+
+        Next i
+
+    End If
+
+    If bestIdx = 0 Then
+        bestIdx = FindMassBasedCadMatchForBom(b)
+    End If
+
+    FindBestCadMatchForBom = bestIdx
+    Exit Function
+
+ErrHandler:
+    LogLine "FindBestCadMatchForBom error: " & Err.Description
+    FindBestCadMatchForBom = 0
+End Function
+
+Private Function FindBestCadMatchForBomByDimsAndMassPreference(ByRef b As BomInfo, _
+                                                               ByVal massPreference As String) As Long
+On Error GoTo ErrHandler
+
+    FindBestCadMatchForBomByDimsAndMassPreference = 0
+
+    If b.hasDims = False Then Exit Function
+    If massPreference = "" Then Exit Function
+
+    Dim i As Long
+    Dim bestDimDiff As Double
+
+    bestDimDiff = 1E+99
+
+    For i = 1 To PartCount
+
+        If parts(i).UsedForBomMatch = False Then
+
+            Dim dL As Double
+            Dim dW As Double
+            Dim dT As Double
+            Dim totalDiff As Double
+
+            dL = Abs(parts(i).Length - b.BomLength)
+            dW = Abs(parts(i).Width - b.BomWidth)
+            dT = Abs(parts(i).Thickness - b.BomThickness)
+
+            totalDiff = dL + dW + dT
+
+            If dL <= DIM_REVIEW_TOL * 4 And _
+               dW <= DIM_REVIEW_TOL * 4 And _
+               dT <= DIM_REVIEW_TOL * 4 Then
+
+                If totalDiff < bestDimDiff Then bestDimDiff = totalDiff
+
+            End If
+
+        End If
+
+    Next i
+
+    If bestDimDiff = 1E+99 Then Exit Function
+
+    Dim dimBand As Double
+    dimBand = DIM_OK_TOL
+    If dimBand < 0.05 Then dimBand = 0.05
+
+    Dim bestIdx As Long
+    Dim bestMass As Double
+
+    bestIdx = 0
+
+    If UCase(massPreference) = "LIGHT" Then
+        bestMass = 1E+99
+    Else
+        bestMass = -1E+99
+    End If
+
+    For i = 1 To PartCount
+
+        If parts(i).UsedForBomMatch = False Then
+
+            dL = Abs(parts(i).Length - b.BomLength)
+            dW = Abs(parts(i).Width - b.BomWidth)
+            dT = Abs(parts(i).Thickness - b.BomThickness)
+
+            totalDiff = dL + dW + dT
+
+            If dL <= DIM_REVIEW_TOL * 4 And _
+               dW <= DIM_REVIEW_TOL * 4 And _
+               dT <= DIM_REVIEW_TOL * 4 Then
+
+                If totalDiff <= bestDimDiff + dimBand Then
+
+                    If UCase(massPreference) = "LIGHT" Then
+                        If parts(i).massValue < bestMass Then
+                            bestMass = parts(i).massValue
+                            bestIdx = i
+                        End If
+                    ElseIf UCase(massPreference) = "HEAVY" Then
+                        If parts(i).massValue > bestMass Then
+                            bestMass = parts(i).massValue
+                            bestIdx = i
+                        End If
+                    End If
+
+                End If
+
+            End If
+
+        End If
+
+    Next i
+
+    If bestIdx > 0 Then
+        LogLine "TCP/BCP mass match: " & b.quoteName & _
+                " preference=" & massPreference & _
+                " -> CAD '" & parts(bestIdx).componentName & "'" & _
+                " mass=" & FormatNumberForCsv(parts(bestIdx).massValue)
+    End If
+
+    FindBestCadMatchForBomByDimsAndMassPreference = bestIdx
+    Exit Function
+
+ErrHandler:
+    LogLine "FindBestCadMatchForBomByDimsAndMassPreference error: " & Err.Description
+    FindBestCadMatchForBomByDimsAndMassPreference = 0
+End Function
+
+Private Function FindMassBasedCadMatchForBom(ByRef b As BomInfo) As Long
+On Error GoTo ErrHandler
+
+    FindMassBasedCadMatchForBom = 0
+
+    Dim bestIdx As Long
+    Dim bestScore As Double
+
+    bestIdx = 0
+    bestScore = -1
+
+    Dim i As Long
+
+    For i = 1 To PartCount
+
+        If parts(i).UsedForBomMatch = False Then
+
+            Dim score As Double
+            score = 0
+
+            If IsNameMatch(parts(i).cleanName, b.quoteName) Then score = score + 10
+            If IsNameMatch(parts(i).componentName, b.quoteName) Then score = score + 6
+
+            If score > bestScore Then
+                bestScore = score
+                bestIdx = i
+            End If
+
+        End If
+
+    Next i
+
+    If bestScore <= 0 Then
+        FindMassBasedCadMatchForBom = 0
+    Else
+        FindMassBasedCadMatchForBom = bestIdx
+    End If
+
+    Exit Function
+
+ErrHandler:
+    FindMassBasedCadMatchForBom = 0
+End Function
+
+Private Function CompareBomToCadStatus(ByRef b As BomInfo, ByVal cadIdx As Long) As String
+On Error GoTo ErrHandler
+
+    If cadIdx <= 0 Then
+        CompareBomToCadStatus = "NO CAD MATCH"
+        Exit Function
+    End If
+
+    If b.hasDims = False Then
+        CompareBomToCadStatus = "MATCH (no BOM dims)"
+        Exit Function
+    End If
+
+    Dim dL As Double
+    Dim dW As Double
+    Dim dT As Double
+
+    dL = Abs(parts(cadIdx).Length - b.BomLength)
+    dW = Abs(parts(cadIdx).Width - b.BomWidth)
+    dT = Abs(parts(cadIdx).Thickness - b.BomThickness)
+
+    Dim worst As Double
+    worst = dL
+
+    If dW > worst Then worst = dW
+    If dT > worst Then worst = dT
+
+    If worst <= DIM_OK_TOL Then
+        CompareBomToCadStatus = "OK"
+    ElseIf worst <= DIM_REVIEW_TOL Then
+        CompareBomToCadStatus = "REVIEW (" & FormatNumberForCsv(worst) & ")"
+    Else
+        CompareBomToCadStatus = "CHECK (" & FormatNumberForCsv(worst) & ")"
+    End If
+
+    Exit Function
+
+ErrHandler:
+    CompareBomToCadStatus = "ERROR"
+End Function
+
+Private Function IsPossibleJBlockByDims(ByVal L As Double, ByVal W As Double, ByVal T As Double) As Boolean
+    If Abs(T - JBlockTgtT) <= J_BLOCK_DIM_MATCH_TOL Then
+        If Abs(W - JBlockTgtW) <= J_BLOCK_DIM_MATCH_TOL Then
+            If Abs(L - JBlockTgtL) <= J_BLOCK_DIM_MATCH_TOL Then
+                IsPossibleJBlockByDims = True
+            End If
+        End If
+    End If
+End Function
+
+Private Function IsPossibleCamByDims(ByVal L As Double, ByVal W As Double, ByVal T As Double) As Boolean
+    If Abs(T - EjCamTgtT) <= EJECTOR_CAM_THICKNESS_TOL Then
+        If Abs(W - EjCamTgtW) <= EJECTOR_CAM_WIDTH_TOL Then
+            If Abs(L - EjCamTgtL) <= EJECTOR_CAM_LENGTH_TOL Then
+                IsPossibleCamByDims = True
+            End If
+        End If
+    End If
+End Function
+
+Private Function CleanPullcoreDisplayName(ByVal s As String) As String
+    s = Trim(s)
+
+    s = Replace(s, "             Material", "", , , vbTextCompare)
+    s = Replace(s, "            Material", "", , , vbTextCompare)
+    s = Replace(s, "         Material", "", , , vbTextCompare)
+    s = Replace(s, "       Material", "", , , vbTextCompare)
+    s = Replace(s, " Material", "", , , vbTextCompare)
+
+    Do While InStr(s, "  ") > 0
+        s = Replace(s, "  ", " ")
+    Loop
+
+    s = Trim(s)
+
+    ' Preserve the BOM wording, but normalize shop-facing pullcore tokens.
+    s = Replace(s, "PULLCORE", "Pullcore", , , vbTextCompare)
+    s = Replace(s, "PULL CORE", "Pullcore", , , vbTextCompare)
+    s = Replace(s, " CAM", " Cam", , , vbTextCompare)
+    s = Replace(s, " KEY", " Key", , , vbTextCompare)
+    s = Replace(s, " LE ", " Le ", , , vbTextCompare)
+    s = Replace(s, " TE ", " Te ", , , vbTextCompare)
+
+    If UCase(Left(s, 3)) = "LE " Then s = "Le " & Mid(s, 4)
+    If UCase(Left(s, 3)) = "TE " Then s = "Te " & Mid(s, 4)
+
+    CleanPullcoreDisplayName = s
+End Function
+
+Private Function GetPullcoreLocationCode(ByVal text As String) As String
+    Dim s As String
+    s = NormalizeText(text)
+
+    If InStr(s, "IDTE") > 0 Or InStr(s, "ID TE") > 0 Then GetPullcoreLocationCode = "IDTE": Exit Function
+    If InStr(s, "IDLE") > 0 Or InStr(s, "ID LE") > 0 Then GetPullcoreLocationCode = "IDLE": Exit Function
+    If InStr(s, "ODTE") > 0 Or InStr(s, "OD TE") > 0 Then GetPullcoreLocationCode = "ODTE": Exit Function
+    If InStr(s, "ODLE") > 0 Or InStr(s, "OD LE") > 0 Then GetPullcoreLocationCode = "ODLE": Exit Function
+
+    If InStr(s, "ID") > 0 And InStr(s, "OD") = 0 Then GetPullcoreLocationCode = "ID": Exit Function
+    If InStr(s, "OD") > 0 And InStr(s, "ID") = 0 Then GetPullcoreLocationCode = "OD": Exit Function
+
+    Dim toks() As String
+    toks = Split(s, " ")
+
+    Dim i As Long
+    For i = LBound(toks) To UBound(toks)
+        If toks(i) = "TE" Then GetPullcoreLocationCode = "TE": Exit Function
+        If toks(i) = "LE" Then GetPullcoreLocationCode = "LE": Exit Function
+    Next i
+
+    GetPullcoreLocationCode = ""
+End Function
+
+Private Function PullcoreLocationScore(ByVal bomLoc As String, ByVal cadLoc As String) As Double
+    If bomLoc = "" Or cadLoc = "" Then
+        PullcoreLocationScore = 0
+        Exit Function
+    End If
+
+    If bomLoc = cadLoc Then
+        PullcoreLocationScore = -3#
+        Exit Function
+    End If
+
+    Dim bSide As String
+    Dim cSide As String
+
+    bSide = Left(bomLoc, 2)
+    cSide = Left(cadLoc, 2)
+
+    If bSide = cSide Then
+        PullcoreLocationScore = -1#
+    Else
+        PullcoreLocationScore = 5#
+    End If
+End Function
+
+' ============================================================
+' TOP/BOT INS FALLBACK FROM CAD GEOMETRY
+' ============================================================
+
+Private Sub AddMissingTopBotInsFromCadGeometry()
+On Error GoTo ErrHandler
+
+    Dim haveTop As Boolean
+    Dim haveBot As Boolean
+
+    haveTop = ExportQuoteExists("TOP INS")
+    haveBot = ExportQuoteExists("BOT INS")
+
+    If haveTop And haveBot Then
+        LogLine "TOP/BOT INS already present. Geometry fallback not needed."
+        Exit Sub
+    End If
+
+    Dim candidates As Collection
+    Set candidates = FindInsertCadCandidates()
+
+    If candidates Is Nothing Or candidates.count = 0 Then
+        LogLine "No insert geometry candidates found."
+        Exit Sub
+    End If
+
+    LogQuarterInchCadCandidates candidates
+
+    Dim idxTop As Long
+    Dim idxBot As Long
+
+    idxTop = 0
+    idxBot = 0
+
+    Dim tgtLarge As Double
+    Dim tgtSmall As Double
+
+    If ComputeInsTargetFromHolderAndPot(tgtLarge, tgtSmall) Then
+        LogLine "INS target from formula: " & _
+                FormatNumberForCsv(tgtLarge) & " x " & FormatNumberForCsv(tgtSmall) & " x 0.25"
+
+        FindInsPairByTargetSize candidates, tgtLarge, tgtSmall, idxTop, idxBot
+    End If
+
+    If idxTop = 0 Or idxBot = 0 Then
+        FindLargestSameSizeQuarterInchPairCandidates candidates, idxTop, idxBot
+    End If
+
+    If idxTop = 0 Or idxBot = 0 Then
+        FindLightestAndHeaviestCandidate candidates, idxTop, idxBot
+    End If
+
+    If idxTop > 0 And haveTop = False Then
+        AddExportRowFromCadPart "TOP INS", idxTop
+        parts(idxTop).UsedForBomMatch = True
+        LogLine "Added TOP INS from CAD geometry: " & parts(idxTop).componentName
+    End If
+
+    If idxBot > 0 And haveBot = False Then
+        AddExportRowFromCadPart "BOT INS", idxBot
+        parts(idxBot).UsedForBomMatch = True
+        LogLine "Added BOT INS from CAD geometry: " & parts(idxBot).componentName
+    End If
+
+    Exit Sub
+
+ErrHandler:
+    LogLine "AddMissingTopBotInsFromCadGeometry error: " & Err.Description
+End Sub
+
+Private Function ComputeInsTargetFromHolderAndPot(ByRef tgtLarge As Double, ByRef tgtSmall As Double) As Boolean
+On Error GoTo ErrHandler
+
+    Dim hL As Double, hW As Double, hT As Double
+    Dim pL As Double, pW As Double, pT As Double
+
+    If Not GetMatchedDimsByQuote("ID HOLDER", hL, hW, hT) Then
+        If Not GetMatchedDimsByQuote("OD HOLDER", hL, hW, hT) Then Exit Function
+    End If
+
+    If Not GetMatchedDimsByQuote("ID POT BLOCK", pL, pW, pT) Then
+        If Not GetMatchedDimsByQuote("OD POT BLOCK", pL, pW, pT) Then
+            If Not GetMatchedDimsByQuote("POT BLOCK", pL, pW, pT) Then Exit Function
+        End If
+    End If
+
+    tgtLarge = hL
+    tgtSmall = hW + pT
+
+    ComputeInsTargetFromHolderAndPot = (tgtLarge > 0 And tgtSmall > 0)
+    Exit Function
+
+ErrHandler:
+    ComputeInsTargetFromHolderAndPot = False
+End Function
+
+Private Function GetMatchedDimsByQuote(ByVal quoteName As String, _
+                                       ByRef L As Double, ByRef W As Double, ByRef T As Double) As Boolean
+On Error GoTo ErrHandler
+
+    Dim key As String
+    key = NormalizeKey(quoteName)
+
+    Dim i As Long
+
+    For i = 1 To ExportCount
+        If NormalizeKey(ExportRows(i).quoteName) = key Then
+            If ExportRows(i).Length > 0 Then
+                L = ExportRows(i).Length
+                W = ExportRows(i).Width
+                T = ExportRows(i).Thickness
+            Else
+                L = ExportRows(i).BomLength
+                W = ExportRows(i).BomWidth
+                T = ExportRows(i).BomThickness
+            End If
+
+            GetMatchedDimsByQuote = (L > 0)
+            Exit Function
+        End If
+    Next i
+
+    Exit Function
+
+ErrHandler:
+    GetMatchedDimsByQuote = False
+End Function
+
+Private Sub FindInsPairByTargetSize(ByVal candidates As Collection, _
+                                    ByVal tgtLarge As Double, ByVal tgtSmall As Double, _
+                                    ByRef idxTop As Long, ByRef idxBot As Long)
+On Error GoTo ErrHandler
+
+    Dim best1 As Long
+    Dim best2 As Long
+    Dim d1 As Double
+    Dim d2 As Double
+
+    best1 = 0
+    best2 = 0
+    d1 = 1E+99
+    d2 = 1E+99
+
+    Dim n As Long
+    Dim idx As Long
+    Dim cL As Double
+    Dim cS As Double
+    Dim dist As Double
+
+    For n = 1 To candidates.count
+
+        idx = CLng(candidates(n))
+
+        cL = parts(idx).Length
+        cS = parts(idx).Width
+
+        dist = Abs(cL - tgtLarge) + Abs(cS - tgtSmall)
+
+        If dist <= 2# Then
+            If dist < d1 Then
+                d2 = d1
+                best2 = best1
+                d1 = dist
+                best1 = idx
+            ElseIf dist < d2 Then
+                d2 = dist
+                best2 = idx
+            End If
+        End If
+
+    Next n
+
+    If best1 > 0 And best2 > 0 Then
+
+        If parts(best1).massValue <= parts(best2).massValue Then
+            idxTop = best1
+            idxBot = best2
+        Else
+            idxTop = best2
+            idxBot = best1
+        End If
+
+    Else
+
+        idxTop = best1
+        idxBot = best2
+
+    End If
+
+    Exit Sub
+
+ErrHandler:
+    LogLine "FindInsPairByTargetSize error: " & Err.Description
+End Sub
+
+Private Function FindInsertCadCandidates() As Collection
+On Error GoTo ErrHandler
+
+    Dim result As New Collection
+
+    Dim i As Long
+
+    For i = 1 To PartCount
+        If parts(i).UsedForBomMatch = False Then
+            If IsInsertCadGeometryCandidate(i) Then
+                result.Add i
+            End If
+        End If
+    Next i
+
+    Set FindInsertCadCandidates = result
+    Exit Function
+
+ErrHandler:
+    Set FindInsertCadCandidates = New Collection
+End Function
+
+Private Function IsInsertCadGeometryCandidate(ByVal cadIdx As Long) As Boolean
+    If cadIdx <= 0 Then Exit Function
+
+    If Abs(parts(cadIdx).Thickness - QUARTER_INCH_THICKNESS) <= INSERT_THICKNESS_TOL Then
+        IsInsertCadGeometryCandidate = True
+        Exit Function
+    End If
+
+    Dim hay As String
+    hay = UCase(parts(cadIdx).cleanName & " " & parts(cadIdx).componentName)
+
+    If InStr(hay, "INS") > 0 Or InStr(hay, "INSERT") > 0 Then
+        IsInsertCadGeometryCandidate = True
+    End If
+End Function
+
+Private Sub FindLargestSameSizeQuarterInchPairCandidates(ByVal candidates As Collection, _
+                                                         ByRef idxA As Long, _
+                                                         ByRef idxB As Long)
+On Error GoTo ErrHandler
+
+    idxA = 0
+    idxB = 0
+
+    If candidates Is Nothing Then Exit Sub
+    If candidates.count < 2 Then Exit Sub
+
+    Dim bestVol As Double
+    bestVol = -1
+
+    Dim i As Long
+    Dim j As Long
+    Dim a As Long
+    Dim b As Long
+
+    For i = 1 To candidates.count - 1
+
+        a = CLng(candidates(i))
+
+        For j = i + 1 To candidates.count
+
+            b = CLng(candidates(j))
+
+            If SameWidthLengthPair(a, b) Then
+
+                Dim vol As Double
+                vol = parts(a).BBoxVolume + parts(b).BBoxVolume
+
+                If vol > bestVol Then
+                    bestVol = vol
+                    idxA = a
+                    idxB = b
+                End If
+
+            End If
+
+        Next j
+
+    Next i
+
+    Exit Sub
+
+ErrHandler:
+    LogLine "FindLargestSameSizeQuarterInchPairCandidates error: " & Err.Description
+End Sub
+
+Private Function SameWidthLengthPair(ByVal a As Long, ByVal b As Long) As Boolean
+    If a <= 0 Or b <= 0 Then Exit Function
+
+    If Abs(parts(a).Length - parts(b).Length) <= INSERT_LENGTH_MATCH_TOL Then
+        If Abs(parts(a).Width - parts(b).Width) <= INSERT_WIDTH_MATCH_TOL Then
+            SameWidthLengthPair = True
+        End If
+    End If
+End Function
+
+Private Sub FindLightestAndHeaviestCandidate(ByVal candidates As Collection, _
+                                             ByRef lightIdx As Long, _
+                                             ByRef heavyIdx As Long)
+On Error GoTo ErrHandler
+
+    lightIdx = 0
+    heavyIdx = 0
+
+    If candidates Is Nothing Then Exit Sub
+    If candidates.count = 0 Then Exit Sub
+
+    Dim i As Long
+    Dim c As Long
+    Dim lightMass As Double
+    Dim heavyMass As Double
+
+    lightMass = 1E+15
+    heavyMass = -1
+
+    For i = 1 To candidates.count
+
+        c = CLng(candidates(i))
+
+        If parts(c).massValue < lightMass Then
+            lightMass = parts(c).massValue
+            lightIdx = c
+        End If
+
+        If parts(c).massValue > heavyMass Then
+            heavyMass = parts(c).massValue
+            heavyIdx = c
+        End If
+
+    Next i
+
+    If lightIdx = heavyIdx Then heavyIdx = 0
+
+    Exit Sub
+
+ErrHandler:
+    LogLine "FindLightestAndHeaviestCandidate error: " & Err.Description
+End Sub
+
+Private Sub AddExportRowFromCadPart(ByVal quoteName As String, ByVal cadIdx As Long)
+On Error GoTo ErrHandler
+
+    If cadIdx <= 0 Then Exit Sub
+
+    ExportCount = ExportCount + 1
+    ReDim Preserve ExportRows(1 To ExportCount)
+
+    ExportRows(ExportCount).quoteName = quoteName
+    ExportRows(ExportCount).Quantity = parts(cadIdx).Quantity
+    ExportRows(ExportCount).material = DEFAULT_STEEL_TYPE
+
+    ExportRows(ExportCount).CadPartIndex = cadIdx
+    ExportRows(ExportCount).HasCad = True
+
+    ExportRows(ExportCount).Thickness = parts(cadIdx).Thickness
+    ExportRows(ExportCount).Width = parts(cadIdx).Width
+    ExportRows(ExportCount).Length = parts(cadIdx).Length
+
+    ExportRows(ExportCount).BomThickness = 0
+    ExportRows(ExportCount).BomWidth = 0
+    ExportRows(ExportCount).BomLength = 0
+    ExportRows(ExportCount).HasBomDims = False
+
+    ExportRows(ExportCount).Status = "FROM CAD GEOMETRY"
+    Exit Sub
+
+ErrHandler:
+    LogLine "AddExportRowFromCadPart error: " & Err.Description
+End Sub
+
+Private Function ExportQuoteExists(ByVal quoteName As String) As Boolean
+    Dim k As String
+    k = NormalizeKey(quoteName)
+
+    Dim i As Long
+
+    For i = 1 To ExportCount
+        If NormalizeKey(ExportRows(i).quoteName) = k Then
+            ExportQuoteExists = True
+            Exit Function
+        End If
+    Next i
+End Function
+
+Private Sub LogQuarterInchCadCandidates(ByVal candidates As Collection)
+On Error Resume Next
+
+    If candidates Is Nothing Then Exit Sub
+
+    Dim i As Long
+    Dim c As Long
+
+    LogLine "Insert geometry candidates: " & candidates.count
+
+    For i = 1 To candidates.count
+        c = CLng(candidates(i))
+
+        LogLine "  CAND: " & parts(c).componentName & _
+                " L=" & FormatNumberForCsv(parts(c).Length) & _
+                " W=" & FormatNumberForCsv(parts(c).Width) & _
+                " T=" & FormatNumberForCsv(parts(c).Thickness) & _
+                " mass=" & FormatNumberForCsv(parts(c).massValue)
+    Next i
+End Sub
+
+' ============================================================
+' J BLOCK PACKAGE
+' ============================================================
+
+Private Sub ExportJBlockPackage(ByVal outputFolder As String)
+On Error GoTo ErrHandler
+
+    If swModel Is Nothing Then Exit Sub
+
+    Dim jbIdx As Long
+    jbIdx = FindBestJBlockIndex()
+
+    If jbIdx <= 0 Then
+        LogLine "J BLOCK package: no J BLOCK CAD part found."
+        Exit Sub
+    End If
+
+    Dim jbFolder As String
+    jbFolder = outputFolder & "\" & CurrentJobNumber & " " & J_BLOCK_FOLDER_NAME
+
+    EnsureFolderDeep jbFolder
+
+    LogLine "J BLOCK CAD selected: " & parts(jbIdx).componentName
+
+    ExportJBlockBaseExactPackage jbFolder, jbIdx
+
+    Dim camIdx As Long
+    camIdx = FindBestEjectorCamIndex()
+
+    If camIdx > 0 Then
+        LogLine "Ejector CAM CAD selected: " & parts(camIdx).componentName
+        ExportJBlockCamDxfOnly jbFolder, camIdx
+    Else
+        LogLine "J BLOCK package: ejector CAM not found (skipping CAM DXF)."
+    End If
+
+    Exit Sub
+
+ErrHandler:
+    LogLine "ExportJBlockPackage error: " & Err.Description
+End Sub
+
+Private Function FindBestJBlockIndex() As Long
+On Error GoTo ErrHandler
+
+    FindBestJBlockIndex = 0
+
+    Dim bestIdx As Long
+    Dim bestScore As Double
+
+    bestIdx = 0
+    bestScore = -1
+
+    Dim fbIdx As Long
+    Dim fbDist As Double
+
+    fbIdx = 0
+    fbDist = 1E+99
+
+    Dim i As Long
+
+    For i = 1 To PartCount
+
+        If parts(i).UsedForBomMatch Then GoTo NextPart
+
+        Dim dist As Double
+
+        dist = Abs(parts(i).Length - JBlockTgtL) * 2# _
+             + Abs(parts(i).Width - JBlockTgtW) _
+             + Abs(parts(i).Thickness - JBlockTgtT)
+
+        If dist < fbDist Then
+            fbDist = dist
+            fbIdx = i
+        End If
+
+        Dim score As Double
+        score = 0
+
+        Dim hay As String
+        hay = parts(i).cleanName & " " & parts(i).componentName & " " & parts(i).filePath
+
+        If ContainsAnyPipeKey(hay, J_BLOCK_NAME_KEYS) Then score = score + 5000
+
+        If IsPossibleJBlockByDims(parts(i).Length, parts(i).Width, parts(i).Thickness) Then
+            score = score + (1000# - dist * 100#)
+        End If
+
+        If score > bestScore Then
+            bestScore = score
+            bestIdx = i
+        End If
+
+NextPart:
+    Next i
+
+    LogJBlockCandidates
+
+    If bestScore <= 0 Then
+
+        If fbIdx > 0 And fbDist <= 1.6 Then
+            FindBestJBlockIndex = fbIdx
+            LogLine "J BLOCK fallback closest bbox: " & parts(fbIdx).componentName
+        Else
+            FindBestJBlockIndex = 0
+        End If
+
+    Else
+
+        FindBestJBlockIndex = bestIdx
+        LogLine "J BLOCK best match: " & parts(bestIdx).componentName
+
+    End If
+
+    Exit Function
+
+ErrHandler:
+    LogLine "FindBestJBlockIndex error: " & Err.Description
+    FindBestJBlockIndex = 0
+End Function
+
+Private Sub LogJBlockCandidates()
+On Error Resume Next
+
+    Dim i As Long
+
+    For i = 1 To PartCount
+
+        Dim hay As String
+        hay = parts(i).cleanName & " " & parts(i).componentName
+
+        If ContainsAnyPipeKey(hay, J_BLOCK_NAME_KEYS) Or _
+           IsPossibleJBlockByDims(parts(i).Length, parts(i).Width, parts(i).Thickness) Then
+
+            LogLine "  JBLOCK CAND: " & parts(i).componentName & _
+                    " L=" & FormatNumberForCsv(parts(i).Length) & _
+                    " W=" & FormatNumberForCsv(parts(i).Width) & _
+                    " T=" & FormatNumberForCsv(parts(i).Thickness)
+        End If
+
+    Next i
+End Sub
+
+Private Function FindBestEjectorCamIndex() As Long
+On Error GoTo ErrHandler
+
+    FindBestEjectorCamIndex = 0
+
+    Dim bestIdx As Long
+    Dim bestScore As Double
+
+    bestIdx = 0
+    bestScore = -1
+
+    Dim i As Long
+
+    For i = 1 To PartCount
+
+        Dim score As Double
+        score = 0
+
+        Dim hay As String
+        hay = parts(i).cleanName & " " & parts(i).componentName & " " & parts(i).filePath
+
+        If ContainsAnyPipeKey(hay, EJECTOR_CAM_NAME_KEYS) Then score = score + 60
+        If IsPossibleCamByDims(parts(i).Length, parts(i).Width, parts(i).Thickness) Then score = score + 30
+
+        If InStr(UCase(hay), "PULLCORE") > 0 Or InStr(UCase(hay), "PULL CORE") > 0 Then score = score - 80
+
+        If score > bestScore Then
+            bestScore = score
+            bestIdx = i
+        End If
+
+    Next i
+
+    LogEjectorCamCandidates
+
+    If bestScore <= 0 Then
+        FindBestEjectorCamIndex = 0
+    Else
+        FindBestEjectorCamIndex = bestIdx
+    End If
+
+    Exit Function
+
+ErrHandler:
+    LogLine "FindBestEjectorCamIndex error: " & Err.Description
+    FindBestEjectorCamIndex = 0
+End Function
+
+Private Sub LogEjectorCamCandidates()
+On Error Resume Next
+
+    Dim i As Long
+
+    For i = 1 To PartCount
+
+        Dim hay As String
+        hay = parts(i).cleanName & " " & parts(i).componentName
+
+        If ContainsAnyPipeKey(hay, EJECTOR_CAM_NAME_KEYS) Then
+            LogLine "  EJ CAM CAND: " & parts(i).componentName
+        End If
+
+    Next i
+End Sub
+
+Private Sub ExportJBlockBaseExactPackage(ByVal jbFolder As String, ByVal jbIdx As Long)
+On Error GoTo ErrHandler
+
+    If jbIdx <= 0 Then Exit Sub
+
+    Dim p As PartInfo
+    p = parts(jbIdx)
+
+    Dim custToken As String
+    Dim dateToken As String
+
+    custToken = CleanFileName(CustomerNumber)
+    dateToken = CleanFileName(DateCode)
+
+    If custToken = "" Then custToken = "UNKNOWN"
+    If dateToken = "" Then dateToken = Format(Date, "mm-dd-yyyy")
+
+    Dim jbToken As String
+    jbToken = CleanQuoteTokenForFile(J_BLOCK_BASE_FILE_TOKEN)
+
+    If jbToken = "" Then jbToken = "J BLOCK"
+
+    Dim xtPath As String
+    Dim dxfPath As String
+
+    xtPath = jbFolder & "\" & CurrentJobNumber & "_" & jbToken & "_" & custToken & "_" & dateToken & ".x_t"
+    dxfPath = jbFolder & "\" & CurrentJobNumber & "_" & jbToken & "_" & custToken & "_" & dateToken & ".dxf"
+
+    xtPath = GetUniqueFilePath(xtPath)
+    dxfPath = GetUniqueFilePath(dxfPath)
+
+    LogLine "Exporting J BLOCK base XT + DXF."
+
+    If swModel.GetType = swDocASSEMBLY Then
+        ExportAssemblyComponentBySuppressRestWithOptionalDxf swModel, p, xtPath, dxfPath, "J BLOCK", False
+    ElseIf swModel.GetType = swDocPART Then
+        If p.isBodyOnly Then
+            ShowOnlyPartBody swModel, p.bodyName
+            SaveModelAs swModel, xtPath
+            ShowAllPartBodies swModel
+        Else
+            SaveModelAs swModel, xtPath
+        End If
+    End If
+
+    If swModel.GetType = swDocASSEMBLY Then
+        If CreateJBlockDxfFromAssemblyTopView(jbFolder, p, dxfPath) Then
+            LogLine "J BLOCK DXF built from native assembly top-view path."
+            Exit Sub
+        Else
+            LogLine "WARNING: J BLOCK native assembly DXF failed; falling back to part-based DXF."
+        End If
+    End If
+
+    CreateProjectedDxfFromXtPath xtPath, dxfPath, "J BLOCK", _
+                                  J_BLOCK_PARENT_VIEW_PRIMARY, J_BLOCK_PARENT_VIEW_FALLBACK, _
+                                  True, False, False
+
+    Exit Sub
+
+ErrHandler:
+    LogLine "ExportJBlockBaseExactPackage error: " & Err.Description
+    On Error Resume Next
+    UnsuppressAllAssemblyComponents swModel
+    ShowAllAssemblyComponents swModel
+End Sub
+
+Private Function CreateJBlockDxfFromAssemblyTopView(ByVal jbFolder As String, _
+                                                    ByRef p As PartInfo, _
+                                                    ByVal dxfPath As String) As Boolean
+On Error GoTo ErrHandler
+
+    CreateJBlockDxfFromAssemblyTopView = False
+
+    If swModel Is Nothing Then Exit Function
+    If swModel.GetType <> swDocASSEMBLY Then Exit Function
+
+    Dim keepNames As Collection
+    Set keepNames = New Collection
+    AddUniqueComponentName keepNames, p.componentName
+
+    Dim tempFolder As String
+    Dim tempNativePath As String
+
+    tempFolder = Environ$("TEMP") & "\CMS_JBLOCK_DXF_" & Format(Now, "yyyymmdd_hhnnss")
+    EnsureFolderDeep tempFolder
+
+    ' IMPORTANT:
+    ' Use native SLDASM, not X_T, so CMS_TOP / standard views survive.
+    tempNativePath = tempFolder & "\" & CurrentJobNumber & "_JBLOCK_TOPVIEW_TEMP.sldasm"
+
+    Dim hiddenNames As Collection
+    Set hiddenNames = New Collection
+
+    If HideAllExceptComponentNamesOnce(swModel, keepNames, hiddenNames) = False Then
+        LogLine "J BLOCK assembly-top DXF: could not isolate J BLOCK component."
+        GoTo CleanExit
+    End If
+
+    ApplyCmsTopView swModel
+    StabilizeActiveView swModel, 100
+
+    LogLine "J BLOCK DXF: saving isolated native SLDASM for right-face center view:"
+    LogLine "  " & tempNativePath
+
+    If SaveModelCopyAs(swModel, tempNativePath) = False Then GoTo CleanExit
+
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    If fso.FileExists(tempNativePath) = False Then
+        LogLine "J BLOCK assembly-top DXF: temp native SLDASM was not created."
+        GoTo CleanExit
+    End If
+
+    ' J BLOCK center/base view must be the right face. Projected views unfold from there.
+    CreateProjectedDxfFromNativePath tempNativePath, dxfPath, "J BLOCK", _
+                                     "*Right", "*Right", _
+                                     True, False, False, False, False
+
+    CreateJBlockDxfFromAssemblyTopView = fso.FileExists(dxfPath)
+
+CleanExit:
+    On Error Resume Next
+
+    If Not hiddenNames Is Nothing Then
+        If hiddenNames.count > 0 Then
+            ShowNamedComponentsOnce swModel, hiddenNames
+        Else
+            ShowAllAssemblyComponents swModel
+        End If
+    Else
+        ShowAllAssemblyComponents swModel
+    End If
+
+    ApplyCmsTopView swModel
+
+    Dim fso2 As Object
+    Set fso2 = CreateObject("Scripting.FileSystemObject")
+    If Not fso2 Is Nothing Then
+        If tempFolder <> "" Then
+            If fso2.FolderExists(tempFolder) Then fso2.DeleteFolder tempFolder, True
+        End If
+    End If
+
+    Exit Function
+
+ErrHandler:
+    LogLine "CreateJBlockDxfFromAssemblyTopView error: " & Err.Description
+    CreateJBlockDxfFromAssemblyTopView = False
+    Resume CleanExit
+End Function
+
+Private Sub ExportJBlockCamDxfOnly(ByVal jbFolder As String, ByVal camIdx As Long)
+On Error GoTo ErrHandler
+
+    If camIdx <= 0 Then Exit Sub
+
+    Dim p As PartInfo
+    p = parts(camIdx)
+
+    Dim custToken As String
+    Dim dateToken As String
+
+    custToken = CleanFileName(CustomerNumber)
+    dateToken = CleanFileName(DateCode)
+
+    If custToken = "" Then custToken = "UNKNOWN"
+    If dateToken = "" Then dateToken = Format(Date, "mm-dd-yyyy")
+
+    Dim camToken As String
+    camToken = CleanQuoteTokenForFile(J_BLOCK_CAM_FILE_TOKEN)
+
+    If camToken = "" Then camToken = "CAM"
+
+    Dim xtPath As String
+    Dim dxfPath As String
+
+    xtPath = jbFolder & "\" & CurrentJobNumber & "_" & camToken & "_" & custToken & "_" & dateToken & ".x_t"
+    dxfPath = jbFolder & "\" & CurrentJobNumber & "_" & camToken & "_" & custToken & "_" & dateToken & ".dxf"
+
+    xtPath = GetUniqueFilePath(xtPath)
+    dxfPath = GetUniqueFilePath(dxfPath)
+
+    LogLine "Exporting J BLOCK ejector CAM XT + DXF."
+
+    If swModel.GetType = swDocASSEMBLY Then
+        ExportAssemblyComponentBySuppressRestWithOptionalDxf swModel, p, xtPath, dxfPath, "CAM", False
+    ElseIf swModel.GetType = swDocPART Then
+        If p.isBodyOnly Then
+            ShowOnlyPartBody swModel, p.bodyName
+            SaveModelAs swModel, xtPath
+            ShowAllPartBodies swModel
+        Else
+            SaveModelAs swModel, xtPath
+        End If
+    End If
+
+    CreateProjectedDxfFromXtPath xtPath, dxfPath, "CAM", _
+                                  CMS_TOP_VIEW_NAME, "*Top", True, False, False
+
+    Exit Sub
+
+ErrHandler:
+    LogLine "ExportJBlockCamDxfOnly error: " & Err.Description
+    On Error Resume Next
+    UnsuppressAllAssemblyComponents swModel
+    ShowAllAssemblyComponents swModel
+End Sub
+
+' ============================================================
+' END OF PART 6 OF 8
+' Paste Part 7 next.
+' ============================================================
+' ============================================================
+' PULLCORE CAM AND KEY PACKAGE
+' ============================================================
+
+Private Sub ExportPullcoreCamKeyPackage(ByVal outputFolder As String)
+On Error GoTo ErrHandler
+
+    If swModel Is Nothing Then Exit Sub
+
+    If PullcoreMatchCount = 0 Then
+        LogLine "PULLCORE package: no pullcore matches."
+        Exit Sub
+    End If
+
+    Dim pcFolder As String
+    pcFolder = outputFolder & "\" & CurrentJobNumber & " " & PULLCORE_CAM_KEY_FOLDER_NAME
+
+    EnsureFolderDeep pcFolder
+
+    Dim usedNames As Object
+    Set usedNames = CreateObject("Scripting.Dictionary")
+
+    Dim i As Long
+
+    For i = 1 To PullcoreMatchCount
+
+        If PullcoreMatches(i).CadPartIndex > 0 Then
+            ExportPullcoreCandidateSet pcFolder, i, usedNames
+        Else
+            LogLine "PULLCORE skipped (no CAD): " & PullcoreMatches(i).quoteName
+        End If
+
+    Next i
+
+    Exit Sub
+
+ErrHandler:
+    LogLine "ExportPullcoreCamKeyPackage error: " & Err.Description
+    On Error Resume Next
+    UnsuppressAllAssemblyComponents swModel
+    ShowAllAssemblyComponents swModel
+End Sub
+
+Private Sub ExportPullcoreCandidateSet(ByVal pcFolder As String, _
+                                       ByVal matchIdx As Long, _
+                                       ByVal usedNames As Object)
+On Error GoTo ErrHandler
+
+    Dim cadIdx As Long
+    cadIdx = PullcoreMatches(matchIdx).CadPartIndex
+
+    If cadIdx <= 0 Then Exit Sub
+
+    Dim exportName As String
+    exportName = PullcoreMatches(matchIdx).quoteName
+
+    If exportName = "" Then exportName = CleanPullcoreDisplayName(PullcoreMatches(matchIdx).Description)
+
+    If exportName = "" Then
+        If PullcoreMatches(matchIdx).isCam Then
+            exportName = "PULLCORE CAM"
+        Else
+            exportName = "PULLCORE KEY"
+        End If
+    End If
+
+    Dim baseKey As String
+    baseKey = UCase(exportName)
+
+    If Not usedNames Is Nothing Then
+
+        If usedNames.Exists(baseKey) Then
+
+            Dim n As Long
+            n = CLng(usedNames(baseKey)) + 1
+
+            usedNames(baseKey) = n
+            exportName = exportName & " " & CStr(n)
+
+        Else
+
+            usedNames(baseKey) = 1
+
+        End If
+
+    End If
+
+    LogLine "PULLCORE export name: " & exportName
+
+    ExportOneSpecialNamedPartToFolder pcFolder, cadIdx, exportName, "PULLCORE", True
+    Exit Sub
+
+ErrHandler:
+    LogLine "ExportPullcoreCandidateSet error: " & Err.Description
+End Sub
+
+' ============================================================
+' PULLCORE STOP / FLIPPER CAM COVER PACKAGE
+' ============================================================
+
+Private Sub ExportPullcoreStopPackage(ByVal outputFolder As String)
+On Error GoTo ErrHandler
+
+    If swModel Is Nothing Then Exit Sub
+
+    Dim stopIdx As Long
+    Dim coverIdx As Long
+
+    stopIdx = FindBestPartByNameAndDims(PULLCORE_STOP_NAME_KEYS, 0, 0, 0, 0)
+
+    coverIdx = FindBestPartByNameAndDims(FLIPPER_CAM_COVER_NAME_KEYS, _
+                                         FLIPPER_CAM_COVER_TARGET_THICKNESS, _
+                                         FLIPPER_CAM_COVER_TARGET_WIDTH, _
+                                         FLIPPER_CAM_COVER_TARGET_LENGTH, _
+                                         FLIPPER_CAM_COVER_DIM_TOL)
+
+    If stopIdx <= 0 And coverIdx <= 0 Then
+        LogLine "PULLCORE STOP package: no stop or cover found."
+        Exit Sub
+    End If
+
+    Dim stopFolder As String
+    stopFolder = outputFolder & "\" & CurrentJobNumber & " " & PULLCORE_STOP_FOLDER_NAME
+
+    EnsureFolderDeep stopFolder
+
+    If stopIdx > 0 Then
+        LogLine "Pullcore STOP CAD: " & parts(stopIdx).componentName
+        ExportOneSpecialNamedPartToFolder stopFolder, stopIdx, "PULLCORE STOP", "PULLCORE STOP", True
+    End If
+
+    If coverIdx > 0 Then
+        LogLine "Flipper CAM COVER CAD: " & parts(coverIdx).componentName
+        ExportOneSpecialNamedPartToFolder stopFolder, coverIdx, "FLIPPER CAM COVER PLATE", "FLIPPER CAM COVER PLATE", True
+    End If
+
+    Exit Sub
+
+ErrHandler:
+    LogLine "ExportPullcoreStopPackage error: " & Err.Description
+    On Error Resume Next
+    UnsuppressAllAssemblyComponents swModel
+    ShowAllAssemblyComponents swModel
+End Sub
+
+Private Function FindBestPartByNameAndDims(ByVal pipeKeys As String, _
+                                           ByVal targetT As Double, _
+                                           ByVal targetW As Double, _
+                                           ByVal targetL As Double, _
+                                           ByVal tol As Double) As Long
+On Error GoTo ErrHandler
+
+    FindBestPartByNameAndDims = 0
+
+    Dim bestIdx As Long
+    Dim bestScore As Double
+
+    bestIdx = 0
+    bestScore = -1
+
+    Dim i As Long
+
+    For i = 1 To PartCount
+
+        Dim score As Double
+        score = 0
+
+        Dim hay As String
+        hay = parts(i).cleanName & " " & parts(i).componentName & " " & parts(i).filePath
+
+        If ContainsAnyPipeKey(hay, pipeKeys) Then score = score + 100
+
+        If targetT > 0 And targetW > 0 And targetL > 0 And tol > 0 Then
+            If Abs(parts(i).Thickness - targetT) <= tol Then
+                If Abs(parts(i).Width - targetW) <= tol Then
+                    If Abs(parts(i).Length - targetL) <= tol Then
+                        score = score + 40
+                    End If
+                End If
+            End If
+        End If
+
+        If score > bestScore Then
+            bestScore = score
+            bestIdx = i
+        End If
+
+    Next i
+
+    If bestScore <= 0 Then
+        FindBestPartByNameAndDims = 0
+    Else
+        FindBestPartByNameAndDims = bestIdx
+    End If
+
+    Exit Function
+
+ErrHandler:
+    LogLine "FindBestPartByNameAndDims error: " & Err.Description
+    FindBestPartByNameAndDims = 0
+End Function
+
+Private Sub ExportOneSpecialNamedPartToFolder(ByVal folderPath As String, _
+                                              ByVal cadIdx As Long, _
+                                              ByVal exportName As String, _
+                                              ByVal dxfQuoteName As String, _
+                                              ByVal makeWireframe As Boolean)
+On Error GoTo ErrHandler
+
+    If cadIdx <= 0 Then Exit Sub
+
+    EnsureFolderDeep folderPath
+
+    Dim p As PartInfo
+    p = parts(cadIdx)
+
+    Dim quoteToken As String
+    quoteToken = CleanQuoteTokenForFile(exportName)
+
+    If quoteToken = "" Then quoteToken = "ITEM"
+
+    Dim custToken As String
+    Dim dateToken As String
+
+    custToken = CleanFileName(CustomerNumber)
+    dateToken = CleanFileName(DateCode)
+
+    If custToken = "" Then custToken = "UNKNOWN"
+    If dateToken = "" Then dateToken = Format(Date, "mm-dd-yyyy")
+
+    Dim xtPath As String
+    Dim dxfPath As String
+
+    xtPath = folderPath & "\" & CurrentJobNumber & "_" & quoteToken & "_" & custToken & "_" & dateToken & ".x_t"
+    dxfPath = folderPath & "\" & CurrentJobNumber & "_" & quoteToken & "_" & custToken & "_" & dateToken & ".dxf"
+
+    xtPath = GetUniqueFilePath(xtPath)
+    dxfPath = GetUniqueFilePath(dxfPath)
+
+    LogLine "Special export: " & exportName & " -> " & xtPath
+
+    If swModel.GetType = swDocASSEMBLY Then
+
+        ExportAssemblyComponentBySuppressRestWithOptionalDxf swModel, p, xtPath, dxfPath, dxfQuoteName, False
+
+    ElseIf swModel.GetType = swDocPART Then
+
+        If p.isBodyOnly Then
+            ShowOnlyPartBody swModel, p.bodyName
+            SaveModelAs swModel, xtPath
+            ShowAllPartBodies swModel
+        Else
+            SaveModelAs swModel, xtPath
+        End If
+
+    End If
+
+    Dim oldStraightenAngle As Double
+    Dim oldPullcoreCadIdx As Long
+
+    oldStraightenAngle = CurrentDxfStraightenAngleRad
+    oldPullcoreCadIdx = CurrentPullcoreStraightenCadIndex
+
+    CurrentDxfStraightenAngleRad = 0#
+    CurrentPullcoreStraightenCadIndex = 0
+
+    If STRAIGHTEN_PULLCORE_DXF And UCase(Trim(dxfQuoteName)) = "PULLCORE" Then
+        CurrentPullcoreStraightenCadIndex = cadIdx
+
+        LogLine "PULLCORE: using matched CAD component for straightening: " & _
+                parts(cadIdx).componentName
+    End If
+
+    CreateProjectedDxfFromXtPath xtPath, dxfPath, dxfQuoteName, _
+                                  "*Front", "*Front", makeWireframe, False, False, False, False
+
+    CurrentDxfStraightenAngleRad = oldStraightenAngle
+    CurrentPullcoreStraightenCadIndex = oldPullcoreCadIdx
+
+    Exit Sub
+
+ErrHandler:
+    LogLine "ExportOneSpecialNamedPartToFolder error (" & exportName & "): " & Err.Description
+    On Error Resume Next
+    CurrentDxfStraightenAngleRad = 0#
+    CurrentPullcoreStraightenCadIndex = 0
+    UnsuppressAllAssemblyComponents swModel
+    ShowAllAssemblyComponents swModel
+End Sub
+
+' ============================================================
+' PULLCORE BEST-FIT BBOX / STRAIGHTENING
+' ============================================================
+
+Private Function TryGetPullcoreBestFitDims(ByVal cadIdx As Long, _
+                                           ByRef outL As Double, _
+                                           ByRef outW As Double, _
+                                           ByRef outT As Double) As Boolean
+On Error GoTo ErrHandler
+
+    TryGetPullcoreBestFitDims = False
+
+    If cadIdx <= 0 Or cadIdx > PartCount Then Exit Function
+
+    If PullcoreBestFitDimCache Is Nothing Then
+        Set PullcoreBestFitDimCache = CreateObject("Scripting.Dictionary")
+    End If
+
+    Dim cacheKey As String
+    cacheKey = CStr(cadIdx)
+
+    If PullcoreBestFitDimCache.Exists(cacheKey) Then
+        Dim cached() As String
+        cached = Split(CStr(PullcoreBestFitDimCache(cacheKey)), "|")
+
+        If UBound(cached) >= 2 Then
+            outL = CDbl(cached(0))
+            outW = CDbl(cached(1))
+            outT = CDbl(cached(2))
+
+            TryGetPullcoreBestFitDims = (outL > 0 And outW > 0 And outT > 0)
+            Exit Function
+        End If
+    End If
+
+    Dim partModel As Object
+    Set partModel = GetModelDocForCadIndex(cadIdx)
+
+    If partModel Is Nothing Then
+        LogLine "PULLCORE best-fit bbox skipped: could not open part model for '" & parts(cadIdx).componentName & "'"
+        Exit Function
+    End If
+
+    If partModel.GetType <> swDocPART Then
+        LogLine "PULLCORE best-fit bbox skipped: '" & parts(cadIdx).componentName & "' is not a part document."
+        Exit Function
+    End If
+
+    If TryCreateAndReadBestFitBoundingBox(partModel, outL, outW, outT) Then
+
+        SortThreeDimensions outL, outW, outT, outL, outW, outT
+
+        outL = Round(outL, DIM_DECIMALS)
+        outW = Round(outW, DIM_DECIMALS)
+        outT = Round(outT, DIM_DECIMALS)
+
+        PullcoreBestFitDimCache(cacheKey) = CStr(outL) & "|" & CStr(outW) & "|" & CStr(outT)
+
+        LogLine "PULLCORE best-fit bbox for " & parts(cadIdx).componentName & " = " & _
+                FormatNumberForCsv(outL) & "/" & FormatNumberForCsv(outW) & "/" & FormatNumberForCsv(outT)
+
+        TryGetPullcoreBestFitDims = True
+
+    End If
+
+    Exit Function
+
+ErrHandler:
+    LogLine "TryGetPullcoreBestFitDims error (cadIdx " & cadIdx & "): " & Err.Description
+    TryGetPullcoreBestFitDims = False
+End Function
+
+Private Function TryComputePullcoreStraightenAngleFromMatchedCad(ByVal cadIdx As Long, _
+                                                                 ByRef detectedDegOut As Double) As Boolean
+On Error GoTo ErrHandler
+
+    TryComputePullcoreStraightenAngleFromMatchedCad = False
+    detectedDegOut = 0#
+
+    If cadIdx <= 0 Or cadIdx > PartCount Then Exit Function
+
+    Dim matchIdx As Long
+    matchIdx = FindPullcoreMatchIndexByCadIndex(cadIdx)
+
+    If matchIdx > 0 Then
+
+        If Abs(PullcoreMatches(matchIdx).DetectedAngleDeg) >= PULLCORE_STRAIGHTEN_MIN_DEG Then
+            detectedDegOut = PullcoreMatches(matchIdx).DetectedAngleDeg
+            LogLine "PULLCORE angle from stored original/fitted bbox report: " & _
+                    Format(detectedDegOut, "0.00") & " deg"
+            TryComputePullcoreStraightenAngleFromMatchedCad = True
+            Exit Function
+        End If
+
+        If PullcoreMatches(matchIdx).FittedLength > 0 And _
+           PullcoreMatches(matchIdx).OriginalLength > 0 Then
+
+            detectedDegOut = EstimatePullcoreAngleFromFittedAndOriginalDeg( _
+                PullcoreMatches(matchIdx).FittedLength, _
+                PullcoreMatches(matchIdx).FittedWidth, _
+                PullcoreMatches(matchIdx).FittedThickness, _
+                PullcoreMatches(matchIdx).OriginalLength, _
+                PullcoreMatches(matchIdx).OriginalWidth, _
+                PullcoreMatches(matchIdx).OriginalThickness)
+
+            If Abs(detectedDegOut) >= PULLCORE_STRAIGHTEN_MIN_DEG Then
+                TryComputePullcoreStraightenAngleFromMatchedCad = True
+                Exit Function
+            End If
+
+        End If
+
+    End If
+
+    Dim partModel As Object
+    Set partModel = GetModelDocForCadIndex(cadIdx)
+
+    Dim modelEdgeDeg As Double
+
+    If Not partModel Is Nothing Then
+        If partModel.GetType = swDocPART Then
+
+            If TryComputePullcoreLongestModelEdgeAngleFromModel(partModel, modelEdgeDeg) Then
+                If Abs(modelEdgeDeg) >= PULLCORE_STRAIGHTEN_MIN_DEG Then
+                    detectedDegOut = modelEdgeDeg
+                    TryComputePullcoreStraightenAngleFromMatchedCad = True
+                    Exit Function
+                End If
+            End If
+
+        End If
+    End If
+
+    Dim bestL As Double
+    Dim bestW As Double
+    Dim bestT As Double
+
+    If TryGetPullcoreMatchedReportDims(cadIdx, bestL, bestW, bestT) Then
+        detectedDegOut = EstimatePullcoreAngleFromFittedAndOriginalDeg(bestL, bestW, bestT, _
+            parts(cadIdx).OriginalAsmLength, parts(cadIdx).OriginalAsmWidth, parts(cadIdx).OriginalAsmThickness)
+
+        If Abs(detectedDegOut) >= PULLCORE_STRAIGHTEN_MIN_DEG Then
+            TryComputePullcoreStraightenAngleFromMatchedCad = True
+            Exit Function
+        End If
+    End If
+
+    Exit Function
+
+ErrHandler:
+    LogLine "TryComputePullcoreStraightenAngleFromMatchedCad error: " & Err.Description
+    TryComputePullcoreStraightenAngleFromMatchedCad = False
+End Function
+
+Private Function FindPullcoreMatchIndexByCadIndex(ByVal cadIdx As Long) As Long
+On Error GoTo ErrHandler
+
+    FindPullcoreMatchIndexByCadIndex = 0
+
+    If cadIdx <= 0 Then Exit Function
+
+    Dim i As Long
+
+    For i = 1 To PullcoreMatchCount
+        If PullcoreMatches(i).CadPartIndex = cadIdx Then
+            FindPullcoreMatchIndexByCadIndex = i
+            Exit Function
+        End If
+    Next i
+
+    Exit Function
+
+ErrHandler:
+    FindPullcoreMatchIndexByCadIndex = 0
+End Function
+
+Private Function TryGetPullcoreMatchedReportDims(ByVal cadIdx As Long, _
+                                                 ByRef outL As Double, _
+                                                 ByRef outW As Double, _
+                                                 ByRef outT As Double) As Boolean
+On Error GoTo ErrHandler
+
+    TryGetPullcoreMatchedReportDims = False
+
+    outL = 0#
+    outW = 0#
+    outT = 0#
+
+    If cadIdx <= 0 Then Exit Function
+
+    Dim i As Long
+
+    For i = 1 To PullcoreMatchCount
+
+        If PullcoreMatches(i).CadPartIndex = cadIdx Then
+
+            If PullcoreMatches(i).FittedLength > 0 And _
+               PullcoreMatches(i).FittedWidth > 0 And _
+               PullcoreMatches(i).FittedThickness > 0 Then
+
+                outL = PullcoreMatches(i).FittedLength
+                outW = PullcoreMatches(i).FittedWidth
+                outT = PullcoreMatches(i).FittedThickness
+
+                TryGetPullcoreMatchedReportDims = True
+                Exit Function
+
+            End If
+
+        End If
+
+    Next i
+
+    Exit Function
+
+ErrHandler:
+    TryGetPullcoreMatchedReportDims = False
+End Function
+
+Private Function TryComputePullcoreBestFitStraightenAngleFromNativePath(ByVal nativePath As String, _
+                                                                        ByRef detectedDegOut As Double) As Boolean
+On Error GoTo ErrHandler
+
+    TryComputePullcoreBestFitStraightenAngleFromNativePath = False
+    detectedDegOut = 0#
+
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    If fso.FileExists(nativePath) = False Then Exit Function
+
+    Dim ext As String
+    ext = LCase(fso.GetExtensionName(nativePath))
+
+    Dim errs As Long
+    Dim warns As Long
+    Dim mdl As Object
+
+    If ext = "sldasm" Then
+        Set mdl = swApp.OpenDoc6(nativePath, swDocASSEMBLY, swOpenDocOptions_Silent, "", errs, warns)
+    Else
+        Set mdl = swApp.OpenDoc6(nativePath, swDocPART, swOpenDocOptions_Silent, "", errs, warns)
+    End If
+
+    If mdl Is Nothing Then Exit Function
+
+    swApp.ActivateDoc3 mdl.GetTitle, False, 0, errs
+    EnsureSwHidden
+
+    Dim modelEdgeDeg As Double
+    Dim mathDeg As Double
+
+    If TryComputePullcoreLongestModelEdgeAngleFromModel(mdl, modelEdgeDeg) Then
+        If Abs(modelEdgeDeg) >= PULLCORE_STRAIGHTEN_MIN_DEG Then
+            detectedDegOut = modelEdgeDeg
+            TryComputePullcoreBestFitStraightenAngleFromNativePath = True
+            GoTo CleanExit
+        End If
+    End If
+
+    If TryComputeBBoxDimensionMathAngleFromModel(mdl, mathDeg) Then
+        If Abs(mathDeg) >= PULLCORE_STRAIGHTEN_MIN_DEG Then
+            detectedDegOut = mathDeg
+            TryComputePullcoreBestFitStraightenAngleFromNativePath = True
+            GoTo CleanExit
+        End If
+    End If
+
+CleanExit:
+    On Error Resume Next
+    If Not mdl Is Nothing Then swApp.CloseDoc mdl.GetTitle
+    Exit Function
+
+ErrHandler:
+    LogLine "TryComputePullcoreBestFitStraightenAngleFromNativePath error: " & Err.Description
+    On Error Resume Next
+    If Not mdl Is Nothing Then swApp.CloseDoc mdl.GetTitle
+    TryComputePullcoreBestFitStraightenAngleFromNativePath = False
+End Function
+
+Private Function TryComputePullcoreLongestModelEdgeAngleFromModel(ByVal mdl As Object, _
+                                                                  ByRef angleDegOut As Double) As Boolean
+On Error GoTo ErrHandler
+
+    TryComputePullcoreLongestModelEdgeAngleFromModel = False
+    angleDegOut = 0#
+
+    If mdl Is Nothing Then Exit Function
+
+    Dim bodyList As Collection
+    Set bodyList = New Collection
+
+    CollectSolidBodiesFromModel mdl, bodyList
+
+    If bodyList.count = 0 Then Exit Function
+
+    Dim bestInPlane As Double
+    Dim bestDx As Double
+    Dim bestDy As Double
+
+    bestInPlane = -1#
+    bestDx = 0#
+    bestDy = 0#
+
+    Dim bi As Long
+    Dim ei As Long
+    Dim body As Object
+    Dim vEdges As Variant
+    Dim edge As Object
+    Dim curve As Object
+    Dim vCP As Variant
+
+    Dim sx As Double, sy As Double, sz As Double
+    Dim ex As Double, ey As Double, ez As Double
+    Dim dx As Double, dy As Double, dz As Double
+    Dim inPlane As Double, fullLen As Double
+
+    For bi = 1 To bodyList.count
+
+        Set body = bodyList(bi)
+
+        If Not body Is Nothing Then
+
+            vEdges = body.GetEdges
+
+            If IsArray(vEdges) Then
+
+                For ei = 0 To UBound(vEdges)
+
+                    Set edge = vEdges(ei)
+
+                    If Not edge Is Nothing Then
+
+                        Set curve = Nothing
+                        On Error Resume Next
+                        Set curve = edge.GetCurve
+                        On Error GoTo ErrHandler
+
+                        If Not curve Is Nothing Then
+                            If curve.IsLine Then
+
+                                vCP = edge.GetCurveParams2
+
+                                If IsArray(vCP) Then
+                                    If UBound(vCP) >= 5 Then
+
+                                        sx = CDbl(vCP(0))
+                                        sy = CDbl(vCP(1))
+                                        sz = CDbl(vCP(2))
+                                        ex = CDbl(vCP(3))
+                                        ey = CDbl(vCP(4))
+                                        ez = CDbl(vCP(5))
+
+                                        dx = ex - sx
+                                        dy = ey - sy
+                                        dz = ez - sz
+
+                                        inPlane = Sqr(dx * dx + dy * dy)
+                                        fullLen = Sqr(dx * dx + dy * dy + dz * dz)
+
+                                        If fullLen > 0.000001 Then
+                                            If inPlane / fullLen >= 0.5 Then
+                                                If inPlane > bestInPlane Then
+                                                    bestInPlane = inPlane
+                                                    bestDx = dx
+                                                    bestDy = dy
+                                                End If
+                                            End If
+                                        End If
+
+                                    End If
+                                End If
+
+                            End If
+                        End If
+
+                    End If
+
+                Next ei
+
+            End If
+
+        End If
+
+    Next bi
+
+    If bestInPlane <= 0.000001 Then Exit Function
+
+    Dim ang As Double
+    ang = Atan2Safe(bestDy, bestDx)
+    ang = NormalizeAngleToPlusMinus90(ang)
+
+    angleDegOut = RadToDeg(ang)
+
+    TryComputePullcoreLongestModelEdgeAngleFromModel = True
+    Exit Function
+
+ErrHandler:
+    LogLine "TryComputePullcoreLongestModelEdgeAngleFromModel error: " & Err.Description
+    TryComputePullcoreLongestModelEdgeAngleFromModel = False
+End Function
+
+Private Sub CollectSolidBodiesFromModel(ByVal mdl As Object, ByVal outBodies As Collection)
+On Error Resume Next
+
+    If mdl Is Nothing Then Exit Sub
+    If outBodies Is Nothing Then Exit Sub
+
+    If mdl.GetType = swDocPART Then
+
+        Dim vB As Variant
+        vB = mdl.GetBodies2(swSolidBody, False)
+
+        If IsArray(vB) Then
+            Dim i As Long
+            For i = 0 To UBound(vB)
+                If Not vB(i) Is Nothing Then outBodies.Add vB(i)
+            Next i
+        End If
+
+    ElseIf mdl.GetType = swDocASSEMBLY Then
+
+        Dim vComps As Variant
+        vComps = mdl.GetComponents(False)
+
+        If IsArray(vComps) Then
+
+            Dim c As Long
+            Dim comp As Object
+            Dim cm As Object
+            Dim vCB As Variant
+            Dim j As Long
+
+            For c = 0 To UBound(vComps)
+
+                Set comp = vComps(c)
+
+                If Not comp Is Nothing Then
+                    If comp.IsSuppressed = False Then
+
+                        Set cm = comp.GetModelDoc2
+
+                        If Not cm Is Nothing Then
+                            If cm.GetType = swDocPART Then
+
+                                vCB = cm.GetBodies2(swSolidBody, False)
+
+                                If IsArray(vCB) Then
+                                    For j = 0 To UBound(vCB)
+                                        If Not vCB(j) Is Nothing Then outBodies.Add vCB(j)
+                                    Next j
+                                End If
+
+                            End If
+                        End If
+
+                    End If
+                End If
+
+            Next c
+
+        End If
+
+    End If
+End Sub
+
+Private Function TryComputeBBoxDimensionMathAngleFromModel(ByVal mdl As Object, _
+                                                           ByRef angleDegOut As Double) As Boolean
+On Error GoTo ErrHandler
+
+    TryComputeBBoxDimensionMathAngleFromModel = False
+    angleDegOut = 0#
+
+    If mdl Is Nothing Then Exit Function
+
+    If mdl.GetType = swDocPART Then
+        TryComputeBBoxDimensionMathAngleFromModel = _
+            TryComputeBBoxDimensionMathAngleForPart(mdl, angleDegOut)
+        Exit Function
+    End If
+
+    If mdl.GetType <> swDocASSEMBLY Then Exit Function
+
+    Dim vComps As Variant
+    vComps = mdl.GetComponents(False)
+
+    If IsEmpty(vComps) Then Exit Function
+
+    Dim bestVol As Double
+    Dim bestAng As Double
+
+    bestVol = -1#
+    bestAng = 0#
+
+    Dim i As Long
+    Dim comp As Object
+    Dim cm As Object
+    Dim oneAng As Double
+    Dim dx As Double
+    Dim dy As Double
+    Dim dz As Double
+
+    For i = 0 To UBound(vComps)
+
+        Set comp = vComps(i)
+
+        If Not comp Is Nothing Then
+            If comp.IsSuppressed = False Then
+
+                Set cm = comp.GetModelDoc2
+
+                If Not cm Is Nothing Then
+                    If cm.GetType = swDocPART Then
+
+                        If TryComputeBBoxDimensionMathAngleForPart(cm, oneAng) Then
+
+                            If GetPartBoundingBoxInches(cm, dx, dy, dz) Then
+
+                                Dim vol As Double
+                                vol = dx * dy * dz
+
+                                If vol > bestVol Then
+                                    bestVol = vol
+                                    bestAng = oneAng
+                                End If
+
+                            End If
+
+                        End If
+
+                    End If
+                End If
+
+            End If
+        End If
+
+    Next i
+
+    If bestVol > 0# Then
+        angleDegOut = bestAng
+        TryComputeBBoxDimensionMathAngleFromModel = True
+    End If
+
+    Exit Function
+
+ErrHandler:
+    TryComputeBBoxDimensionMathAngleFromModel = False
+End Function
+
+Private Function TryComputeBBoxDimensionMathAngleForPart(ByVal partModel As Object, _
+                                                         ByRef angleDegOut As Double) As Boolean
+On Error GoTo ErrHandler
+
+    TryComputeBBoxDimensionMathAngleForPart = False
+    angleDegOut = 0#
+
+    If partModel Is Nothing Then Exit Function
+    If partModel.GetType <> swDocPART Then Exit Function
+
+    Dim dx As Double
+    Dim dy As Double
+    Dim dz As Double
+
+    If GetPartBoundingBoxInches(partModel, dx, dy, dz) = False Then Exit Function
+
+    Dim normL As Double
+    Dim normW As Double
+    Dim normT As Double
+
+    SortThreeDimensions dx, dy, dz, normL, normW, normT
+
+    Dim bestL As Double
+    Dim bestW As Double
+    Dim bestT As Double
+
+    If TryCreateAndReadBestFitBoundingBox(partModel, bestL, bestW, bestT) = False Then Exit Function
+
+    SortThreeDimensions bestL, bestW, bestT, bestL, bestW, bestT
+
+    angleDegOut = EstimatePullcoreAngleFromFittedAndOriginalDeg(bestL, bestW, bestT, normL, normW, normT)
+
+    TryComputeBBoxDimensionMathAngleForPart = (Abs(angleDegOut) > 0#)
+    Exit Function
+
+ErrHandler:
+    TryComputeBBoxDimensionMathAngleForPart = False
+End Function
+
+Private Function SearchBoxRotationDeg(ByVal bestW As Double, ByVal bestT As Double, _
+                                      ByVal normW As Double, ByVal normT As Double) As Double
+On Error GoTo ErrHandler
+
+    Dim bestAng As Double
+    Dim bestErr As Double
+
+    bestAng = 0#
+    bestErr = 1E+99
+
+    Dim a As Double
+    Dim rad As Double
+    Dim pW As Double
+    Dim pT As Double
+    Dim e As Double
+
+    a = 0#
+
+    Do While a <= 90#
+
+        rad = a * PI_VALUE / 180#
+
+        pW = bestW * Cos(rad) + bestT * Sin(rad)
+        pT = bestW * Sin(rad) + bestT * Cos(rad)
+
+        e = Abs(pW - normW) + Abs(pT - normT)
+
+        If e < bestErr Then
+            bestErr = e
+            bestAng = a
+        End If
+
+        a = a + 1#
+
+    Loop
+
+    Dim lo As Double
+    Dim hi As Double
+
+    lo = bestAng - 1#
+    hi = bestAng + 1#
+
+    If lo < 0# Then lo = 0#
+    If hi > 90# Then hi = 90#
+
+    a = lo
+
+    Do While a <= hi
+
+        rad = a * PI_VALUE / 180#
+
+        pW = bestW * Cos(rad) + bestT * Sin(rad)
+        pT = bestW * Sin(rad) + bestT * Cos(rad)
+
+        e = Abs(pW - normW) + Abs(pT - normT)
+
+        If e < bestErr Then
+            bestErr = e
+            bestAng = a
+        End If
+
+        a = a + 0.1
+
+    Loop
+
+    SearchBoxRotationDeg = bestAng
+    Exit Function
+
+ErrHandler:
+    SearchBoxRotationDeg = 0#
+End Function
+
+Private Function GetModelDocForCadIndex(ByVal cadIdx As Long) As Object
+On Error GoTo ErrHandler
+
+    Set GetModelDocForCadIndex = Nothing
+
+    If cadIdx <= 0 Or cadIdx > PartCount Then Exit Function
+
+    If Not swModel Is Nothing Then
+
+        If swModel.GetType = swDocASSEMBLY Then
+
+            Dim swComp As Object
+            Set swComp = FindAssemblyComponentByName(swModel, parts(cadIdx).componentName)
+
+            If Not swComp Is Nothing Then
+
+                On Error Resume Next
+                If swComp.GetSuppression = swComponentLightweight Then
+                    swComp.SetSuppression2 swComponentFullyResolved
+                End If
+                On Error GoTo ErrHandler
+
+                Set GetModelDocForCadIndex = swComp.GetModelDoc2
+
+                If GetModelDocForCadIndex Is Nothing And parts(cadIdx).filePath <> "" Then
+                    Dim openErrs As Long
+                    Dim openWarns As Long
+
+                    Set GetModelDocForCadIndex = swApp.OpenDoc6(parts(cadIdx).filePath, swDocPART, _
+                                                  swOpenDocOptions_Silent + swOpenDocOptions_ReadOnly, _
+                                                  parts(cadIdx).configName, openErrs, openWarns)
+                End If
+
+                If Not GetModelDocForCadIndex Is Nothing Then
+                    ActivateModelDocForPullcore GetModelDocForCadIndex
+                    Exit Function
+                End If
+
+            End If
+
+        ElseIf swModel.GetType = swDocPART Then
+
+            Set GetModelDocForCadIndex = swModel
+            ActivateModelDocForPullcore GetModelDocForCadIndex
+            Exit Function
+
+        End If
+
+    End If
+
+    If parts(cadIdx).filePath <> "" Then
+
+        Dim fso As Object
+        Set fso = CreateObject("Scripting.FileSystemObject")
+
+        If fso.FileExists(parts(cadIdx).filePath) Then
+
+            Dim errs As Long
+            Dim warns As Long
+
+            Set GetModelDocForCadIndex = swApp.OpenDoc6(parts(cadIdx).filePath, swDocPART, _
+                                          swOpenDocOptions_Silent + swOpenDocOptions_ReadOnly, _
+                                          parts(cadIdx).configName, errs, warns)
+
+            If Not GetModelDocForCadIndex Is Nothing Then
+                ActivateModelDocForPullcore GetModelDocForCadIndex
+            End If
+
+        End If
+
+    End If
+
+    Exit Function
+
+ErrHandler:
+    LogLine "GetModelDocForCadIndex error: " & Err.Description
+    Set GetModelDocForCadIndex = Nothing
+End Function
+
+Private Sub ActivateModelDocForPullcore(ByVal partModel As Object)
+On Error Resume Next
+
+    If partModel Is Nothing Then Exit Sub
+    If swApp Is Nothing Then Exit Sub
+
+    Dim actErrs As Long
+    swApp.ActivateDoc3 partModel.GetTitle, False, 0, actErrs
+    EnsureSwHidden
+End Sub
+
+Private Function FindBoundingBoxProfileFeature(ByVal partModel As Object) As Object
+On Error GoTo ErrHandler
+
+    Set FindBoundingBoxProfileFeature = Nothing
+
+    If partModel Is Nothing Then Exit Function
+
+    Dim swFeat As Object
+    Set swFeat = partModel.FirstFeature
+
+    Do While Not swFeat Is Nothing
+
+        If LCase(swFeat.GetTypeName2()) = "boundingboxprofilefeat" Then
+            Set FindBoundingBoxProfileFeature = swFeat
+            Exit Function
+        End If
+
+        Set swFeat = swFeat.GetNextFeature
+    Loop
+
+    Exit Function
+
+ErrHandler:
+    Set FindBoundingBoxProfileFeature = Nothing
+End Function
+
+Private Function TryInsertPullcoreBestFitBoundingBox(ByVal partModel As Object) As Object
+On Error GoTo ErrHandler
+
+    Set TryInsertPullcoreBestFitBoundingBox = Nothing
+
+    If partModel Is Nothing Then Exit Function
+
+    Dim featMgr As Object
+    Set featMgr = partModel.FeatureManager
+
+    If featMgr Is Nothing Then Exit Function
+
+    Dim bboxFeat As Object
+    Dim status As Long
+    Dim bboxType As Long
+    Dim tryTypes(1 To 4) As Long
+    Dim t As Long
+
+    tryTypes(1) = swBoundingBoxType_BestFit
+    tryTypes(2) = swBoundingBoxType_Centric
+    tryTypes(3) = 0
+    tryTypes(4) = 1
+
+    partModel.ClearSelection2 True
+
+    For t = 1 To 4
+
+        bboxType = tryTypes(t)
+        Set bboxFeat = Nothing
+        status = 0
+
+        On Error Resume Next
+
+        Set bboxFeat = featMgr.InsertGlobalBoundingBox(bboxType, False, False, Nothing)
+
+        If bboxFeat Is Nothing Then
+            Set bboxFeat = featMgr.InsertGlobalBoundingBox(bboxType, False, False, Nothing, False)
+        End If
+
+        If bboxFeat Is Nothing Then
+            Set bboxFeat = featMgr.InsertGlobalBoundingBox(bboxType, False, False)
+        End If
+
+        If bboxFeat Is Nothing Then
+            Set bboxFeat = featMgr.InsertGlobalBoundingBox2(bboxType, False, False, Nothing)
+        End If
+
+        If bboxFeat Is Nothing Then
+            featMgr.InsertGlobalBoundingBox bboxType, False, False, status
+            Set bboxFeat = FindBoundingBoxProfileFeature(partModel)
+        End If
+
+        On Error GoTo ErrHandler
+
+        If Not bboxFeat Is Nothing Then
+            LogLine "PULLCORE best-fit bbox feature created with type=" & CStr(bboxType)
+            Set TryInsertPullcoreBestFitBoundingBox = bboxFeat
+            Exit Function
+        End If
+
+    Next t
+
+    Exit Function
+
+ErrHandler:
+    LogLine "TryInsertPullcoreBestFitBoundingBox error: " & Err.Description
+    Set TryInsertPullcoreBestFitBoundingBox = Nothing
+End Function
+
+Private Function TryReadBoundingBoxDimsFromFeature(ByVal bboxFeat As Object, _
+                                                   ByRef outL As Double, _
+                                                   ByRef outW As Double, _
+                                                   ByRef outT As Double) As Boolean
+On Error GoTo ErrHandler
+
+    TryReadBoundingBoxDimsFromFeature = False
+
+    outL = 0#
+    outW = 0#
+    outT = 0#
+
+    If bboxFeat Is Nothing Then Exit Function
+
+    If TryReadBoundingBoxFeatureSketchDims(bboxFeat, outL, outW, outT) Then
+        TryReadBoundingBoxDimsFromFeature = True
+        Exit Function
+    End If
+
+    Dim featName As String
+    featName = bboxFeat.Name
+
+    Dim partModel As Object
+    Set partModel = bboxFeat.GetModelDoc2
+
+    If Not partModel Is Nothing Then
+
+        On Error Resume Next
+        partModel.ClearSelection2 True
+        bboxFeat.Select2 False, 0
+        On Error GoTo ErrHandler
+
+        If TryReadBoundingBoxCustomProps(partModel, outL, outW, outT) Then
+            TryReadBoundingBoxDimsFromFeature = True
+            Exit Function
+        End If
+
+    End If
+
+    LogLine "PULLCORE bbox feature '" & featName & "' found but dimensions could not be read."
+
+    Exit Function
+
+ErrHandler:
+    TryReadBoundingBoxDimsFromFeature = False
+End Function
+
+Private Function TryCreateAndReadBestFitBoundingBox(ByVal partModel As Object, _
+                                                    ByRef outL As Double, _
+                                                    ByRef outW As Double, _
+                                                    ByRef outT As Double) As Boolean
+On Error GoTo ErrHandler
+
+    TryCreateAndReadBestFitBoundingBox = False
+
+    outL = 0#
+    outW = 0#
+    outT = 0#
+
+    If partModel Is Nothing Then Exit Function
+    If partModel.GetType <> swDocPART Then Exit Function
+
+    ActivateModelDocForPullcore partModel
+
+    Dim gotDims As Boolean
+    Dim createdTemp As Boolean
+    Dim bboxFeat As Object
+
+    gotDims = False
+    createdTemp = False
+    Set bboxFeat = Nothing
+
+    partModel.ClearSelection2 True
+    partModel.ForceRebuild3 False
+
+    gotDims = TryReadBoundingBoxCustomProps(partModel, outL, outW, outT)
+
+    If gotDims = False Then
+        Set bboxFeat = FindBoundingBoxProfileFeature(partModel)
+        If Not bboxFeat Is Nothing Then
+            gotDims = TryReadBoundingBoxDimsFromFeature(bboxFeat, outL, outW, outT)
+        End If
+    End If
+
+    If gotDims = False Then
+        Set bboxFeat = TryInsertPullcoreBestFitBoundingBox(partModel)
+        createdTemp = (Not bboxFeat Is Nothing)
+
+        If Not bboxFeat Is Nothing Then
+            partModel.ForceRebuild3 False
+
+            gotDims = TryReadBoundingBoxCustomProps(partModel, outL, outW, outT)
+
+            If gotDims = False Then
+                gotDims = TryReadBoundingBoxDimsFromFeature(bboxFeat, outL, outW, outT)
+            End If
+        End If
+    End If
+
+    If createdTemp And Not bboxFeat Is Nothing Then
+        On Error Resume Next
+        partModel.ClearSelection2 True
+        bboxFeat.Select2 False, 0
+        partModel.EditDelete
+        partModel.ClearSelection2 True
+        partModel.ForceRebuild3 False
+        On Error GoTo ErrHandler
+    End If
+
+    If gotDims Then
+        SortThreeDimensions outL, outW, outT, outL, outW, outT
+        outL = RoundDimInches(outL)
+        outW = RoundDimInches(outW)
+        outT = RoundDimInches(outT)
+        LogLine "PULLCORE best-fit bbox read L/W/T=" & _
+                FormatNumberForCsv(outL) & "/" & FormatNumberForCsv(outW) & "/" & FormatNumberForCsv(outT)
+    Else
+        LogLine "PULLCORE best-fit bbox unavailable for part '" & partModel.GetTitle & "'."
+    End If
+
+    TryCreateAndReadBestFitBoundingBox = (gotDims And outL > 0 And outW > 0 And outT > 0)
+    Exit Function
+
+ErrHandler:
+    LogLine "TryCreateAndReadBestFitBoundingBox error: " & Err.Description
+
+    On Error Resume Next
+    If createdTemp And Not bboxFeat Is Nothing Then
+        partModel.ClearSelection2 True
+        bboxFeat.Select2 False, 0
+        partModel.EditDelete
+        partModel.ClearSelection2 True
+    End If
+
+    TryCreateAndReadBestFitBoundingBox = False
+End Function
+
+Private Function TryReadBoundingBoxCustomProps(ByVal partModel As Object, _
+                                               ByRef outL As Double, _
+                                               ByRef outW As Double, _
+                                               ByRef outT As Double) As Boolean
+On Error GoTo ErrHandler
+
+    TryReadBoundingBoxCustomProps = False
+
+    If partModel Is Nothing Then Exit Function
+
+    Dim ext As Object
+    Set ext = partModel.Extension
+
+    If ext Is Nothing Then Exit Function
+
+    Dim cpm As Object
+    Set cpm = ext.CustomPropertyManager("")
+
+    If cpm Is Nothing Then Exit Function
+
+    Dim L As Double
+    Dim W As Double
+    Dim T As Double
+
+    L = ReadBoundingBoxPropInches(cpm, Array("SW-BoundingBoxLength", "Total Bounding Box Length", "BoundingBoxLength"))
+    W = ReadBoundingBoxPropInches(cpm, Array("SW-BoundingBoxWidth", "Total Bounding Box Width", "BoundingBoxWidth"))
+    T = ReadBoundingBoxPropInches(cpm, Array("SW-BoundingBoxThickness", "Total Bounding Box Thickness", "BoundingBoxThickness", "SW-BoundingBoxHeight"))
+
+    If L > 0 And W > 0 And T > 0 Then
+        outL = L
+        outW = W
+        outT = T
+
+        TryReadBoundingBoxCustomProps = True
+    End If
+
+    Exit Function
+
+ErrHandler:
+    TryReadBoundingBoxCustomProps = False
+End Function
+
+Private Function ReadBoundingBoxPropInches(ByVal cpm As Object, ByVal names As Variant) As Double
+On Error Resume Next
+
+    ReadBoundingBoxPropInches = 0#
+
+    Dim nm As Variant
+    Dim valOut As String
+    Dim resolved As String
+
+    For Each nm In names
+
+        valOut = ""
+        resolved = ""
+
+        cpm.Get4 CStr(nm), False, valOut, resolved
+
+        Dim useStr As String
+
+        useStr = resolved
+        If Trim(useStr) = "" Then useStr = valOut
+
+        If Trim(useStr) <> "" Then
+
+            Dim v As Double
+            Dim isMm As Boolean
+
+            isMm = (InStr(LCase(useStr), "mm") > 0)
+            v = ParseLeadingNumber(useStr)
+
+            If v > 0 Then
+                If isMm Then
+                    ReadBoundingBoxPropInches = v / 25.4
+                ElseIf v < 3# Then
+                    ReadBoundingBoxPropInches = v * INCHES_PER_METER
+                Else
+                    ReadBoundingBoxPropInches = v
+                End If
+
+                Exit Function
+            End If
+
+        End If
+
+    Next nm
+End Function
+
+Private Function ParseLeadingNumber(ByVal s As String) As Double
+On Error Resume Next
+
+    Dim i As Long
+    Dim ch As String
+    Dim token As String
+
+    token = ""
+
+    For i = 1 To Len(s)
+
+        ch = Mid(s, i, 1)
+
+        If (ch >= "0" And ch <= "9") Or ch = "." Then
+            token = token & ch
+        ElseIf token <> "" Then
+            Exit For
+        End If
+
+    Next i
+
+    If token <> "" And IsNumeric(token) Then ParseLeadingNumber = CDbl(token)
+End Function
+
+Private Function TryReadBoundingBoxFeatureSketchDims(ByVal bboxFeat As Object, _
+                                                     ByRef outL As Double, _
+                                                     ByRef outW As Double, _
+                                                     ByRef outT As Double) As Boolean
+On Error GoTo ErrHandler
+
+    TryReadBoundingBoxFeatureSketchDims = False
+
+    outL = 0#
+    outW = 0#
+    outT = 0#
+
+    If bboxFeat Is Nothing Then Exit Function
+
+    Dim lengths As Collection
+    Set lengths = New Collection
+
+    CollectSketchSegmentLengthsFromFeature bboxFeat, lengths
+
+    If lengths.count < 3 Then Exit Function
+
+    Dim a As Double
+    Dim b As Double
+    Dim c As Double
+
+    If GetThreeUniqueBoxEdgeLengths(lengths, a, b, c) = False Then Exit Function
+
+    SortThreeDimensions a, b, c, outL, outW, outT
+
+    TryReadBoundingBoxFeatureSketchDims = (outL > 0 And outW > 0 And outT > 0)
+    Exit Function
+
+ErrHandler:
+    TryReadBoundingBoxFeatureSketchDims = False
+End Function
+
+Private Sub CollectSketchSegmentLengthsFromFeature(ByVal feat As Object, ByVal lengths As Collection)
+On Error Resume Next
+
+    If feat Is Nothing Then Exit Sub
+
+    Dim spec As Object
+    Set spec = feat.GetSpecificFeature2
+
+    If Not spec Is Nothing Then
+
+        Dim segs As Variant
+        segs = spec.GetSketchSegments
+
+        If IsEmpty(segs) = False Then
+
+            Dim i As Long
+            Dim seg As Object
+
+            For i = 0 To UBound(segs)
+
+                Set seg = segs(i)
+
+                If Not seg Is Nothing Then
+
+                    Dim p1 As Object
+                    Dim p2 As Object
+
+                    Set p1 = seg.GetStartPoint2
+                    Set p2 = seg.GetEndPoint2
+
+                    If Not p1 Is Nothing And Not p2 Is Nothing Then
+
+                        Dim dx As Double
+                        Dim dy As Double
+                        Dim dz As Double
+                        Dim distIn As Double
+
+                        dx = CDbl(p2.x) - CDbl(p1.x)
+                        dy = CDbl(p2.y) - CDbl(p1.y)
+                        dz = CDbl(p2.z) - CDbl(p1.z)
+
+                        distIn = Sqr(dx * dx + dy * dy + dz * dz) * INCHES_PER_METER
+
+                        If distIn > 0.01 Then lengths.Add distIn
+
+                    End If
+
+                End If
+
+            Next i
+
+        End If
+
+    End If
+
+    Dim subFeat As Object
+    Set subFeat = feat.GetFirstSubFeature
+
+    Do While Not subFeat Is Nothing
+        CollectSketchSegmentLengthsFromFeature subFeat, lengths
+        Set subFeat = subFeat.GetNextSubFeature
+    Loop
+End Sub
+
+Private Function GetThreeUniqueBoxEdgeLengths(ByVal lengths As Collection, _
+                                              ByRef a As Double, ByRef b As Double, ByRef c As Double) As Boolean
+On Error GoTo ErrHandler
+
+    GetThreeUniqueBoxEdgeLengths = False
+
+    a = 0#
+    b = 0#
+    c = 0#
+
+    If lengths Is Nothing Then Exit Function
+    If lengths.count < 3 Then Exit Function
+
+    Dim uniques As Collection
+    Set uniques = New Collection
+
+    Dim i As Long
+
+    For i = 1 To lengths.count
+        AddUniqueLength uniques, CDbl(lengths(i)), 0.02
+    Next i
+
+    If uniques.count < 3 Then Exit Function
+
+    Dim arr() As Double
+    ReDim arr(1 To uniques.count)
+
+    For i = 1 To uniques.count
+        arr(i) = CDbl(uniques(i))
+    Next i
+
+    Dim j As Long
+    Dim tmp As Double
+
+    For i = 1 To UBound(arr) - 1
+        For j = i + 1 To UBound(arr)
+            If arr(j) > arr(i) Then
+                tmp = arr(i)
+                arr(i) = arr(j)
+                arr(j) = tmp
+            End If
+        Next j
+    Next i
+
+    a = arr(1)
+    b = arr(2)
+    c = arr(3)
+
+    GetThreeUniqueBoxEdgeLengths = True
+    Exit Function
+
+ErrHandler:
+    GetThreeUniqueBoxEdgeLengths = False
+End Function
+
+Private Sub AddUniqueLength(ByVal uniques As Collection, ByVal val As Double, ByVal tol As Double)
+On Error Resume Next
+
+    If val <= 0.01 Then Exit Sub
+
+    Dim i As Long
+
+    For i = 1 To uniques.count
+        If Abs(CDbl(uniques(i)) - val) <= tol Then Exit Sub
+    Next i
+
+    uniques.Add val
+End Sub
+
+' ============================================================
+' CSV REPORTS
+' ============================================================
+
+Private Sub WritePartDimensionCsv(ByVal csvPath As String)
+On Error GoTo ErrHandler
+
+    csvPath = GetWritableCsvPath(csvPath)
+
+    Dim f As Integer
+    f = FreeFile
+
+    Open csvPath For Output As #f
+
+    Print #f, "Index,Component,CleanName,Length,Width,Thickness,OriginalAsmLength,OriginalAsmWidth,OriginalAsmThickness,HasOriginalAsmBBox,BBoxVolume,Mass,Qty,BodyOnly"
+
+    Dim i As Long
+
+    For i = 1 To PartCount
+        Print #f, CsvText(CStr(i)) & "," & _
+                  CsvText(parts(i).componentName) & "," & _
+                  CsvText(parts(i).cleanName) & "," & _
+                  FormatNumberForCsv(parts(i).Length) & "," & _
+                  FormatNumberForCsv(parts(i).Width) & "," & _
+                  FormatNumberForCsv(parts(i).Thickness) & "," & _
+                  FormatNumberForCsv(parts(i).OriginalAsmLength) & "," & _
+                  FormatNumberForCsv(parts(i).OriginalAsmWidth) & "," & _
+                  FormatNumberForCsv(parts(i).OriginalAsmThickness) & "," & _
+                  CStr(parts(i).hasOriginalAsmBBox) & "," & _
+                  FormatNumberForCsv(parts(i).BBoxVolume) & "," & _
+                  FormatNumberForCsv(parts(i).massValue) & "," & _
+                  CStr(parts(i).Quantity) & "," & _
+                  CStr(parts(i).isBodyOnly)
+    Next i
+
+    Close #f
+
+    LogLine "Wrote CAD dimension CSV: " & csvPath
+    Exit Sub
+
+ErrHandler:
+    LogLine "WritePartDimensionCsv error: " & Err.Description
+    On Error Resume Next
+    Close #f
+End Sub
+
+Private Sub WriteJobSignatureCsv(ByVal csvPath As String)
+On Error GoTo ErrHandler
+
+    csvPath = GetWritableCsvPath(csvPath)
+
+    Dim f As Integer
+    f = FreeFile
+
+    Open csvPath For Output As #f
+
+    Print #f, "JobNumber,CustomerNumber,DateCode,ComponentRole,QuoteName,CadComponent,CleanName,Length,Width,Thickness,Mass,CenterX,CenterY,CenterZ,HasCenter,Status"
+
+    WriteJobSignatureRow f, "TCP", "TCP", "TCP|TOP SMED|TOP CLAMPING|TOP CLAMPING PLATE|ID SMED"
+    WriteJobSignatureRow f, "BCP", "BCP", "BCP|BOTTOM SMED|BOT SMED|BOTTOM CLAMPING|BOTTOM CLAMPING PLATE|OD SMED"
+    WriteJobSignatureRow f, "ID HOLDER", "ID HOLDER", ID_HOLDER_KEYS
+    WriteJobSignatureRow f, "OD HOLDER", "OD HOLDER", OD_HOLDER_KEYS
+    WriteJobSignatureRow f, "ID POT", "ID POT BLOCK", "ID POT BLOCK|ID POT|TOP POT BLOCK|TOP POT|TCP POT BLOCK|TCP POT"
+    WriteJobSignatureRow f, "OD POT", "OD POT BLOCK", "OD POT BLOCK|OD POT|BOTTOM POT BLOCK|BOT POT BLOCK|BOTTOM POT|BOT POT|BCP POT BLOCK|BCP POT"
+
+    Close #f
+
+    LogLine "Wrote job signature CSV: " & csvPath
+    Exit Sub
+
+ErrHandler:
+    LogLine "WriteJobSignatureCsv error: " & Err.Description
+    On Error Resume Next
+    Close #f
+End Sub
+
+Private Sub WriteJobSignatureRow(ByVal f As Integer, _
+                                 ByVal roleName As String, _
+                                 ByVal quoteName As String, _
+                                 ByVal fallbackKeys As String)
+On Error Resume Next
+
+    Dim cadIdx As Long
+    cadIdx = FindCadIndexFromExportQuote(quoteName)
+
+    If cadIdx <= 0 Then
+        cadIdx = FindCadPartIndexByQuoteOrKeys(quoteName, fallbackKeys)
+    End If
+
+    Dim cadComponent As String
+    Dim cleanName As String
+    Dim statusText As String
+    Dim L As Double
+    Dim W As Double
+    Dim T As Double
+    Dim massVal As Double
+    Dim centerX As Double
+    Dim centerY As Double
+    Dim centerZ As Double
+    Dim hasCenter As Boolean
+
+    cadComponent = ""
+    cleanName = ""
+    statusText = "NO CAD MATCH"
+    L = 0#: W = 0#: T = 0#
+    massVal = 0#
+    centerX = 0#: centerY = 0#: centerZ = 0#
+    hasCenter = False
+
+    If cadIdx > 0 And cadIdx <= PartCount Then
+        cadComponent = parts(cadIdx).componentName
+        cleanName = parts(cadIdx).cleanName
+        L = parts(cadIdx).Length
+        W = parts(cadIdx).Width
+        T = parts(cadIdx).Thickness
+        massVal = parts(cadIdx).massValue
+        hasCenter = parts(cadIdx).hasAsmCenter
+        centerX = parts(cadIdx).AsmCenterX
+        centerY = parts(cadIdx).AsmCenterY
+        centerZ = parts(cadIdx).AsmCenterZ
+        statusText = "OK"
+    End If
+
+    Print #f, CsvText(CurrentJobNumber) & "," & _
+              CsvText(CustomerNumber) & "," & _
+              CsvText(DateCode) & "," & _
+              CsvText(roleName) & "," & _
+              CsvText(quoteName) & "," & _
+              CsvText(cadComponent) & "," & _
+              CsvText(cleanName) & "," & _
+              FormatNumberForCsv(L) & "," & _
+              FormatNumberForCsv(W) & "," & _
+              FormatNumberForCsv(T) & "," & _
+              FormatNumberForCsv(massVal) & "," & _
+              FormatNumberForCsv(centerX) & "," & _
+              FormatNumberForCsv(centerY) & "," & _
+              FormatNumberForCsv(centerZ) & "," & _
+              CStr(hasCenter) & "," & _
+              CsvText(statusText)
+End Sub
+
+Private Sub UploadJobSignatureToElgin(ByVal csvPath As String)
+On Error GoTo ErrHandler
+
+    If AUTO_UPLOAD_JOB_SIGNATURE_TO_ELGIN = False Then Exit Sub
+    If csvPath = "" Then Exit Sub
+
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    If fso.FileExists(csvPath) = False Then Exit Sub
+
+    Dim boundary As String
+    boundary = "----CMSXT" & Format(Now, "yyyymmddhhnnss")
+
+    Dim csvText As String
+    csvText = ReadAllTextFile(csvPath)
+
+    If Trim(csvText) = "" Then Exit Sub
+
+    Dim body As String
+    body = "--" & boundary & vbCrLf & _
+           "Content-Disposition: form-data; name=" & Chr(34) & "file" & Chr(34) & "; filename=" & Chr(34) & JOB_SIGNATURE_REPORT_FILE & Chr(34) & vbCrLf & _
+           "Content-Type: text/csv" & vbCrLf & vbCrLf & _
+           csvText & vbCrLf & _
+           "--" & boundary & "--" & vbCrLf
+
+    Dim url As String
+    url = Trim(ELGIN_API_BASE_URL)
+
+    Do While Right(url, 1) = "/"
+        url = Left(url, Len(url) - 1)
+    Loop
+
+    url = url & "/api/job-signatures/" & CurrentJobNumber & "/upload"
+
+    Dim http As Object
+    Set http = CreateObject("WinHttp.WinHttpRequest.5.1")
+
+    http.Open "POST", url, False
+    http.SetRequestHeader "Content-Type", "multipart/form-data; boundary=" & boundary
+    http.SetRequestHeader "X-Elgin-Api-Key", ELGIN_SIGNATURE_API_KEY
+    http.Send body
+
+    If CLng(http.Status) >= 200 And CLng(http.Status) < 300 Then
+        LogLine "Uploaded job signature to ELGIN: " & url
+    Else
+        LogLine "WARNING: ELGIN signature upload failed. HTTP " & CStr(http.Status) & " " & CStr(http.ResponseText)
+    End If
+
+CleanExit:
+    On Error Resume Next
+    Set http = Nothing
+    Set fso = Nothing
+    Exit Sub
+
+ErrHandler:
+    LogLine "WARNING: UploadJobSignatureToElgin error: " & Err.Description
+    Resume CleanExit
+End Sub
+
+Private Sub WriteExportCheckCsv(ByVal csvPath As String)
+On Error GoTo ErrHandler
+
+    csvPath = GetWritableCsvPath(csvPath)
+
+    Dim f As Integer
+    f = FreeFile
+
+    Open csvPath For Output As #f
+
+    Print #f, "Section,QuoteName,Material,Qty,BomL,BomW,BomT,CadL,CadW,CadT,CadComponent,Status"
+
+    Dim i As Long
+
+    For i = 1 To ExportCount
+
+        Dim cadName As String
+        Dim cadL As String
+        Dim cadW As String
+        Dim cadT As String
+
+        If ExportRows(i).HasCad Then
+            cadName = parts(ExportRows(i).CadPartIndex).componentName
+            cadL = FormatNumberForCsv(ExportRows(i).Length)
+            cadW = FormatNumberForCsv(ExportRows(i).Width)
+            cadT = FormatNumberForCsv(ExportRows(i).Thickness)
+        Else
+            cadName = ""
+            cadL = ""
+            cadW = ""
+            cadT = ""
+        End If
+
+        Print #f, "EXPORT," & _
+                  CsvText(ExportRows(i).quoteName) & "," & _
+                  CsvText(ExportRows(i).material) & "," & _
+                  CStr(ExportRows(i).Quantity) & "," & _
+                  FormatNumberForCsv(ExportRows(i).BomLength) & "," & _
+                  FormatNumberForCsv(ExportRows(i).BomWidth) & "," & _
+                  FormatNumberForCsv(ExportRows(i).BomThickness) & "," & _
+                  cadL & "," & cadW & "," & cadT & "," & _
+                  CsvText(cadName) & "," & _
+                  CsvText(ExportRows(i).Status)
+    Next i
+
+    For i = 1 To PullcoreMatchCount
+
+        Dim pcCadName As String
+        Dim pcL As String
+        Dim pcW As String
+        Dim pcT As String
+
+        If PullcoreMatches(i).CadPartIndex > 0 Then
+            pcCadName = parts(PullcoreMatches(i).CadPartIndex).componentName
+            pcL = FormatNumberForCsv(PullcoreMatches(i).FittedLength)
+            pcW = FormatNumberForCsv(PullcoreMatches(i).FittedWidth)
+            pcT = FormatNumberForCsv(PullcoreMatches(i).FittedThickness)
+        Else
+            pcCadName = ""
+            pcL = ""
+            pcW = ""
+            pcT = ""
+        End If
+
+        Print #f, "PULLCORE," & _
+                  CsvText(PullcoreMatches(i).quoteName) & "," & _
+                  CsvText(PullcoreMatches(i).material) & "," & _
+                  CStr(PullcoreMatches(i).Quantity) & "," & _
+                  FormatNumberForCsv(PullcoreMatches(i).BomLength) & "," & _
+                  FormatNumberForCsv(PullcoreMatches(i).BomWidth) & "," & _
+                  FormatNumberForCsv(PullcoreMatches(i).BomThickness) & "," & _
+                  pcL & "," & pcW & "," & pcT & "," & _
+                  CsvText(pcCadName) & "," & _
+                  CsvText(PullcoreMatches(i).Status)
+    Next i
+
+    WritePackageReportRow f, "J BLOCK", FindBestJBlockIndex()
+    WritePackageReportRow f, "EJECTOR CAM", FindBestEjectorCamIndex()
+    WritePackageReportRow f, "PULLCORE STOP", FindBestPartByNameAndDims(PULLCORE_STOP_NAME_KEYS, 0, 0, 0, 0)
+    WritePackageReportRow f, "FLIPPER CAM COVER PLATE", _
+        FindBestPartByNameAndDims(FLIPPER_CAM_COVER_NAME_KEYS, _
+                                  FLIPPER_CAM_COVER_TARGET_THICKNESS, _
+                                  FLIPPER_CAM_COVER_TARGET_WIDTH, _
+                                  FLIPPER_CAM_COVER_TARGET_LENGTH, _
+                                  FLIPPER_CAM_COVER_DIM_TOL)
+
+    Print #f, "RAWBOM,---,---,---,---,---,---,---,---,---,---,parsed " & CStr(BomCount) & " rows"
+
+    For i = 1 To BomCount
+        Print #f, "RAWBOM," & _
+                  CsvText(BomRows(i).Description) & "," & _
+                  CsvText(BomRows(i).material) & "," & _
+                  CStr(BomRows(i).Quantity) & "," & _
+                  FormatNumberForCsv(BomRows(i).BomLength) & "," & _
+                  FormatNumberForCsv(BomRows(i).BomWidth) & "," & _
+                  FormatNumberForCsv(BomRows(i).BomThickness) & ",,,," & _
+                  CsvText(BomRows(i).quoteName) & "," & _
+                  CsvText("isPullcore=" & CStr(IsPullcoreBomRow(BomRows(i))) & " hasDims=" & CStr(BomRows(i).hasDims))
+    Next i
+
+    Close #f
+
+    LogLine "Wrote BOM match report CSV: " & csvPath
+    Exit Sub
+
+ErrHandler:
+    LogLine "WriteExportCheckCsv error: " & Err.Description
+    On Error Resume Next
+    Close #f
+End Sub
+
+Private Sub WritePackageReportRow(ByVal f As Integer, ByVal label As String, ByVal cadIdx As Long)
+On Error Resume Next
+
+    Dim nm As String
+    Dim L As String
+    Dim W As String
+    Dim T As String
+    Dim st As String
+
+    If cadIdx > 0 And cadIdx <= PartCount Then
+        nm = parts(cadIdx).componentName
+        L = FormatNumberForCsv(parts(cadIdx).Length)
+        W = FormatNumberForCsv(parts(cadIdx).Width)
+        T = FormatNumberForCsv(parts(cadIdx).Thickness)
+        st = "CAD MATCH FOUND"
+    Else
+        nm = ""
+        L = ""
+        W = ""
+        T = ""
+        st = "NO CAD MATCH"
+    End If
+
+    Print #f, "PACKAGE," & CsvText(label) & ",,,,,," & _
+              L & "," & W & "," & T & "," & CsvText(nm) & "," & CsvText(st)
+End Sub
+
+' ============================================================
+' PULL CORE DIMENSIONS EXCEL REPORT
+' ============================================================
+
+Private Sub WritePullCoreDimensionsExcel(ByVal reportPath As String)
+On Error GoTo ErrHandler
+
+    If CREATE_PULLCORE_DIMENSIONS_EXCEL = False Then Exit Sub
+
+    If reportPath = "" Then
+        reportPath = CurrentJobFolder & "\" & PULLCORE_DIMENSIONS_REPORT_FILE
+    End If
+
+    LogLine "Creating Pull Core Dimensions Excel report: " & reportPath
+
+    Dim xlApp As Object
+    Dim wb As Object
+    Dim ws As Object
+
+    Set xlApp = CreateObject("Excel.Application")
+    xlApp.Visible = False
+    xlApp.DisplayAlerts = False
+    xlApp.ScreenUpdating = False
+    xlApp.EnableEvents = False
+
+    Set wb = xlApp.Workbooks.Add
+    Set ws = wb.Worksheets(1)
+
+    On Error Resume Next
+    ws.Name = "Pull Core Dimensions"
+    On Error GoTo ErrHandler
+
+    WritePullCoreDimensionsExcelHeader ws
+
+    Dim r As Long
+    r = 2
+
+    Dim i As Long
+
+    For i = 1 To PullcoreMatchCount
+        WritePullCoreDimensionsExcelRow ws, r, i
+        r = r + 1
+    Next i
+
+    With ws
+        .Columns("A:AH").AutoFit
+        .Rows(1).Font.Bold = True
+        .Rows(1).Interior.Color = RGB(220, 230, 241)
+        .Rows(1).AutoFilter
+    End With
+
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    EnsureFolderDeep fso.GetParentFolderName(reportPath)
+
+    If fso.FileExists(reportPath) Then
+        On Error Resume Next
+        fso.DeleteFile reportPath, True
+        On Error GoTo ErrHandler
+    End If
+
+    wb.SaveAs reportPath, xlOpenXMLWorkbook
+    wb.Close False
+
+    xlApp.EnableEvents = True
+    xlApp.ScreenUpdating = True
+    xlApp.Quit
+
+    Set ws = Nothing
+    Set wb = Nothing
+    Set xlApp = Nothing
+
+    LogLine "Pull Core Dimensions Excel report saved: " & reportPath
+
+    Exit Sub
+
+ErrHandler:
+    LogLine "WritePullCoreDimensionsExcel error: " & Err.Description
+
+    On Error Resume Next
+
+    If Not wb Is Nothing Then wb.Close False
+    If Not xlApp Is Nothing Then xlApp.Quit
+
+    Set ws = Nothing
+    Set wb = Nothing
+    Set xlApp = Nothing
+End Sub
+
+Private Sub WritePullCoreDimensionsExcelHeader(ByVal ws As Object)
+On Error Resume Next
+
+    If ws Is Nothing Then Exit Sub
+
+    ws.Cells(1, 1).Value = "Job"
+    ws.Cells(1, 2).Value = "Quote Name"
+    ws.Cells(1, 3).Value = "Description"
+    ws.Cells(1, 4).Value = "Material"
+    ws.Cells(1, 5).Value = "Qty"
+    ws.Cells(1, 6).Value = "CAD Component"
+    ws.Cells(1, 7).Value = "Clean Name"
+
+    ws.Cells(1, 8).Value = "BOM Length"
+    ws.Cells(1, 9).Value = "BOM Width"
+    ws.Cells(1, 10).Value = "BOM Thickness"
+
+    ws.Cells(1, 11).Value = "Original Bounding Box Dimensions"
+    ws.Cells(1, 12).Value = "Original Length"
+    ws.Cells(1, 13).Value = "Original Width"
+    ws.Cells(1, 14).Value = "Original Thickness"
+
+    ws.Cells(1, 15).Value = "Fitted Bounding Box Dimensions"
+    ws.Cells(1, 16).Value = "Fitted Length"
+    ws.Cells(1, 17).Value = "Fitted Width"
+    ws.Cells(1, 18).Value = "Fitted Thickness"
+
+    ws.Cells(1, 19).Value = "Delta Length Original-Fitted"
+    ws.Cells(1, 20).Value = "Delta Width Original-Fitted"
+    ws.Cells(1, 21).Value = "Delta Thickness Original-Fitted"
+
+    ws.Cells(1, 22).Value = "Detected Pullcore Angle Deg"
+    ws.Cells(1, 23).Value = "DXF Rotation Deg"
+
+    ws.Cells(1, 24).Value = "Status"
+    ws.Cells(1, 25).Value = "Is Cam"
+    ws.Cells(1, 26).Value = "CAD Index"
+    ws.Cells(1, 27).Value = "Mass"
+    ws.Cells(1, 28).Value = "BBox Volume"
+    ws.Cells(1, 29).Value = "Notes"
+
+    ws.Cells(1, 30).Value = "Assembly Center X"
+    ws.Cells(1, 31).Value = "Assembly Center Y"
+    ws.Cells(1, 32).Value = "Assembly Center Z"
+    ws.Cells(1, 33).Value = "ID/OD Height Axis Used"
+    ws.Cells(1, 34).Value = "ID/OD Height Value"
+End Sub
+
+Private Sub WritePullCoreDimensionsExcelRow(ByVal ws As Object, ByVal r As Long, ByVal matchIdx As Long)
+On Error Resume Next
+
+    If ws Is Nothing Then Exit Sub
+    If matchIdx <= 0 Or matchIdx > PullcoreMatchCount Then Exit Sub
+
+    Dim cadIdx As Long
+    cadIdx = PullcoreMatches(matchIdx).CadPartIndex
+
+    Dim compName As String
+    Dim cleanName As String
+    Dim massVal As Double
+    Dim volVal As Double
+
+    compName = ""
+    cleanName = ""
+    massVal = 0#
+    volVal = 0#
+
+    If cadIdx > 0 And cadIdx <= PartCount Then
+        compName = parts(cadIdx).componentName
+        cleanName = parts(cadIdx).cleanName
+        massVal = parts(cadIdx).massValue
+        volVal = parts(cadIdx).BBoxVolume
+    End If
+
+    ws.Cells(r, 1).Value = CurrentJobNumber
+    ws.Cells(r, 2).Value = PullcoreMatches(matchIdx).quoteName
+    ws.Cells(r, 3).Value = PullcoreMatches(matchIdx).Description
+    ws.Cells(r, 4).Value = PullcoreMatches(matchIdx).material
+    ws.Cells(r, 5).Value = PullcoreMatches(matchIdx).Quantity
+
+    ws.Cells(r, 6).NumberFormat = "@"
+    ws.Cells(r, 6).Value = compName
+
+    ws.Cells(r, 7).NumberFormat = "@"
+    ws.Cells(r, 7).Value = cleanName
+
+    ws.Cells(r, 8).Value = PullcoreMatches(matchIdx).BomLength
+    ws.Cells(r, 9).Value = PullcoreMatches(matchIdx).BomWidth
+    ws.Cells(r, 10).Value = PullcoreMatches(matchIdx).BomThickness
+
+    ws.Cells(r, 11).Value = "Original Bounding Box Dimensions"
+    ws.Cells(r, 12).Value = PullcoreMatches(matchIdx).OriginalLength
+    ws.Cells(r, 13).Value = PullcoreMatches(matchIdx).OriginalWidth
+    ws.Cells(r, 14).Value = PullcoreMatches(matchIdx).OriginalThickness
+
+    ws.Cells(r, 15).Value = "Fitted Bounding Box Dimensions"
+    ws.Cells(r, 16).Value = PullcoreMatches(matchIdx).FittedLength
+    ws.Cells(r, 17).Value = PullcoreMatches(matchIdx).FittedWidth
+    ws.Cells(r, 18).Value = PullcoreMatches(matchIdx).FittedThickness
+
+    ws.Cells(r, 19).Value = PullcoreMatches(matchIdx).OriginalLength - PullcoreMatches(matchIdx).FittedLength
+    ws.Cells(r, 20).Value = PullcoreMatches(matchIdx).OriginalWidth - PullcoreMatches(matchIdx).FittedWidth
+    ws.Cells(r, 21).Value = PullcoreMatches(matchIdx).OriginalThickness - PullcoreMatches(matchIdx).FittedThickness
+
+    ws.Cells(r, 22).Value = PullcoreMatches(matchIdx).DetectedAngleDeg
+    ws.Cells(r, 23).Value = PullcoreMatches(matchIdx).DxfRotationDeg
+
+    ws.Cells(r, 24).Value = PullcoreMatches(matchIdx).Status
+    ws.Cells(r, 25).Value = CStr(PullcoreMatches(matchIdx).isCam)
+    ws.Cells(r, 26).Value = cadIdx
+    ws.Cells(r, 27).Value = massVal
+    ws.Cells(r, 28).Value = volVal
+
+    If cadIdx <= 0 Then
+        ws.Cells(r, 29).Value = "No CAD match"
+    ElseIf Abs(PullcoreMatches(matchIdx).DetectedAngleDeg) < PULLCORE_STRAIGHTEN_MIN_DEG Then
+        ws.Cells(r, 29).Value = "Angle below threshold or original/fitted boxes nearly identical"
+    Else
+        ws.Cells(r, 29).Value = "Angle calculated from original assembly/world bbox vs fitted bbox"
+    End If
+
+    If cadIdx > 0 And cadIdx <= PartCount Then
+        If parts(cadIdx).hasAsmCenter Then
+            ws.Cells(r, 30).Value = parts(cadIdx).AsmCenterX
+            ws.Cells(r, 31).Value = parts(cadIdx).AsmCenterY
+            ws.Cells(r, 32).Value = parts(cadIdx).AsmCenterZ
+            ws.Cells(r, 33).Value = PullcoreIdOdHeightAxisUsed
+
+            If PullcoreIdOdHeightAxisUsed <> "" Then
+                ws.Cells(r, 34).Value = GetPullcoreMatchHeightValue(matchIdx, PullcoreIdOdHeightAxisUsed)
+            End If
+        End If
+    End If
+End Sub
+
+' ============================================================
+' END OF PART 7 OF 8
+' Paste Part 8 next.
+' ============================================================
+' ============================================================
+' FINDERS: JOB FOLDER + CAD
+' ============================================================
+
+Private Function FindJobFolderByText(ByVal rootPath As String, ByVal searchText As String) As String
+On Error GoTo ErrHandler
+
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    If Not fso.FolderExists(rootPath) Then
+        LogLine "Root path does not exist: " & rootPath
+        Exit Function
+    End If
+
+    Dim root As Object
+    Set root = fso.GetFolder(rootPath)
+
+    Dim wantUpper As String
+    wantUpper = UCase(Trim(searchText))
+
+    Dim bestPath As String
+    Dim bestScore As Long
+
+    bestPath = ""
+    bestScore = -1
+
+    Dim subFolder As Object
+    Dim nameUpper As String
+    Dim score As Long
+
+    For Each subFolder In root.SubFolders
+
+        nameUpper = UCase(subFolder.Name)
+
+        If ShouldSkipJobSearchTopFolder(subFolder.Name, wantUpper) Then GoTo NextTop
+        If nameUpper = UCase(EXTRACT_FOLDER_NAME) Then GoTo NextTop
+        If InStr(nameUpper, " PRINTS") > 0 Then GoTo NextTop
+        If InStr(nameUpper, "PULLCORE") > 0 Then GoTo NextTop
+        If InStr(nameUpper, "PYROPEL") > 0 Then GoTo NextTop
+        If InStr(nameUpper, "J BLOCK") > 0 Then GoTo NextTop
+
+        score = -1
+
+        If nameUpper = wantUpper Then
+            score = 1000
+        ElseIf InStr(nameUpper, wantUpper) > 0 Then
+            score = 500 - Abs(Len(nameUpper) - Len(wantUpper))
+        End If
+
+        If score > bestScore Then
+            bestScore = score
+            bestPath = subFolder.path
+        End If
+
+NextTop:
+    Next subFolder
+
+    If bestPath <> "" Then
+        FindJobFolderByText = bestPath
+        Exit Function
+    End If
+
+    For Each subFolder In root.SubFolders
+        nameUpper = UCase(subFolder.Name)
+        If ShouldSkipJobSearchTopFolder(subFolder.Name, wantUpper) = False Then
+            If nameUpper <> UCase(EXTRACT_FOLDER_NAME) Then
+                SearchJobFolderRecursive subFolder, wantUpper, 1, bestPath, bestScore
+            End If
+        End If
+    Next subFolder
+
+    If bestPath = "" Then
+        If InStr(UCase(root.Name), wantUpper) > 0 Then bestPath = rootPath
+    End If
+
+    FindJobFolderByText = bestPath
+    Exit Function
+
+ErrHandler:
+    LogLine "FindJobFolderByText error: " & Err.Description
+    FindJobFolderByText = ""
+End Function
+
+Private Function ShouldSkipJobSearchTopFolder(ByVal folderName As String, ByVal wantUpper As String) As Boolean
+On Error GoTo ErrHandler
+
+    ShouldSkipJobSearchTopFolder = False
+
+    If LIMIT_JOB_SEARCH_TO_CURRENT_AND_PREVIOUS_MONTH = False Then Exit Function
+
+    Dim n As String
+    n = UCase(folderName)
+
+    If InStr(n, wantUpper) > 0 Then Exit Function
+
+    Dim currentMonth As String
+    Dim previousMonth As String
+
+    currentMonth = UCase(Format(Date, "mmmm yyyy"))
+    previousMonth = UCase(Format(DateAdd("m", -1, Date), "mmmm yyyy"))
+
+    If InStr(n, currentMonth) > 0 Then Exit Function
+    If InStr(n, previousMonth) > 0 Then Exit Function
+
+    ShouldSkipJobSearchTopFolder = True
+    Exit Function
+
+ErrHandler:
+    ShouldSkipJobSearchTopFolder = False
+End Function
+
+Private Sub SearchJobFolderRecursive(ByVal folder As Object, _
+                                     ByVal wantUpper As String, _
+                                     ByVal depth As Long, _
+                                     ByRef bestPath As String, _
+                                     ByRef bestScore As Long)
+On Error Resume Next
+
+    If folder Is Nothing Then Exit Sub
+    If depth > 3 Then Exit Sub
+
+    Dim subFolder As Object
+    Dim nameUpper As String
+    Dim score As Long
+
+    For Each subFolder In folder.SubFolders
+
+        nameUpper = UCase(subFolder.Name)
+
+        If nameUpper = UCase(EXTRACT_FOLDER_NAME) Then GoTo NextSub
+        If InStr(nameUpper, " PRINTS") > 0 Then GoTo NextSub
+        If InStr(nameUpper, "PULLCORE") > 0 Then GoTo NextSub
+        If InStr(nameUpper, "PYROPEL") > 0 Then GoTo NextSub
+        If InStr(nameUpper, "J BLOCK") > 0 Then GoTo NextSub
+
+        score = -1
+
+        If nameUpper = wantUpper Then
+            score = 1000 - depth
+        ElseIf InStr(nameUpper, wantUpper) > 0 Then
+            score = 500 - (depth * 20) - Abs(Len(nameUpper) - Len(wantUpper))
+        End If
+
+        If score > bestScore Then
+            bestScore = score
+            bestPath = subFolder.path
+        End If
+
+        SearchJobFolderRecursive subFolder, wantUpper, depth + 1, bestPath, bestScore
+
+NextSub:
+    Next subFolder
+End Sub
+
+Private Function FindAllCadModelsRanked(ByVal folderPath As String) As Collection
+On Error GoTo ErrHandler
+
+    Dim result As New Collection
+
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    If Not fso.FolderExists(folderPath) Then
+        Set FindAllCadModelsRanked = result
+        Exit Function
+    End If
+
+    Dim paths As Collection
+    Dim scores As Collection
+
+    Set paths = New Collection
+    Set scores = New Collection
+
+    CollectCadModelsInFolder fso.GetFolder(folderPath), paths, scores
+
+    Dim used() As Boolean
+
+    If paths.count > 0 Then
+
+        ReDim used(1 To paths.count)
+
+        Dim k As Long
+        Dim i As Long
+        Dim bestI As Long
+        Dim bestS As Long
+
+        For k = 1 To paths.count
+
+            bestI = 0
+            bestS = -2147483647
+
+            For i = 1 To paths.count
+                If used(i) = False Then
+                    If CLng(scores(i)) > bestS Then
+                        bestS = CLng(scores(i))
+                        bestI = i
+                    End If
+                End If
+            Next i
+
+            If bestI > 0 Then
+                used(bestI) = True
+                result.Add CStr(paths(bestI))
+            End If
+
+        Next k
+
+    End If
+
+    Set FindAllCadModelsRanked = result
+    Exit Function
+
+ErrHandler:
+    LogLine "FindAllCadModelsRanked error: " & Err.Description
+    Set FindAllCadModelsRanked = New Collection
+End Function
+
+Private Sub CollectCadModelsInFolder(ByVal folder As Object, ByVal paths As Collection, ByVal scores As Collection)
+On Error Resume Next
+
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    Dim folderName As String
+    folderName = UCase(folder.Name)
+
+    If InStr(folderName, " PRINTS") > 0 Then Exit Sub
+    If folderName = "BASE" Or InStr(folderName, " BASE") > 0 Then Exit Sub
+
+    Dim file As Object
+    Dim ext As String
+    Dim score As Long
+
+    For Each file In folder.Files
+
+        ext = LCase(fso.GetExtensionName(file.path))
+        score = CadFilePriority(ext, file.Name)
+
+        If score > 0 Then
+            paths.Add file.path
+            scores.Add score
+        End If
+
+    Next file
+
+    Dim subFolder As Object
+
+    For Each subFolder In folder.SubFolders
+        CollectCadModelsInFolder subFolder, paths, scores
+    Next subFolder
+End Sub
+
+Private Sub AppendCadCandidates(ByVal target As Collection, ByVal extra As Collection)
+On Error Resume Next
+
+    If target Is Nothing Or extra Is Nothing Then Exit Sub
+
+    Dim i As Long
+    Dim j As Long
+    Dim p As String
+    Dim dup As Boolean
+
+    For i = 1 To extra.count
+
+        p = CStr(extra(i))
+        dup = False
+
+        For j = 1 To target.count
+            If LCase(CStr(target(j))) = LCase(p) Then
+                dup = True
+                Exit For
+            End If
+        Next j
+
+        If dup = False Then target.Add p
+
+    Next i
+End Sub
+
+Private Function CadFilePriority(ByVal ext As String, ByVal fileName As String) As Long
+
+    Dim nameUpper As String
+    nameUpper = UCase(fileName)
+
+    If Left(fileName, 2) = "~$" Then CadFilePriority = 0: Exit Function
+    If Left(nameUpper, 2) = "~$" Then CadFilePriority = 0: Exit Function
+
+    Dim bonus As Long
+    bonus = 0
+
+    If InStr(nameUpper, CurrentJobNumber) > 0 Then bonus = bonus + 5
+    If InStr(nameUpper, "ASSEM") > 0 Or InStr(nameUpper, "ASSY") > 0 Or InStr(nameUpper, "BASE") > 0 Then bonus = bonus + 3
+
+    Select Case ext
+        Case "sldasm"
+            CadFilePriority = 100 + bonus
+        Case "easm"
+            CadFilePriority = 90 + bonus
+        Case "asm"
+            CadFilePriority = 85 + bonus
+        Case "step", "stp"
+            CadFilePriority = 80 + bonus
+        Case "x_t", "x_b"
+            CadFilePriority = 70 + bonus
+        Case "igs", "iges"
+            CadFilePriority = 60 + bonus
+        Case "sldprt"
+            CadFilePriority = 50 + bonus
+        Case "prt"
+            CadFilePriority = 45 + bonus
+        Case Else
+            CadFilePriority = 0
+    End Select
+End Function
+
+' ============================================================
+' OUTPUT NAMING
+' ============================================================
+
+Private Sub DetermineOutputNamingInfo(ByVal jobFolder As String)
+On Error GoTo ErrHandler
+
+    CustomerNumber = ""
+    DateCode = ""
+    NamingSourceText = ""
+
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    If Not fso.FolderExists(jobFolder) Then Exit Sub
+
+    SearchNamingInfoRecursive fso.GetFolder(jobFolder)
+
+    If DateCode = "" Then DateCode = Format(Date, "mm-dd-yyyy")
+    If CustomerNumber = "" Then CustomerNumber = CurrentJobNumber
+
+    Exit Sub
+
+ErrHandler:
+    LogLine "DetermineOutputNamingInfo error: " & Err.Description
+End Sub
+
+Private Sub SearchNamingInfoRecursive(ByVal folder As Object)
+On Error Resume Next
+
+    Dim file As Object
+
+    For Each file In folder.Files
+        TryExtractNamingFromText file.Name
+        If CustomerNumber <> "" And DateCode <> "" Then Exit Sub
+    Next file
+
+    TryExtractNamingFromText folder.Name
+
+    Dim subFolder As Object
+
+    For Each subFolder In folder.SubFolders
+        SearchNamingInfoRecursive subFolder
+        If CustomerNumber <> "" And DateCode <> "" Then Exit Sub
+    Next subFolder
+End Sub
+
+Private Sub TryExtractNamingFromText(ByVal text As String)
+On Error Resume Next
+
+    If text = "" Then Exit Sub
+
+    If CustomerNumber = "" Then
+
+        Dim c As String
+        c = ExtractCustomerNumberFromText(text)
+
+        If c <> "" Then
+            CustomerNumber = c
+            If NamingSourceText = "" Then NamingSourceText = text
+        End If
+
+    End If
+
+    If DateCode = "" Then
+
+        Dim d As String
+        d = ExtractDateCodeFromText(text)
+
+        If d <> "" Then
+            DateCode = d
+            If NamingSourceText = "" Then NamingSourceText = text
+        End If
+
+    End If
+End Sub
+
+Private Function ExtractCustomerNumberFromText(ByVal text As String) As String
+On Error GoTo ErrHandler
+
+    Dim upper As String
+    upper = UCase(text)
+
+    Dim i As Long
+    Dim runStart As Long
+    Dim runLen As Long
+    Dim ch As String
+    Dim candidate As String
+
+    runStart = 0
+    runLen = 0
+
+    For i = 1 To Len(upper) + 1
+
+        If i <= Len(upper) Then
+            ch = Mid(upper, i, 1)
+        Else
+            ch = "X"
+        End If
+
+        If ch >= "0" And ch <= "9" Then
+
+            If runLen = 0 Then runStart = i
+            runLen = runLen + 1
+
+        Else
+
+            If runLen >= 8 Then
+                candidate = Mid(upper, runStart, runLen)
+
+                If IsLikelyEightDigitDate(candidate) = False And IsMostlyZeros(candidate) = False Then
+                    ExtractCustomerNumberFromText = candidate
+                    Exit Function
+                End If
+            End If
+
+            runLen = 0
+
+        End If
+
+    Next i
+
+    Exit Function
+
+ErrHandler:
+    ExtractCustomerNumberFromText = ""
+End Function
+
+Private Function ExtractDateCodeFromText(ByVal text As String) As String
+On Error GoTo ErrHandler
+
+    Dim sep As Variant
+    Dim guess As String
+
+    For Each sep In Array("-", "_", ".", "/")
+
+        guess = ExtractDateWithSeparator(text, CStr(sep))
+
+        If guess <> "" Then
+            ExtractDateCodeFromText = guess
+            Exit Function
+        End If
+
+    Next sep
+
+    Exit Function
+
+ErrHandler:
+    ExtractDateCodeFromText = ""
+End Function
+
+Private Function ExtractDateWithSeparator(ByVal text As String, ByVal sep As String) As String
+On Error GoTo ErrHandler
+
+    Dim cleaned As String
+    cleaned = Replace(text, " ", "")
+
+    Dim i As Long
+    Dim n As Long
+    Dim chunk As String
+    Dim mm As String
+    Dim dd As String
+    Dim yyyy As String
+
+    n = Len(cleaned)
+
+    For i = 1 To n - 7
+
+        chunk = Mid(cleaned, i, 10)
+
+        If Len(chunk) = 10 Then
+            If Mid(chunk, 3, 1) = sep And Mid(chunk, 6, 1) = sep Then
+
+                mm = Left(chunk, 2)
+                dd = Mid(chunk, 4, 2)
+                yyyy = Right(chunk, 4)
+
+                If IsNumeric(mm) And IsNumeric(dd) And IsNumeric(yyyy) Then
+                    If IsValidMonthDayYear(CLng(mm), CLng(dd), CLng(yyyy)) Then
+                        ExtractDateWithSeparator = mm & "-" & dd & "-" & yyyy
+                        Exit Function
+                    End If
+                End If
+
+            End If
+        End If
+
+    Next i
+
+    Exit Function
+
+ErrHandler:
+    ExtractDateWithSeparator = ""
+End Function
+
+Private Function IsLikelyEightDigitDate(ByVal s As String) As Boolean
+    If Len(s) <> 8 Then Exit Function
+    If IsNumeric(s) = False Then Exit Function
+
+    Dim mm As Long
+    Dim dd As Long
+    Dim yyyy As Long
+
+    mm = CLng(Left(s, 2))
+    dd = CLng(Mid(s, 3, 2))
+    yyyy = CLng(Right(s, 4))
+
+    If IsValidMonthDayYear(mm, dd, yyyy) Then
+        IsLikelyEightDigitDate = True
+        Exit Function
+    End If
+
+    yyyy = CLng(Left(s, 4))
+    mm = CLng(Mid(s, 5, 2))
+    dd = CLng(Right(s, 2))
+
+    If IsValidMonthDayYear(mm, dd, yyyy) Then IsLikelyEightDigitDate = True
+End Function
+
+Private Function IsValidMonthDayYear(ByVal mm As Long, ByVal dd As Long, ByVal yyyy As Long) As Boolean
+    If mm < 1 Or mm > 12 Then Exit Function
+    If dd < 1 Or dd > 31 Then Exit Function
+    If yyyy < 2000 Or yyyy > 2100 Then Exit Function
+
+    IsValidMonthDayYear = True
+End Function
+
+Private Function IsMostlyZeros(ByVal s As String) As Boolean
+    Dim i As Long
+    Dim zeros As Long
+
+    For i = 1 To Len(s)
+        If Mid(s, i, 1) = "0" Then zeros = zeros + 1
+    Next i
+
+    If Len(s) > 0 Then
+        If zeros / Len(s) >= 0.7 Then IsMostlyZeros = True
+    End If
+End Function
+
+' ============================================================
+' ARRAY / HEADER HELPERS
+' ============================================================
+
+Private Function GetArrayValue(ByVal data As Variant, ByVal r As Long, ByVal c As Long) As String
+On Error Resume Next
+
+    If c <= 0 Then Exit Function
+
+    Dim v As Variant
+    v = data(r, c)
+
+    If IsError(v) Then Exit Function
+    If IsNull(v) Then Exit Function
+
+    GetArrayValue = Trim(CStr(v))
+End Function
+
+Private Function FindBomHeaderLikeInArrayRow(ByVal data As Variant, ByVal r As Long, ByVal colCount As Long, ByVal options As Variant) As Long
+    Dim opt As Variant
+    Dim c As Long
+    Dim cellUpper As String
+
+    For c = 1 To colCount
+
+        cellUpper = UCase(GetArrayValue(data, r, c))
+
+        If cellUpper <> "" Then
+            For Each opt In options
+                If cellUpper = UCase(CStr(opt)) Or InStr(cellUpper, UCase(CStr(opt))) > 0 Then
+                    FindBomHeaderLikeInArrayRow = c
+                    Exit Function
+                End If
+            Next opt
+        End If
+
+    Next c
+End Function
+
+Private Function FindBomQtyColumnInArrayRow(ByVal data As Variant, ByVal r As Long, ByVal colCount As Long) As Long
+    FindBomQtyColumnInArrayRow = FindBomHeaderLikeInArrayRow(data, r, colCount, Array("QTY", "QUANTITY", "QNTY", "QUAN"))
+End Function
+
+Private Function FindBomMaterialColumnInArrayRow(ByVal data As Variant, ByVal r As Long, ByVal colCount As Long) As Long
+    FindBomMaterialColumnInArrayRow = FindBomHeaderLikeInArrayRow(data, r, colCount, Array("MATERIAL", "MAT", "MTL", "STEEL"))
+End Function
+
+Private Sub FindBomDimensionColumnsInArrayRow(ByVal data As Variant, ByVal r As Long, ByVal colCount As Long, _
+                                              ByRef lenCol As Long, ByRef widCol As Long, ByRef thkCol As Long)
+
+    lenCol = FindBomHeaderLikeInArrayRow(data, r, colCount, Array("LENGTH", "LTH", "LEN"))
+    widCol = FindBomHeaderLikeInArrayRow(data, r, colCount, Array("WIDTH", "WTH", "WID"))
+    thkCol = FindBomHeaderLikeInArrayRow(data, r, colCount, Array("THICKNESS", "THICK", "THK", "HGT", "HEIGHT"))
+End Sub
+
+Private Function IsLikelyBomWorksheet(ByVal ws As Object) As Boolean
+On Error Resume Next
+
+    Dim n As String
+    n = UCase(ws.Name)
+
+    If InStr(n, "BOM") > 0 Then IsLikelyBomWorksheet = True: Exit Function
+    If InStr(n, "BILL") > 0 Then IsLikelyBomWorksheet = True: Exit Function
+    If InStr(n, "MATERIAL") > 0 Then IsLikelyBomWorksheet = True: Exit Function
+    If InStr(n, "QUOTE") > 0 Then IsLikelyBomWorksheet = True: Exit Function
+
+    IsLikelyBomWorksheet = True
+End Function
+
+Private Function ShouldSkipBomWorksheet(ByVal ws As Object) As Boolean
+On Error Resume Next
+
+    Dim n As String
+    n = UCase(ws.Name)
+
+    If InStr(n, "INSTRUCTION") > 0 Then ShouldSkipBomWorksheet = True: Exit Function
+    If InStr(n, "NOTES") > 0 Then ShouldSkipBomWorksheet = True: Exit Function
+    If InStr(n, "COVER") > 0 Then ShouldSkipBomWorksheet = True: Exit Function
+End Function
+
+' ============================================================
+' NAME STANDARDIZATION
+' ============================================================
+
+Private Function StandardPlateName(ByVal desc As String) As String
+On Error GoTo ErrHandler
+
+    Dim s As String
+    s = NormalizeText(desc)
+
+    If InStr(s, "EJECTOR J-BLOCK") > 0 Or InStr(s, "EJ J-BLOCK") > 0 Or _
+       InStr(s, "EJ J BLOCK") > 0 Or InStr(s, "J-BLOCK") > 0 Or InStr(s, "J BLOCK") > 0 Then
+        StandardPlateName = "EJECTOR J-BLOCK"
+        Exit Function
+    End If
+
+    If InStr(s, "PULLCORE") > 0 Or InStr(s, "PULL CORE") > 0 Then
+
+        Dim loc As String
+        Dim kind As String
+
+        loc = GetPullcoreLocationCode(s)
+
+        If InStr(s, "CAM") > 0 Then
+            kind = "PULLCORE CAM"
+        Else
+            kind = "PULLCORE KEY"
+        End If
+
+        If loc <> "" Then
+            StandardPlateName = loc & " " & kind
+        Else
+            StandardPlateName = kind
+        End If
+
+        Exit Function
+    End If
+
+    If InStr(s, "ID HOLDER") > 0 Or InStr(s, "IDTE HOLDER") > 0 Or InStr(s, "TOP HOLDER") > 0 Or InStr(s, "TOP HOLDER BLOCK") > 0 Then
+        StandardPlateName = "ID HOLDER"
+        Exit Function
+    End If
+
+    If InStr(s, "OD HOLDER") > 0 Or InStr(s, "ODTE HOLDER") > 0 Or InStr(s, "BOTTOM HOLDER") > 0 Or _
+       InStr(s, "BOT HOLDER") > 0 Or InStr(s, "BOTTOM HOLDER BLOCK") > 0 Then
+        StandardPlateName = "OD HOLDER"
+        Exit Function
+    End If
+
+    If InStr(s, "POT BLOCK") > 0 Or InStr(s, "POT BLK") > 0 Or InStr(s, " POT ") > 0 Or Right(s, 4) = " POT" Then
+
+        If IsLikelyOdSideName(s) Then
+            StandardPlateName = "OD POT BLOCK"
+            Exit Function
+        End If
+
+        If IsLikelyIdSideName(s) Then
+            StandardPlateName = "ID POT BLOCK"
+            Exit Function
+        End If
+
+        StandardPlateName = "POT BLOCK"
+        Exit Function
+    End If
+
+    If InStr(s, "SMED") > 0 Then
+
+        If IsLikelyIdSideName(s) Then
+            StandardPlateName = "TCP"
+            Exit Function
+        End If
+
+        If IsLikelyOdSideName(s) Then
+            StandardPlateName = "BCP"
+            Exit Function
+        End If
+
+        StandardPlateName = "SMED PLATE"
+        Exit Function
+    End If
+
+    If InStr(s, "TOP CLAMP") > 0 Or InStr(s, "TOP CLAMPING") > 0 Then
+        StandardPlateName = "TCP"
+        Exit Function
+    End If
+
+    If InStr(s, "BOTTOM CLAMP") > 0 Or InStr(s, "BOT CLAMP") > 0 Or _
+       InStr(s, "BOTTOM CLAMPING") > 0 Or InStr(s, "BOT CLAMPING") > 0 Then
+        StandardPlateName = "BCP"
+        Exit Function
+    End If
+
+    If InStr(s, "TCP") > 0 Then
+        StandardPlateName = "TCP"
+        Exit Function
+    End If
+
+    If InStr(s, "BCP") > 0 Then
+        StandardPlateName = "BCP"
+        Exit Function
+    End If
+
+    If InStr(s, "TOP INS") > 0 Or InStr(s, "TOP INSULATION") > 0 Then
+        StandardPlateName = "TOP INS"
+        Exit Function
+    End If
+
+    If InStr(s, "BOT INS") > 0 Or InStr(s, "BOTTOM INS") > 0 Or InStr(s, "BOTTOM INSULATION") > 0 Then
+        StandardPlateName = "BOT INS"
+        Exit Function
+    End If
+
+    If InStr(s, "PULLCORE STOP") > 0 Or InStr(s, "PULL CORE STOP") > 0 Then
+        StandardPlateName = "PULLCORE STOP"
+        Exit Function
+    End If
+
+    If InStr(s, "FLIPPER CAM COVER") > 0 Or InStr(s, "CAM COVER PLATE") > 0 Then
+        StandardPlateName = "FLIPPER CAM COVER PLATE"
+        Exit Function
+    End If
+
+    StandardPlateName = ProperCaseText(Trim(desc))
+    Exit Function
+
+ErrHandler:
+    StandardPlateName = Trim(desc)
+End Function
+
+Private Function IsLikelyIdSideName(ByVal s As String) As Boolean
+    If InStr(s, "ID ") > 0 Or Left(s, 2) = "ID" Then IsLikelyIdSideName = True: Exit Function
+    If InStr(s, " TOP") > 0 Or Left(s, 3) = "TOP" Then IsLikelyIdSideName = True: Exit Function
+    If InStr(s, "TCP") > 0 Then IsLikelyIdSideName = True
+End Function
+
+Private Function IsLikelyOdSideName(ByVal s As String) As Boolean
+    If InStr(s, "OD ") > 0 Or Left(s, 2) = "OD" Then IsLikelyOdSideName = True: Exit Function
+    If InStr(s, "BOTTOM") > 0 Or InStr(s, "BOT ") > 0 Or Left(s, 3) = "BOT" Then IsLikelyOdSideName = True: Exit Function
+    If InStr(s, "BCP") > 0 Then IsLikelyOdSideName = True
+End Function
+
+Private Function IsMainPrintsQuote(ByVal quoteName As String) As Boolean
+    Dim k As String
+    k = NormalizeKey(quoteName)
+
+    Select Case k
+        Case "IDHOLDER", "ODHOLDER", "TCP", "BCP", "TOPINS", "BOTINS", _
+             "SMEDPLATE", "IDPOTBLOCK", "ODPOTBLOCK", "POTBLOCK"
+            IsMainPrintsQuote = True
+    End Select
+End Function
+
+Private Function GetOutputFolderForRegularExport(ByVal quoteName As String, ByVal outputFolder As String) As String
+    If IsMainPrintsQuote(quoteName) Then
+        GetOutputFolderForRegularExport = outputFolder
+    Else
+        GetOutputFolderForRegularExport = CurrentJobFolder & "\" & CurrentJobNumber & " MISC DETAILS"
+    End If
+End Function
+
+Private Function IsInsertQuoteName(ByVal quoteName As String) As Boolean
+    Dim k As String
+    k = NormalizeKey(quoteName)
+
+    If k = "TOPINS" Or k = "BOTINS" Then IsInsertQuoteName = True: Exit Function
+    If InStr(k, "INSERT") > 0 Then IsInsertQuoteName = True: Exit Function
+    If InStr(k, "INS") > 0 And Len(k) <= 16 Then IsInsertQuoteName = True
+End Function
+
+Private Function ShouldSkipExportQuoteName(ByVal quoteName As String) As Boolean
+    Dim s As String
+    s = NormalizeText(quoteName)
+
+    If InStr(s, "J-BLOCK") > 0 Or InStr(s, "J BLOCK") > 0 Or InStr(s, "JBLOCK") > 0 Then
+        ShouldSkipExportQuoteName = True
+        Exit Function
+    End If
+
+    If InStr(s, "PULLCORE") > 0 Or InStr(s, "PULL CORE") > 0 Then
+        ShouldSkipExportQuoteName = True
+        Exit Function
+    End If
+
+    If InStr(s, "FLIPPER CAM COVER") > 0 Then
+        ShouldSkipExportQuoteName = True
+        Exit Function
+    End If
+End Function
+
+Private Function IsNameMatch(ByVal cadName As String, ByVal quoteName As String) As Boolean
+    Dim a As String
+    Dim b As String
+
+    a = NormalizeKey(cadName)
+    b = NormalizeKey(quoteName)
+
+    If a = "" Or b = "" Then Exit Function
+
+    If InStr(a, b) > 0 Or InStr(b, a) > 0 Then IsNameMatch = True
+End Function
+
+' ============================================================
+' TCP / BCP MASS HELPERS
+' ============================================================
+
+Private Function IsTcpBcpQuoteName(ByVal quoteName As String) As Boolean
+    Dim k As String
+    k = NormalizeKey(quoteName)
+
+    Select Case k
+        Case "TCP", "BCP", _
+             "TOPCLAMPINGPLATE", "BOTTOMCLAMPINGPLATE", _
+             "TOPSMEDPLATE", "BOTTOMSMEDPLATE", _
+             "TOPSMED", "BOTTOMSMED"
+            IsTcpBcpQuoteName = True
+    End Select
+End Function
+
+Private Function ShouldUseTcpBcpMassPairRule(ByRef b As BomInfo) As Boolean
+On Error GoTo ErrHandler
+
+    ShouldUseTcpBcpMassPairRule = False
+
+    If b.hasDims = False Then Exit Function
+    If IsTcpBcpQuoteName(b.quoteName) = False Then Exit Function
+
+    Dim counterpart As String
+    counterpart = GetCounterpartQuoteName(b.quoteName)
+
+    If counterpart = "" Then Exit Function
+
+    Dim i As Long
+
+    For i = 1 To BomCount
+
+        If NormalizeKey(BomRows(i).quoteName) = NormalizeKey(counterpart) Then
+            If BomRows(i).hasDims Then
+                If Abs(BomRows(i).BomLength - b.BomLength) <= SAME_SIZE_PAIR_TOL Then
+                    If Abs(BomRows(i).BomWidth - b.BomWidth) <= SAME_SIZE_PAIR_TOL Then
+                        If Abs(BomRows(i).BomThickness - b.BomThickness) <= SAME_SIZE_PAIR_TOL Then
+                            ShouldUseTcpBcpMassPairRule = True
+                            Exit Function
+                        End If
+                    End If
+                End If
+            End If
+        End If
+
+    Next i
+
+    Exit Function
+
+ErrHandler:
+    ShouldUseTcpBcpMassPairRule = False
+End Function
+
+Private Function GetMassPreferenceForQuoteName(ByVal quoteName As String) As String
+    Dim k As String
+    k = NormalizeKey(quoteName)
+
+    If k = "TOPINS" Then GetMassPreferenceForQuoteName = "LIGHT": Exit Function
+    If k = "BOTINS" Then GetMassPreferenceForQuoteName = "HEAVY": Exit Function
+
+    If k = "TCP" Then GetMassPreferenceForQuoteName = "LIGHT": Exit Function
+    If k = "BCP" Then GetMassPreferenceForQuoteName = "HEAVY": Exit Function
+
+    If k = "TOPCLAMPINGPLATE" Or k = "TOPSMEDPLATE" Or k = "TOPSMED" Then
+        GetMassPreferenceForQuoteName = "LIGHT"
+        Exit Function
+    End If
+
+    If k = "BOTTOMCLAMPINGPLATE" Or k = "BOTTOMSMEDPLATE" Or k = "BOTTOMSMED" Then
+        GetMassPreferenceForQuoteName = "HEAVY"
+        Exit Function
+    End If
+
+    GetMassPreferenceForQuoteName = ""
+End Function
+
+Private Function GetCounterpartQuoteName(ByVal quoteName As String) As String
+    Dim k As String
+    k = NormalizeKey(quoteName)
+
+    If k = "IDHOLDER" Then GetCounterpartQuoteName = "OD HOLDER": Exit Function
+    If k = "ODHOLDER" Then GetCounterpartQuoteName = "ID HOLDER": Exit Function
+    If k = "TOPINS" Then GetCounterpartQuoteName = "BOT INS": Exit Function
+    If k = "BOTINS" Then GetCounterpartQuoteName = "TOP INS": Exit Function
+    If k = "TCP" Then GetCounterpartQuoteName = "BCP": Exit Function
+    If k = "BCP" Then GetCounterpartQuoteName = "TCP": Exit Function
+
+    If k = "TOPCLAMPINGPLATE" Or k = "TOPSMEDPLATE" Or k = "TOPSMED" Then
+        GetCounterpartQuoteName = "BCP"
+        Exit Function
+    End If
+
+    If k = "BOTTOMCLAMPINGPLATE" Or k = "BOTTOMSMEDPLATE" Or k = "BOTTOMSMED" Then
+        GetCounterpartQuoteName = "TCP"
+        Exit Function
+    End If
+End Function
+
+Private Function NormalizeSteelType(ByVal matText As String) As String
+    Dim s As String
+    s = UCase(Trim(matText))
+
+    If s = "" Then NormalizeSteelType = DEFAULT_STEEL_TYPE: Exit Function
+
+    If InStr(s, "PYROPEL") > 0 Then NormalizeSteelType = "Pyropel": Exit Function
+    If InStr(s, "4140") > 0 Then NormalizeSteelType = "4140": Exit Function
+    If InStr(s, "H-13") > 0 Or InStr(s, "H13") > 0 Then NormalizeSteelType = "H13": Exit Function
+    If InStr(s, "A-2") > 0 Or InStr(s, "A2") > 0 Then NormalizeSteelType = "A-2": Exit Function
+    If InStr(s, "D-2") > 0 Or InStr(s, "D2") > 0 Then NormalizeSteelType = "D-2": Exit Function
+    If InStr(s, "DRILL ROD") > 0 Then NormalizeSteelType = "Drill Rod": Exit Function
+    If InStr(s, "STAINLESS") > 0 Or InStr(s, "SS") > 0 Then NormalizeSteelType = "Stainless": Exit Function
+
+    NormalizeSteelType = Trim(matText)
+End Function
+
+Private Function IsHardwareName(ByVal d As String) As Boolean
+    If InStr(d, "SCREW") > 0 Then IsHardwareName = True: Exit Function
+    If InStr(d, "BOLT") > 0 Then IsHardwareName = True: Exit Function
+    If InStr(d, "WASHER") > 0 Then IsHardwareName = True: Exit Function
+    If InStr(d, "DOWEL") > 0 Then IsHardwareName = True: Exit Function
+    If InStr(d, "NUT ") > 0 Then IsHardwareName = True: Exit Function
+    If InStr(d, "SHCS") > 0 Then IsHardwareName = True: Exit Function
+    If InStr(d, "SOCKET HEAD") > 0 Then IsHardwareName = True: Exit Function
+    If InStr(d, "SPRING") > 0 Then IsHardwareName = True: Exit Function
+    If InStr(d, "PIN") > 0 And InStr(d, "PINION") = 0 Then IsHardwareName = True: Exit Function
+    If InStr(d, "O-RING") > 0 Or InStr(d, "ORING") > 0 Then IsHardwareName = True: Exit Function
+End Function
+
+Private Function FindCadPartIndexByQuoteOrKeys(ByVal quoteName As String, ByVal pipeKeys As String) As Long
+On Error GoTo ErrHandler
+
+    FindCadPartIndexByQuoteOrKeys = 0
+
+    Dim i As Long
+    Dim hay As String
+
+    For i = 1 To PartCount
+        hay = parts(i).cleanName & " " & parts(i).componentName & " " & parts(i).filePath
+        If ContainsAnyPipeKey(hay, pipeKeys) Then
+            FindCadPartIndexByQuoteOrKeys = i
+            Exit Function
+        End If
+    Next i
+
+    Dim k As String
+    k = NormalizeKey(quoteName)
+
+    For i = 1 To ExportCount
+        If NormalizeKey(ExportRows(i).quoteName) = k And ExportRows(i).HasCad Then
+            FindCadPartIndexByQuoteOrKeys = ExportRows(i).CadPartIndex
+            Exit Function
+        End If
+    Next i
+
+    Exit Function
+
+ErrHandler:
+    FindCadPartIndexByQuoteOrKeys = 0
+End Function
+
+Private Function ContainsAnyPipeKey(ByVal haystack As String, ByVal pipeKeys As String) As Boolean
+On Error GoTo ErrHandler
+
+    ContainsAnyPipeKey = False
+
+    If haystack = "" Then Exit Function
+    If pipeKeys = "" Then Exit Function
+
+    Dim hayUpper As String
+    hayUpper = NormalizeText(haystack)
+
+    Dim keys() As String
+    keys = Split(pipeKeys, "|")
+
+    Dim i As Long
+    Dim k1 As String
+
+    For i = LBound(keys) To UBound(keys)
+        k1 = NormalizeText(keys(i))
+        If k1 <> "" Then
+            If InStr(hayUpper, k1) > 0 Then
+                ContainsAnyPipeKey = True
+                Exit Function
+            End If
+        End If
+    Next i
+
+    Dim hayKey As String
+    hayKey = NormalizeKey(haystack)
+
+    Dim k2 As String
+
+    For i = LBound(keys) To UBound(keys)
+        k2 = NormalizeKey(keys(i))
+        If k2 <> "" Then
+            If InStr(hayKey, k2) > 0 Then
+                ContainsAnyPipeKey = True
+                Exit Function
+            End If
+        End If
+    Next i
+
+    Exit Function
+
+ErrHandler:
+    ContainsAnyPipeKey = False
+End Function
+
+' ============================================================
+' QUARTER-INCH PHYSICAL HIDE
+' ============================================================
+
+Private Sub HideQuarterInchThicknessItems(ByVal model As Object)
+On Error GoTo ErrHandler
+
+    If model Is Nothing Then Exit Sub
+    If model.GetType <> swDocASSEMBLY Then Exit Sub
+
+    HideQuarterInchAssemblyComponents model
+    Exit Sub
+
+ErrHandler:
+    LogLine "HideQuarterInchThicknessItems error: " & Err.Description
+End Sub
+
+Private Sub HideQuarterInchAssemblyComponents(ByVal assyModel As Object)
+On Error Resume Next
+
+    Dim vComps As Variant
+    vComps = assyModel.GetComponents(False)
+
+    If IsEmpty(vComps) Then Exit Sub
+
+    Dim i As Long
+    Dim swComp As Object
+    Dim swCompModel As Object
+    Dim dx As Double
+    Dim dy As Double
+    Dim dz As Double
+    Dim L As Double
+    Dim W As Double
+    Dim T As Double
+
+    For i = 0 To UBound(vComps)
+
+        Set swComp = vComps(i)
+
+        If Not swComp Is Nothing Then
+            If swComp.IsSuppressed = False Then
+
+                Set swCompModel = swComp.GetModelDoc2
+
+                If Not swCompModel Is Nothing Then
+                    If swCompModel.GetType = swDocPART Then
+
+                        If GetPartBoundingBoxInches(swCompModel, dx, dy, dz) Then
+                            SortThreeDimensions dx, dy, dz, L, W, T
+
+                            If IsQuarterInchThickness(T) Then
+                                swComp.Visible = swComponentHidden
+                            End If
+                        End If
+
+                    End If
+                End If
+
+            End If
+        End If
+
+    Next i
+End Sub
+
+' ============================================================
+' GENERAL HELPERS
+' ============================================================
+
+Private Function NormalizeText(ByVal s As String) As String
+    s = UCase(Trim(s))
+    s = Replace(s, vbTab, " ")
+    s = Replace(s, vbCr, " ")
+    s = Replace(s, vbLf, " ")
+
+    NormalizeText = NormalizeSpaces(s)
+End Function
+
+Private Function NormalizeSpaces(ByVal s As String) As String
+    Do While InStr(s, "  ") > 0
+        s = Replace(s, "  ", " ")
+    Loop
+
+    NormalizeSpaces = Trim(s)
+End Function
+
+Private Function NormalizeKey(ByVal s As String) As String
+    s = UCase(Trim(s))
+    s = Replace(s, " ", "")
+    s = Replace(s, "-", "")
+    s = Replace(s, "_", "")
+    s = Replace(s, ".", "")
+    s = Replace(s, "/", "")
+    s = Replace(s, "\", "")
+    s = Replace(s, vbTab, "")
+    s = Replace(s, vbCr, "")
+    s = Replace(s, vbLf, "")
+
+    NormalizeKey = s
+End Function
+
+Private Function ProperCaseText(ByVal s As String) As String
+On Error Resume Next
+
+    ProperCaseText = StrConv(s, vbProperCase)
+
+    If ProperCaseText = "" Then ProperCaseText = s
+End Function
+
+Private Function IsQuarterInchThickness(ByVal T As Double) As Boolean
+    IsQuarterInchThickness = (Abs(T - QUARTER_INCH_THICKNESS) <= QUARTER_INCH_TOLERANCE)
+End Function
+
+Private Function IsComponentHidden(ByVal swComp As Object) As Boolean
+On Error Resume Next
+
+    If swComp Is Nothing Then Exit Function
+
+    IsComponentHidden = (swComp.Visible = swComponentHidden)
+End Function
+
+Private Function GetFileBaseName(ByVal path As String) As String
+On Error Resume Next
+
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    GetFileBaseName = fso.GetBaseName(path)
+End Function
+
+Private Function GetFileExtension(ByVal path As String) As String
+On Error Resume Next
+
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    GetFileExtension = fso.GetExtensionName(path)
+End Function
+
+Private Function CleanDisplayName(ByVal compName As String, ByVal compPath As String) As String
+On Error Resume Next
+
+    Dim s As String
+    s = compName
+
+    Dim dashPos As Long
+    dashPos = InStrRev(s, "-")
+
+    If dashPos > 1 Then
+        Dim tail As String
+        tail = Mid(s, dashPos + 1)
+
+        If IsNumeric(tail) Then s = Left(s, dashPos - 1)
+    End If
+
+    If s = "" And compPath <> "" Then s = GetFileBaseName(compPath)
+
+    CleanDisplayName = Trim(s)
+End Function
+
+Private Function CleanFileName(ByVal s As String) As String
+    s = Trim(s)
+    s = Replace(s, "\", "_")
+    s = Replace(s, "/", "_")
+    s = Replace(s, ":", "_")
+    s = Replace(s, "*", "_")
+    s = Replace(s, "?", "_")
+    s = Replace(s, Chr(34), "_")
+    s = Replace(s, "<", "_")
+    s = Replace(s, ">", "_")
+    s = Replace(s, "|", "_")
+
+    CleanFileName = Trim(s)
+End Function
+
+Private Function CleanQuoteTokenForFile(ByVal s As String) As String
+    s = CleanFileName(s)
+    s = NormalizeSpaces(s)
+
+    CleanQuoteTokenForFile = Trim(s)
+End Function
+
+Private Sub EnsureFolder(ByVal folderPath As String)
+On Error Resume Next
+
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    If fso.FolderExists(folderPath) = False Then fso.CreateFolder folderPath
+End Sub
+
+Private Sub EnsureFolderDeep(ByVal folderPath As String)
+On Error Resume Next
+
+    If folderPath = "" Then Exit Sub
+
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    If fso.FolderExists(folderPath) Then Exit Sub
+
+    Dim parent As String
+    parent = fso.GetParentFolderName(folderPath)
+
+    If parent <> "" And fso.FolderExists(parent) = False Then
+        EnsureFolderDeep parent
+    End If
+
+    If fso.FolderExists(folderPath) = False Then fso.CreateFolder folderPath
+End Sub
+
+Private Sub CollectJobPdfsAndReports()
+On Error GoTo ErrHandler
+
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    Dim destFolder As String
+    destFolder = CurrentJobFolder & "\" & CurrentJobNumber & " pdfs"
+
+    EnsureFolderDeep destFolder
+
+    Dim copied As Long
+    copied = 0
+
+    copied = copied + CopyFilesByExtension(CurrentJobFolder, destFolder, "pdf", destFolder, True)
+
+    Dim names As Variant
+    names = Array("XT_Export_BOM_Match_Report.csv", _
+                  "XT_Export_CAD_Dimensions.csv", _
+                  "XT_Export_BOM_PDF_Text.txt", _
+                  JOB_SIGNATURE_REPORT_FILE, _
+                  PULLCORE_DIMENSIONS_REPORT_FILE)
+
+    Dim i As Long
+    Dim src As String
+
+    For i = LBound(names) To UBound(names)
+
+        src = CurrentJobFolder & "\" & CStr(names(i))
+
+        If fso.FileExists(src) Then
+            fso.CopyFile src, destFolder & "\" & CStr(names(i)), True
+            copied = copied + 1
+        End If
+
+    Next i
+
+    LogLine "Collected " & copied & " PDF/report file(s) into: " & destFolder
+    Exit Sub
+
+ErrHandler:
+    LogLine "CollectJobPdfsAndReports error: " & Err.Description
+End Sub
+
+Private Function CopyFilesByExtension(ByVal srcFolder As String, ByVal destFolder As String, _
+                                      ByVal ext As String, ByVal skipFolder As String, _
+                                      Optional ByVal deleteSource As Boolean = False) As Long
+On Error Resume Next
+
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    If Not fso.FolderExists(srcFolder) Then Exit Function
+
+    Dim folder As Object
+    Set folder = fso.GetFolder(srcFolder)
+
+    Dim count As Long
+    count = 0
+
+    Dim f As Object
+    Dim srcPath As String
+
+    For Each f In folder.Files
+        If LCase(fso.GetExtensionName(f.path)) = LCase(ext) Then
+            srcPath = f.path
+            fso.CopyFile srcPath, destFolder & "\" & f.Name, True
+            count = count + 1
+
+            If deleteSource Then fso.DeleteFile srcPath, True
+        End If
+    Next f
+
+    Dim sub_ As Object
+
+    For Each sub_ In folder.SubFolders
+        If LCase(sub_.path) <> LCase(skipFolder) Then
+            count = count + CopyFilesByExtension(sub_.path, destFolder, ext, skipFolder, deleteSource)
+        End If
+    Next sub_
+
+    CopyFilesByExtension = count
+End Function
+
+Private Function GetWritableCsvPath(ByVal csvPath As String) As String
+On Error GoTo ErrHandler
+
+    Dim f As Integer
+    f = FreeFile
+
+    On Error Resume Next
+    Err.Clear
+    Open csvPath For Output As #f
+
+    If Err.Number = 0 Then
+        Close #f
+        GetWritableCsvPath = csvPath
+        Exit Function
+    End If
+
+    Err.Clear
+
+    Dim alt As String
+    alt = AppendBeforeExtension(csvPath, "_" & Format(Now, "yyyymmdd_hhnnss"))
+
+    LogLine "CSV locked, writing to alternate file instead: " & alt
+
+    GetWritableCsvPath = alt
+    Exit Function
+
+ErrHandler:
+    GetWritableCsvPath = csvPath
+End Function
+
+Private Function AppendBeforeExtension(ByVal path As String, ByVal suffix As String) As String
+On Error Resume Next
+
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    Dim folder As String
+    Dim base As String
+    Dim ext As String
+
+    folder = fso.GetParentFolderName(path)
+    base = fso.GetBaseName(path)
+    ext = fso.GetExtensionName(path)
+
+    If ext = "" Then
+        AppendBeforeExtension = folder & "\" & base & suffix
+    Else
+        AppendBeforeExtension = folder & "\" & base & suffix & "." & ext
+    End If
+End Function
+
+Private Function GetUniqueFilePath(ByVal path As String) As String
+On Error GoTo ErrHandler
+
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    If fso.FileExists(path) = False Then
+        GetUniqueFilePath = path
+        Exit Function
+    End If
+
+    Dim folder As String
+    Dim base As String
+    Dim ext As String
+
+    folder = fso.GetParentFolderName(path)
+    base = fso.GetBaseName(path)
+    ext = fso.GetExtensionName(path)
+
+    Dim n As Long
+    Dim candidate As String
+
+    n = 2
+
+    Do
+        candidate = folder & "\" & base & "_" & n & "." & ext
+
+        If fso.FileExists(candidate) = False Then
+            GetUniqueFilePath = candidate
+            Exit Function
+        End If
+
+        n = n + 1
+    Loop While n < 1000
+
+    GetUniqueFilePath = path
+    Exit Function
+
+ErrHandler:
+    GetUniqueFilePath = path
+End Function
+
+Private Function PowerShellQuote(ByVal s As String) As String
+    PowerShellQuote = "'" & Replace(s, "'", "''") & "'"
+End Function
+
+Private Sub WaitMilliseconds(ByVal ms As Long)
+On Error Resume Next
+
+    If ms <= 0 Then Exit Sub
+
+    Dim startT As Double
+    Dim target As Double
+
+    startT = Timer
+    target = ms / 1000#
+
+    Do
+        DoEvents
+
+        If Timer < startT Then Exit Do
+        If (Timer - startT) >= target Then Exit Do
+    Loop
+End Sub
+
+Private Function CsvText(ByVal s As String) As String
+    s = Replace(s, Chr(34), Chr(34) & Chr(34))
+    CsvText = Chr(34) & s & Chr(34)
+End Function
+
+Private Function FormatNumberForCsv(ByVal v As Double) As String
+    FormatNumberForCsv = Format(v, "0.000")
+End Function
+
+Private Function ReadAllTextFile(ByVal path As String) As String
+On Error GoTo ErrHandler
+
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    If fso.FileExists(path) = False Then Exit Function
+
+    Dim ts As Object
+    Set ts = fso.OpenTextFile(path, 1, False)
+
+    If Not ts.AtEndOfStream Then
+        ReadAllTextFile = ts.ReadAll
+    End If
+
+    ts.Close
+    Exit Function
+
+ErrHandler:
+    ReadAllTextFile = ""
+End Function
+
+Private Sub ExtractDecimalNumbers(ByVal line As String, ByRef nums() As Double, ByRef numCount As Long)
+On Error GoTo ErrHandler
+
+    numCount = 0
+    ReDim nums(0 To 50)
+
+    Dim i As Long
+    Dim ch As String
+    Dim token As String
+
+    token = ""
+
+    For i = 1 To Len(line) + 1
+
+        If i <= Len(line) Then
+            ch = Mid(line, i, 1)
+        Else
+            ch = " "
+        End If
+
+        If (ch >= "0" And ch <= "9") Or ch = "." Then
+
+            token = token & ch
+
+        Else
+
+            If token <> "" Then
+
+                If IsNumeric(token) Then
+                    If InStr(token, ".") > 0 Then
+
+                        nums(numCount) = CDbl(token)
+                        numCount = numCount + 1
+
+                        If numCount > 50 Then Exit For
+
+                    End If
+                End If
+
+                token = ""
+
+            End If
+
+        End If
+
+    Next i
+
+    Exit Sub
+
+ErrHandler:
+    numCount = 0
+End Sub
+
+Private Function ExtractQtyAfterOutsource(ByVal upperLine As String) As Long
+On Error GoTo ErrHandler
+
+    ExtractQtyAfterOutsource = 1
+
+    Dim kw As Variant
+    Dim p As Long
+
+    For Each kw In Array("OUTSOURCE", "PURCHASE", "MAKE", "BUY", "STOCK")
+
+        p = InStr(upperLine, CStr(kw))
+
+        If p > 0 Then
+
+            Dim tail As String
+            tail = Mid(upperLine, p + Len(CStr(kw)))
+
+            Dim i As Long
+            Dim ch As String
+            Dim token As String
+
+            token = ""
+
+            For i = 1 To Len(tail)
+
+                ch = Mid(tail, i, 1)
+
+                If ch >= "0" And ch <= "9" Then
+                    token = token & ch
+                ElseIf token <> "" Then
+                    Exit For
+                End If
+
+            Next i
+
+            If token <> "" Then
+                ExtractQtyAfterOutsource = CLng(token)
+                Exit Function
+            End If
+
+        End If
+
+    Next kw
+
+    Exit Function
+
+ErrHandler:
+    ExtractQtyAfterOutsource = 1
+End Function
+
+Private Function RemoveLeadingItemNumber(ByVal line As String) As String
+On Error Resume Next
+
+    Dim s As String
+    s = Trim(line)
+
+    Dim i As Long
+    Dim ch As String
+    Dim digits As String
+
+    digits = ""
+
+    For i = 1 To Len(s)
+        ch = Mid(s, i, 1)
+
+        If ch >= "0" And ch <= "9" Then
+            digits = digits & ch
+        Else
+            Exit For
+        End If
+    Next i
+
+    If digits <> "" And Len(digits) <= 4 Then
+        s = Trim(Mid(s, Len(digits) + 1))
+    End If
+
+    RemoveLeadingItemNumber = s
+End Function
+
+' ============================================================
+' LOGGING
+' ============================================================
+
+Private Sub LogLine(ByVal msg As String)
+On Error Resume Next
+
+    If ENABLE_EXPORT_LOG = False Then Exit Sub
+
+    Dim f As Integer
+    f = FreeFile
+
+    Dim path As String
+    path = RunLogPath
+
+    If path = "" Then path = StartupLogPath
+    If path = "" Then path = Environ$("USERPROFILE") & "\Desktop\CMS_XT_Export_STARTUP_Log.txt"
+
+    Open path For Append As #f
+    Print #f, Format(Now, "yyyy-mm-dd hh:nn:ss") & "  " & msg
+    Close #f
+End Sub
+
+Private Sub LogStart(ByVal stepName As String)
+    CurrentStepName = stepName
+    StepStartTime = Now
+    LogLine ">>> START: " & stepName
+End Sub
+
+Private Sub LogDone(ByVal stepName As String)
+    LogLine "<<< DONE : " & stepName & " (" & DateDiff("s", StepStartTime, Now) & "s)"
+End Sub
+
+Private Sub LogProgress(ByVal msg As String)
+    If VERBOSE_PROGRESS_LOG Then LogLine "    ... " & msg
+End Sub
+
+Private Sub LogErrorText(ByVal msg As String)
+    LogLine "ERROR: " & msg
+    LastJobFailReason = msg
+
+    If SHOW_ERROR_MESSAGES Then
+        ' Batch-safe: no blocking message box here.
+    End If
+End Sub
+
+' ============================================================
+' END OF MODULE
 ' ============================================================
 
