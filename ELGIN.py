@@ -99,6 +99,7 @@ MACHINE_RENAME_MAP = {
 }
 
 DB_PATH = os.environ.get("ELGIN_DB_PATH", os.environ.get("NEXUS_DB_PATH", "shop_analytics_pro.db"))
+ELGIN_SIGNATURE_API_KEY = os.environ.get("ELGIN_SIGNATURE_API_KEY", "cms-signature-upload")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(APP_SLUG)
@@ -694,6 +695,19 @@ def is_admin_request(request: Request) -> bool:
 def require_admin_request(request: Request):
     if not is_admin_request(request):
         raise HTTPException(status_code=401, detail="Admin login required")
+
+
+def is_signature_api_request(request: Request) -> bool:
+    if not request:
+        return False
+    supplied = request.headers.get("X-Elgin-Api-Key", "")
+    return bool(ELGIN_SIGNATURE_API_KEY) and hmac.compare_digest(supplied, ELGIN_SIGNATURE_API_KEY)
+
+
+def require_signature_or_admin_request(request: Request):
+    if is_admin_request(request) or is_signature_api_request(request):
+        return
+    raise HTTPException(status_code=401, detail="Admin login or signature API key required")
 
 
 # ============================================================
@@ -9615,7 +9629,7 @@ async def update_job_due_date(job_num: str, body: dict = Body(...)):
 
 @app.post("/api/job-signatures/{job_num}/upload")
 async def upload_job_signature_csv(job_num: str, request: Request, file: UploadFile = File(...)):
-    require_admin_request(request)
+    require_signature_or_admin_request(request)
 
     j = normalize_job_num(job_num)
     if not j:

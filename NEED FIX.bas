@@ -28,6 +28,10 @@ Private Const OUTPUT_FOLDER_SUFFIX As String = " PRINTS"
 
 Private Const LOCAL_WORKSPACE_ROOT As String = "C:\CMS_Local_Workspace"
 
+Private Const AUTO_UPLOAD_JOB_SIGNATURE_TO_ELGIN As Boolean = True
+Private Const ELGIN_API_BASE_URL As String = "http://localhost:2926"
+Private Const ELGIN_SIGNATURE_API_KEY As String = "cms-signature-upload"
+
 Private Const PUSH_OUTPUTS_TO_NETWORK As Boolean = False
 Private Const DELETE_EXTRACTED_ZIP_AFTER_FLATTEN As Boolean = True
 
@@ -827,7 +831,12 @@ On Error GoTo ErrHandler
     LogDone "Set TCP-top orientation from matched TCP/BCP, then save BASE"
 
     WriteExportCheckCsv CurrentJobFolder & "\XT_Export_BOM_Match_Report.csv"
-    WriteJobSignatureCsv CurrentJobFolder & "\" & JOB_SIGNATURE_REPORT_FILE
+
+    Dim jobSignaturePath As String
+    jobSignaturePath = CurrentJobFolder & "\" & JOB_SIGNATURE_REPORT_FILE
+
+    WriteJobSignatureCsv jobSignaturePath
+    UploadJobSignatureToElgin jobSignaturePath
 
     If CREATE_PULLCORE_DIMENSIONS_EXCEL And PullcoreMatchCount > 0 Then
         LogStart "Write Pull Core Dimensions Excel"
@@ -10839,6 +10848,66 @@ On Error Resume Next
               FormatNumberForCsv(centerZ) & "," & _
               CStr(hasCenter) & "," & _
               CsvText(statusText)
+End Sub
+
+Private Sub UploadJobSignatureToElgin(ByVal csvPath As String)
+On Error GoTo ErrHandler
+
+    If AUTO_UPLOAD_JOB_SIGNATURE_TO_ELGIN = False Then Exit Sub
+    If csvPath = "" Then Exit Sub
+
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    If fso.FileExists(csvPath) = False Then Exit Sub
+
+    Dim boundary As String
+    boundary = "----CMSXT" & Format(Now, "yyyymmddhhnnss")
+
+    Dim csvText As String
+    csvText = ReadAllTextFile(csvPath)
+
+    If Trim(csvText) = "" Then Exit Sub
+
+    Dim body As String
+    body = "--" & boundary & vbCrLf & _
+           "Content-Disposition: form-data; name=" & Chr(34) & "file" & Chr(34) & "; filename=" & Chr(34) & JOB_SIGNATURE_REPORT_FILE & Chr(34) & vbCrLf & _
+           "Content-Type: text/csv" & vbCrLf & vbCrLf & _
+           csvText & vbCrLf & _
+           "--" & boundary & "--" & vbCrLf
+
+    Dim url As String
+    url = Trim(ELGIN_API_BASE_URL)
+
+    Do While Right(url, 1) = "/"
+        url = Left(url, Len(url) - 1)
+    Loop
+
+    url = url & "/api/job-signatures/" & CurrentJobNumber & "/upload"
+
+    Dim http As Object
+    Set http = CreateObject("WinHttp.WinHttpRequest.5.1")
+
+    http.Open "POST", url, False
+    http.SetRequestHeader "Content-Type", "multipart/form-data; boundary=" & boundary
+    http.SetRequestHeader "X-Elgin-Api-Key", ELGIN_SIGNATURE_API_KEY
+    http.Send body
+
+    If CLng(http.Status) >= 200 And CLng(http.Status) < 300 Then
+        LogLine "Uploaded job signature to ELGIN: " & url
+    Else
+        LogLine "WARNING: ELGIN signature upload failed. HTTP " & CStr(http.Status) & " " & CStr(http.ResponseText)
+    End If
+
+CleanExit:
+    On Error Resume Next
+    Set http = Nothing
+    Set fso = Nothing
+    Exit Sub
+
+ErrHandler:
+    LogLine "WARNING: UploadJobSignatureToElgin error: " & Err.Description
+    Resume CleanExit
 End Sub
 
 Private Sub WriteExportCheckCsv(ByVal csvPath As String)
