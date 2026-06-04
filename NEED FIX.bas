@@ -134,6 +134,7 @@ Private Const PI_VALUE As Double = 3.14159265358979
 
 Private Const CREATE_PULLCORE_DIMENSIONS_EXCEL As Boolean = True
 Private Const PULLCORE_DIMENSIONS_REPORT_FILE As String = "Pull Core Dimensions.xlsx"
+Private Const JOB_SIGNATURE_REPORT_FILE As String = "XT_Export_Job_Signature.csv"
 
 ' ============================================================
 ' MAIN ASSEMBLY / HOLDERS PACKAGE SETTINGS
@@ -823,6 +824,7 @@ On Error GoTo ErrHandler
     LogDone "Set TCP-top orientation from matched TCP/BCP, then save BASE"
 
     WriteExportCheckCsv CurrentJobFolder & "\XT_Export_BOM_Match_Report.csv"
+    WriteJobSignatureCsv CurrentJobFolder & "\" & JOB_SIGNATURE_REPORT_FILE
 
     If CREATE_PULLCORE_DIMENSIONS_EXCEL And PullcoreMatchCount > 0 Then
         LogStart "Write Pull Core Dimensions Excel"
@@ -10650,6 +10652,101 @@ ErrHandler:
     Close #f
 End Sub
 
+Private Sub WriteJobSignatureCsv(ByVal csvPath As String)
+On Error GoTo ErrHandler
+
+    csvPath = GetWritableCsvPath(csvPath)
+
+    Dim f As Integer
+    f = FreeFile
+
+    Open csvPath For Output As #f
+
+    Print #f, "JobNumber,CustomerNumber,DateCode,ComponentRole,QuoteName,CadComponent,CleanName,Length,Width,Thickness,Mass,CenterX,CenterY,CenterZ,HasCenter,Status"
+
+    WriteJobSignatureRow f, "TCP", "TCP", "TCP|TOP SMED|TOP CLAMPING|TOP CLAMPING PLATE|ID SMED"
+    WriteJobSignatureRow f, "BCP", "BCP", "BCP|BOTTOM SMED|BOT SMED|BOTTOM CLAMPING|BOTTOM CLAMPING PLATE|OD SMED"
+    WriteJobSignatureRow f, "ID HOLDER", "ID HOLDER", ID_HOLDER_KEYS
+    WriteJobSignatureRow f, "OD HOLDER", "OD HOLDER", OD_HOLDER_KEYS
+    WriteJobSignatureRow f, "ID POT", "ID POT BLOCK", "ID POT BLOCK|ID POT|TOP POT BLOCK|TOP POT|TCP POT BLOCK|TCP POT"
+    WriteJobSignatureRow f, "OD POT", "OD POT BLOCK", "OD POT BLOCK|OD POT|BOTTOM POT BLOCK|BOT POT BLOCK|BOTTOM POT|BOT POT|BCP POT BLOCK|BCP POT"
+
+    Close #f
+
+    LogLine "Wrote job signature CSV: " & csvPath
+    Exit Sub
+
+ErrHandler:
+    LogLine "WriteJobSignatureCsv error: " & Err.Description
+    On Error Resume Next
+    Close #f
+End Sub
+
+Private Sub WriteJobSignatureRow(ByVal f As Integer, _
+                                 ByVal roleName As String, _
+                                 ByVal quoteName As String, _
+                                 ByVal fallbackKeys As String)
+On Error Resume Next
+
+    Dim cadIdx As Long
+    cadIdx = FindCadIndexFromExportQuote(quoteName)
+
+    If cadIdx <= 0 Then
+        cadIdx = FindCadPartIndexByQuoteOrKeys(quoteName, fallbackKeys)
+    End If
+
+    Dim cadComponent As String
+    Dim cleanName As String
+    Dim statusText As String
+    Dim L As Double
+    Dim W As Double
+    Dim T As Double
+    Dim massVal As Double
+    Dim centerX As Double
+    Dim centerY As Double
+    Dim centerZ As Double
+    Dim hasCenter As Boolean
+
+    cadComponent = ""
+    cleanName = ""
+    statusText = "NO CAD MATCH"
+    L = 0#: W = 0#: T = 0#
+    massVal = 0#
+    centerX = 0#: centerY = 0#: centerZ = 0#
+    hasCenter = False
+
+    If cadIdx > 0 And cadIdx <= PartCount Then
+        cadComponent = parts(cadIdx).componentName
+        cleanName = parts(cadIdx).cleanName
+        L = parts(cadIdx).Length
+        W = parts(cadIdx).Width
+        T = parts(cadIdx).Thickness
+        massVal = parts(cadIdx).massValue
+        hasCenter = parts(cadIdx).hasAsmCenter
+        centerX = parts(cadIdx).AsmCenterX
+        centerY = parts(cadIdx).AsmCenterY
+        centerZ = parts(cadIdx).AsmCenterZ
+        statusText = "OK"
+    End If
+
+    Print #f, CsvText(CurrentJobNumber) & "," & _
+              CsvText(CustomerNumber) & "," & _
+              CsvText(DateCode) & "," & _
+              CsvText(roleName) & "," & _
+              CsvText(quoteName) & "," & _
+              CsvText(cadComponent) & "," & _
+              CsvText(cleanName) & "," & _
+              FormatNumberForCsv(L) & "," & _
+              FormatNumberForCsv(W) & "," & _
+              FormatNumberForCsv(T) & "," & _
+              FormatNumberForCsv(massVal) & "," & _
+              FormatNumberForCsv(centerX) & "," & _
+              FormatNumberForCsv(centerY) & "," & _
+              FormatNumberForCsv(centerZ) & "," & _
+              CStr(hasCenter) & "," & _
+              CsvText(statusText)
+End Sub
+
 Private Sub WriteExportCheckCsv(ByVal csvPath As String)
 On Error GoTo ErrHandler
 
@@ -12263,6 +12360,7 @@ On Error GoTo ErrHandler
     names = Array("XT_Export_BOM_Match_Report.csv", _
                   "XT_Export_CAD_Dimensions.csv", _
                   "XT_Export_BOM_PDF_Text.txt", _
+                  JOB_SIGNATURE_REPORT_FILE, _
                   PULLCORE_DIMENSIONS_REPORT_FILE)
 
     Dim i As Long
