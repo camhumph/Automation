@@ -86,6 +86,7 @@ Private Const PERSIST_CMS_TOP_AS_STANDARD_VIEWS_BEFORE_BASE_SAVE As Boolean = Tr
 Private Const DISABLE_STABILIZE_DELAYS As Boolean = True
 Private Const DISABLE_MAIN_VIEWPORT_GRAPHICS As Boolean = True
 Private Const RUN_SOLIDWORKS_INVISIBLE As Boolean = True
+Private Const ENABLE_EXPORT_LOG As Boolean = False
 
 ' ============================================================
 ' TOP/BOT INSERT GEOMETRY FALLBACK
@@ -823,7 +824,7 @@ On Error GoTo ErrHandler
 
     WriteExportCheckCsv CurrentJobFolder & "\XT_Export_BOM_Match_Report.csv"
 
-    If CREATE_PULLCORE_DIMENSIONS_EXCEL Then
+    If CREATE_PULLCORE_DIMENSIONS_EXCEL And PullcoreMatchCount > 0 Then
         LogStart "Write Pull Core Dimensions Excel"
         WritePullCoreDimensionsExcel PullCoreDimensionsReportPath
         LogDone "Write Pull Core Dimensions Excel"
@@ -1978,9 +1979,7 @@ On Error Resume Next
 
     If model Is Nothing Then Exit Sub
 
-    If DISABLE_STABILIZE_DELAYS Then
-        waitMs = 0
-    End If
+    If DISABLE_STABILIZE_DELAYS Then Exit Sub
 
     model.ViewZoomtofit2
     model.GraphicsRedraw2
@@ -4418,10 +4417,7 @@ On Error GoTo ErrHandler
     Dim parentFallback As String
 
     Select Case NormalizeKey(quoteName)
-        Case "IDHOLDER"
-            parentPrimary = "*Bottom"
-            parentFallback = CMS_TOP_VIEW_NAME
-        Case "ODHOLDER"
+        Case "IDHOLDER", "ODHOLDER"
             parentPrimary = "*Top"
             parentFallback = CMS_TOP_VIEW_NAME
         Case Else
@@ -4458,15 +4454,10 @@ On Error GoTo ErrHandler
     Dim holderViewId As Long
     Dim holderViewToken As String
 
-    If NormalizeKey(quoteName) = "ODHOLDER" Then
-        holderViewName = "*Top"
-        holderViewId = 5
-        holderViewToken = "TOPVIEW"
-    Else
-        holderViewName = "*Bottom"
-        holderViewId = 6
-        holderViewToken = "BOTTOMVIEW"
-    End If
+    ' Shop wants both holder detail DXFs from the top face.
+    holderViewName = "*Top"
+    holderViewId = 5
+    holderViewToken = "TOPVIEW"
 
     ' Native assembly, not X_T.
     tempNativePath = tempFolder & "\" & CurrentJobNumber & "_" & NormalizeKey(quoteName) & "_" & holderViewToken & "_TEMP.sldasm"
@@ -12551,6 +12542,8 @@ End Function
 
 Private Sub LogLine(ByVal msg As String)
 On Error Resume Next
+
+    If ENABLE_EXPORT_LOG = False Then Exit Sub
 
     Dim f As Integer
     f = FreeFile
