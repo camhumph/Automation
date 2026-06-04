@@ -497,9 +497,11 @@ On Error GoTo ErrHandler
             CloseAllDocumentsSafely
             Set swModel = Nothing
             Set swAssy = Nothing
+            Set ExportFilePaths = Nothing
             Set SpecialBomCadMatches = Nothing
             Set SpecialBomCadQuoteNames = Nothing
             Set PullcoreBestFitDimCache = Nothing
+            ReleaseSolidWorksMemory "after batch job"
 
             Erase parts
             Erase BomRows
@@ -515,7 +517,7 @@ On Error GoTo ErrHandler
             PullcoreIdOdHeightAxisUsed = ""
 
             DoEvents
-            WaitMilliseconds 500
+            WaitMilliseconds 100
             DoEvents
 
         End If
@@ -1050,6 +1052,26 @@ On Error Resume Next
         swApp.CloseDoc swDoc.GetTitle
         Set swDoc = nextDoc
     Loop
+
+    Set swDoc = Nothing
+    Set nextDoc = Nothing
+
+    ReleaseSolidWorksMemory "CloseAllDocumentsSafely"
+End Sub
+
+Private Sub ReleaseSolidWorksMemory(Optional ByVal reason As String = "")
+On Error Resume Next
+
+    If Not swModel Is Nothing Then swModel.ClearSelection2 True
+
+    If Not swApp Is Nothing Then
+        swApp.CommandInProgress = False
+        swApp.UserControl = False
+    End If
+
+    Set DxfFreezeDoc = Nothing
+
+    DoEvents
 End Sub
 
 Private Sub DeleteFolderSafe(ByVal folderPath As String)
@@ -3178,6 +3200,7 @@ On Error GoTo ErrHandler
     For i = 1 To ExportCount
         LogLine "Exporting item " & i & "/" & ExportCount & ": " & ExportRows(i).quoteName
         ExportOneMatchedPartAsXt ExportRows(i), outputFolder, i
+        ReleaseSolidWorksMemory "after export item"
         DoEvents
     Next i
 
@@ -4689,6 +4712,9 @@ On Error GoTo ErrHandler
 
     On Error Resume Next
     swApp.CloseDoc mdl.GetTitle
+    Set mdl = Nothing
+    Set fso = Nothing
+    ReleaseSolidWorksMemory "after XT native conversion"
     Exit Function
 
 ErrHandler:
@@ -5107,6 +5133,16 @@ CleanExit:
     End If
 
     If drawTitle <> "" Then swApp.CloseDoc drawTitle
+
+    Set viewBottom = Nothing
+    Set viewTop = Nothing
+    Set viewRight = Nothing
+    Set viewLeft = Nothing
+    Set parentView = Nothing
+    Set swDraw = Nothing
+    Set fso = Nothing
+
+    ReleaseSolidWorksMemory "after DXF save"
     Exit Sub
 
 ErrHandler:
