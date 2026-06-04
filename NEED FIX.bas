@@ -5087,6 +5087,8 @@ On Error GoTo ErrHandler
     Dim saveErrs As Long
     Dim saveWarns As Long
 
+    ForceAllDxfScales1To1 swDraw
+
     LogLine "Saving DXF: " & dxfPath
     EnsureSwHidden
 
@@ -5627,16 +5629,71 @@ On Error Resume Next
     Set swSheet = swDraw.GetCurrentSheet
 
     If Not swSheet Is Nothing Then
-
         swSheet.SetSize 12, E_SHEET_WIDTH_IN / INCHES_PER_METER, E_SHEET_HEIGHT_IN / INCHES_PER_METER
-
-        ' Force sheet scale 1:1 where supported.
-        Err.Clear
-        swSheet.SetScale 1#, 1#, True, True
-        Err.Clear
-
     End If
 
+    ForceDrawingSheetScale1To1 swDraw
+
+    swDraw.GraphicsRedraw2
+End Sub
+
+Private Sub ForceDrawingSheetScale1To1(ByVal swDraw As Object)
+On Error Resume Next
+
+    If swDraw Is Nothing Then Exit Sub
+
+    Dim swSheet As Object
+    Set swSheet = swDraw.GetCurrentSheet
+
+    If swSheet Is Nothing Then Exit Sub
+
+    ' SolidWorks templates and view insertion can reset the sheet to 1:2.
+    ' Force the sheet itself to 1:1 using multiple late-bound API paths.
+    Err.Clear
+    swSheet.SetScale 1#, 1#, False, False
+    Err.Clear
+    swSheet.SetScale 1#, 1#, True, True
+    Err.Clear
+
+    Dim sheetName As String
+    sheetName = ""
+    sheetName = CStr(swSheet.GetName)
+
+    If sheetName <> "" Then
+        Err.Clear
+        swDraw.SetupSheet5 sheetName, 12, 12, 1#, 1#, False, "", _
+                           E_SHEET_WIDTH_IN / INCHES_PER_METER, _
+                           E_SHEET_HEIGHT_IN / INCHES_PER_METER, "", False
+        Err.Clear
+
+        Err.Clear
+        swDraw.SetupSheet4 sheetName, 12, 12, 1#, 1#, False, "", _
+                           E_SHEET_WIDTH_IN / INCHES_PER_METER, _
+                           E_SHEET_HEIGHT_IN / INCHES_PER_METER, ""
+        Err.Clear
+    End If
+End Sub
+
+Private Sub ForceAllDxfScales1To1(ByVal swDraw As Object)
+On Error Resume Next
+
+    If swDraw Is Nothing Then Exit Sub
+
+    ForceDrawingSheetScale1To1 swDraw
+
+    Dim v As Object
+    Set v = swDraw.GetFirstView
+
+    If Not v Is Nothing Then Set v = v.GetNextView
+
+    Do While Not v Is Nothing
+        SetDrawingViewScale v, 1#
+        Set v = v.GetNextView
+    Loop
+
+    ForceDrawingSheetScale1To1 swDraw
+
+    swDraw.ForceRebuild3 False
     swDraw.GraphicsRedraw2
 End Sub
 
@@ -5675,8 +5732,20 @@ On Error Resume Next
     swView.ScaleDecimal = scaleVal
 
     If Abs(scaleVal - 1#) < 0.000001 Then
+        Dim scaleRatio(0 To 1) As Double
+        scaleRatio(0) = 1#
+        scaleRatio(1) = 1#
+
+        Err.Clear
+        swView.ScaleRatio = scaleRatio
+        Err.Clear
         swView.ScaleRatio = "1:1"
+        Err.Clear
     End If
+
+    ' Set this again last. Some SolidWorks view operations flip back to sheet scale.
+    swView.UseSheetScale = False
+    swView.ScaleDecimal = scaleVal
 End Sub
 
 ' ============================================================
