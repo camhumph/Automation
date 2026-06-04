@@ -22,17 +22,22 @@ Option Explicit
 ' USER SETTINGS
 ' ============================================================
 
-Private Const ROOT_JOB_PATH As String = "C:\Users\lenovo\Desktop\000000005.May 2026"
+Private Const ROOT_JOB_PATH As String = "\\Mycloudex2ultra\mexico\Downloads"
 Private Const EXTRACT_FOLDER_NAME As String = "_EXTRACTED_ZIP"
 Private Const OUTPUT_FOLDER_SUFFIX As String = " PRINTS"
 
 Private Const LOCAL_WORKSPACE_ROOT As String = "C:\CMS_Local_Workspace"
+
+Private Const AUTO_UPLOAD_JOB_SIGNATURE_TO_ELGIN As Boolean = True
+Private Const ELGIN_API_BASE_URL As String = "http://localhost:2926"
+Private Const ELGIN_SIGNATURE_API_KEY As String = "cms-signature-upload"
 
 Private Const PUSH_OUTPUTS_TO_NETWORK As Boolean = False
 Private Const DELETE_EXTRACTED_ZIP_AFTER_FLATTEN As Boolean = True
 
 Private Const USE_ACTIVE_SOLIDWORKS_DOC_FIRST As Boolean = False
 Private Const SHOW_ERROR_MESSAGES As Boolean = True
+Private Const LIMIT_JOB_SEARCH_TO_CURRENT_AND_PREVIOUS_MONTH As Boolean = True
 
 Private Const READ_PDF_BOM_WITH_PDFTOTEXT As Boolean = True
 Private Const PDFTOTEXT_EXE As String = "C:\Users\lenovo\Downloads\New folder (9)\poppler-26.02.0\Library\bin\pdftotext.exe"
@@ -86,6 +91,7 @@ Private Const PERSIST_CMS_TOP_AS_STANDARD_VIEWS_BEFORE_BASE_SAVE As Boolean = Tr
 Private Const DISABLE_STABILIZE_DELAYS As Boolean = True
 Private Const DISABLE_MAIN_VIEWPORT_GRAPHICS As Boolean = True
 Private Const RUN_SOLIDWORKS_INVISIBLE As Boolean = True
+Private Const ENABLE_EXPORT_LOG As Boolean = False
 
 ' ============================================================
 ' TOP/BOT INSERT GEOMETRY FALLBACK
@@ -133,6 +139,7 @@ Private Const PI_VALUE As Double = 3.14159265358979
 
 Private Const CREATE_PULLCORE_DIMENSIONS_EXCEL As Boolean = True
 Private Const PULLCORE_DIMENSIONS_REPORT_FILE As String = "Pull Core Dimensions.xlsx"
+Private Const JOB_SIGNATURE_REPORT_FILE As String = "XT_Export_Job_Signature.csv"
 
 ' ============================================================
 ' MAIN ASSEMBLY / HOLDERS PACKAGE SETTINGS
@@ -192,7 +199,7 @@ Private Const CREATE_PULLCORE_CAM_KEY_PACKAGE As Boolean = True
 Private Const PULLCORE_CAM_KEY_FOLDER_NAME As String = "PULLCORE CAM AND KEY"
 
 Private Const AUTO_LABEL_PULLCORE_ID_OD_BY_HEIGHT As Boolean = True
-Private Const PULLCORE_ID_OD_HEIGHT_AXIS As String = "AUTO"
+Private Const PULLCORE_ID_OD_HEIGHT_AXIS As String = "Y"
 Private Const PULLCORE_ID_IS_HIGHER As Boolean = True
 
 Private Const PULLCORE_T_TOL As Double = 0.175
@@ -495,9 +502,11 @@ On Error GoTo ErrHandler
             CloseAllDocumentsSafely
             Set swModel = Nothing
             Set swAssy = Nothing
+            Set ExportFilePaths = Nothing
             Set SpecialBomCadMatches = Nothing
             Set SpecialBomCadQuoteNames = Nothing
             Set PullcoreBestFitDimCache = Nothing
+            ReleaseSolidWorksMemory "after batch job"
 
             Erase parts
             Erase BomRows
@@ -513,7 +522,7 @@ On Error GoTo ErrHandler
             PullcoreIdOdHeightAxisUsed = ""
 
             DoEvents
-            WaitMilliseconds 500
+            WaitMilliseconds 100
             DoEvents
 
         End If
@@ -823,7 +832,13 @@ On Error GoTo ErrHandler
 
     WriteExportCheckCsv CurrentJobFolder & "\XT_Export_BOM_Match_Report.csv"
 
-    If CREATE_PULLCORE_DIMENSIONS_EXCEL Then
+    Dim jobSignaturePath As String
+    jobSignaturePath = CurrentJobFolder & "\" & JOB_SIGNATURE_REPORT_FILE
+
+    WriteJobSignatureCsv jobSignaturePath
+    UploadJobSignatureToElgin jobSignaturePath
+
+    If CREATE_PULLCORE_DIMENSIONS_EXCEL And PullcoreMatchCount > 0 Then
         LogStart "Write Pull Core Dimensions Excel"
         WritePullCoreDimensionsExcel PullCoreDimensionsReportPath
         LogDone "Write Pull Core Dimensions Excel"
@@ -1047,6 +1062,26 @@ On Error Resume Next
         swApp.CloseDoc swDoc.GetTitle
         Set swDoc = nextDoc
     Loop
+
+    Set swDoc = Nothing
+    Set nextDoc = Nothing
+
+    ReleaseSolidWorksMemory "CloseAllDocumentsSafely"
+End Sub
+
+Private Sub ReleaseSolidWorksMemory(Optional ByVal reason As String = "")
+On Error Resume Next
+
+    If Not swModel Is Nothing Then swModel.ClearSelection2 True
+
+    If Not swApp Is Nothing Then
+        swApp.CommandInProgress = False
+        swApp.UserControl = False
+    End If
+
+    Set DxfFreezeDoc = Nothing
+
+    DoEvents
 End Sub
 
 Private Sub DeleteFolderSafe(ByVal folderPath As String)
@@ -1978,9 +2013,7 @@ On Error Resume Next
 
     If model Is Nothing Then Exit Sub
 
-    If DISABLE_STABILIZE_DELAYS Then
-        waitMs = 0
-    End If
+    If DISABLE_STABILIZE_DELAYS Then Exit Sub
 
     model.ViewZoomtofit2
     model.GraphicsRedraw2
@@ -3177,6 +3210,7 @@ On Error GoTo ErrHandler
     For i = 1 To ExportCount
         LogLine "Exporting item " & i & "/" & ExportCount & ": " & ExportRows(i).quoteName
         ExportOneMatchedPartAsXt ExportRows(i), outputFolder, i
+        ReleaseSolidWorksMemory "after export item"
         DoEvents
     Next i
 
@@ -4418,10 +4452,7 @@ On Error GoTo ErrHandler
     Dim parentFallback As String
 
     Select Case NormalizeKey(quoteName)
-        Case "IDHOLDER"
-            parentPrimary = "*Bottom"
-            parentFallback = CMS_TOP_VIEW_NAME
-        Case "ODHOLDER"
+        Case "IDHOLDER", "ODHOLDER"
             parentPrimary = "*Top"
             parentFallback = CMS_TOP_VIEW_NAME
         Case Else
@@ -4458,15 +4489,10 @@ On Error GoTo ErrHandler
     Dim holderViewId As Long
     Dim holderViewToken As String
 
-    If NormalizeKey(quoteName) = "ODHOLDER" Then
-        holderViewName = "*Top"
-        holderViewId = 5
-        holderViewToken = "TOPVIEW"
-    Else
-        holderViewName = "*Bottom"
-        holderViewId = 6
-        holderViewToken = "BOTTOMVIEW"
-    End If
+    ' Shop wants both holder detail DXFs from the top face.
+    holderViewName = "*Top"
+    holderViewId = 5
+    holderViewToken = "TOPVIEW"
 
     ' Native assembly, not X_T.
     tempNativePath = tempFolder & "\" & CurrentJobNumber & "_" & NormalizeKey(quoteName) & "_" & holderViewToken & "_TEMP.sldasm"
@@ -4696,6 +4722,9 @@ On Error GoTo ErrHandler
 
     On Error Resume Next
     swApp.CloseDoc mdl.GetTitle
+    Set mdl = Nothing
+    Set fso = Nothing
+    ReleaseSolidWorksMemory "after XT native conversion"
     Exit Function
 
 ErrHandler:
@@ -5096,6 +5125,8 @@ On Error GoTo ErrHandler
     Dim saveErrs As Long
     Dim saveWarns As Long
 
+    ForceAllDxfScales1To1 swDraw
+
     LogLine "Saving DXF: " & dxfPath
     EnsureSwHidden
 
@@ -5112,6 +5143,16 @@ CleanExit:
     End If
 
     If drawTitle <> "" Then swApp.CloseDoc drawTitle
+
+    Set viewBottom = Nothing
+    Set viewTop = Nothing
+    Set viewRight = Nothing
+    Set viewLeft = Nothing
+    Set parentView = Nothing
+    Set swDraw = Nothing
+    Set fso = Nothing
+
+    ReleaseSolidWorksMemory "after DXF save"
     Exit Sub
 
 ErrHandler:
@@ -5636,16 +5677,71 @@ On Error Resume Next
     Set swSheet = swDraw.GetCurrentSheet
 
     If Not swSheet Is Nothing Then
-
         swSheet.SetSize 12, E_SHEET_WIDTH_IN / INCHES_PER_METER, E_SHEET_HEIGHT_IN / INCHES_PER_METER
-
-        ' Force sheet scale 1:1 where supported.
-        Err.Clear
-        swSheet.SetScale 1#, 1#, True, True
-        Err.Clear
-
     End If
 
+    ForceDrawingSheetScale1To1 swDraw
+
+    swDraw.GraphicsRedraw2
+End Sub
+
+Private Sub ForceDrawingSheetScale1To1(ByVal swDraw As Object)
+On Error Resume Next
+
+    If swDraw Is Nothing Then Exit Sub
+
+    Dim swSheet As Object
+    Set swSheet = swDraw.GetCurrentSheet
+
+    If swSheet Is Nothing Then Exit Sub
+
+    ' SolidWorks templates and view insertion can reset the sheet to 1:2.
+    ' Force the sheet itself to 1:1 using multiple late-bound API paths.
+    Err.Clear
+    swSheet.SetScale 1#, 1#, False, False
+    Err.Clear
+    swSheet.SetScale 1#, 1#, True, True
+    Err.Clear
+
+    Dim sheetName As String
+    sheetName = ""
+    sheetName = CStr(swSheet.GetName)
+
+    If sheetName <> "" Then
+        Err.Clear
+        swDraw.SetupSheet5 sheetName, 12, 12, 1#, 1#, False, "", _
+                           E_SHEET_WIDTH_IN / INCHES_PER_METER, _
+                           E_SHEET_HEIGHT_IN / INCHES_PER_METER, "", False
+        Err.Clear
+
+        Err.Clear
+        swDraw.SetupSheet4 sheetName, 12, 12, 1#, 1#, False, "", _
+                           E_SHEET_WIDTH_IN / INCHES_PER_METER, _
+                           E_SHEET_HEIGHT_IN / INCHES_PER_METER, ""
+        Err.Clear
+    End If
+End Sub
+
+Private Sub ForceAllDxfScales1To1(ByVal swDraw As Object)
+On Error Resume Next
+
+    If swDraw Is Nothing Then Exit Sub
+
+    ForceDrawingSheetScale1To1 swDraw
+
+    Dim v As Object
+    Set v = swDraw.GetFirstView
+
+    If Not v Is Nothing Then Set v = v.GetNextView
+
+    Do While Not v Is Nothing
+        SetDrawingViewScale v, 1#
+        Set v = v.GetNextView
+    Loop
+
+    ForceDrawingSheetScale1To1 swDraw
+
+    swDraw.ForceRebuild3 False
     swDraw.GraphicsRedraw2
 End Sub
 
@@ -5684,8 +5780,20 @@ On Error Resume Next
     swView.ScaleDecimal = scaleVal
 
     If Abs(scaleVal - 1#) < 0.000001 Then
+        Dim scaleRatio(0 To 1) As Double
+        scaleRatio(0) = 1#
+        scaleRatio(1) = 1#
+
+        Err.Clear
+        swView.ScaleRatio = scaleRatio
+        Err.Clear
         swView.ScaleRatio = "1:1"
+        Err.Clear
     End If
+
+    ' Set this again last. Some SolidWorks view operations flip back to sheet scale.
+    swView.UseSheetScale = False
+    swView.ScaleDecimal = scaleVal
 End Sub
 
 ' ============================================================
@@ -7007,7 +7115,7 @@ Private Sub AddPullcoreMatchRow(ByRef b As BomInfo, ByVal cadIdx As Long, _
         End If
 
     Else
-        PullcoreMatches(PullcoreMatchCount).Status = "NO CAD MATCH"
+        PullcoreMatches(PullcoreMatchCount).Status = "NO CAD MATCH - BOUNDING BOX NOT FOUND"
     End If
 
     Dim cadNameForLog As String
@@ -7482,6 +7590,26 @@ ErrHandler:
     GetPullcoreMatchHeightValue = 0#
 End Function
 
+Private Function ShouldAutoRelabelPullcoreMatch(ByVal matchIdx As Long) As Boolean
+On Error GoTo ErrHandler
+
+    ShouldAutoRelabelPullcoreMatch = False
+
+    If matchIdx <= 0 Or matchIdx > PullcoreMatchCount Then Exit Function
+
+    Dim d As String
+    d = NormalizeText(PullcoreMatches(matchIdx).Description)
+
+    ' If the BOM already says ID/OD/LE/TE, keep that BOM name.
+    If GetPullcoreLocationCode(d) <> "" Then Exit Function
+
+    ShouldAutoRelabelPullcoreMatch = True
+    Exit Function
+
+ErrHandler:
+    ShouldAutoRelabelPullcoreMatch = False
+End Function
+
 Private Sub SetPullcoreMatchLabel(ByVal matchIdx As Long, _
                                   ByVal newName As String, _
                                   ByVal axisName As String)
@@ -7489,7 +7617,11 @@ On Error Resume Next
 
     If matchIdx <= 0 Or matchIdx > PullcoreMatchCount Then Exit Sub
 
-    PullcoreMatches(matchIdx).quoteName = newName
+    If ShouldAutoRelabelPullcoreMatch(matchIdx) Then
+        PullcoreMatches(matchIdx).quoteName = newName
+    Else
+        PullcoreMatches(matchIdx).quoteName = CleanPullcoreDisplayName(PullcoreMatches(matchIdx).Description)
+    End If
 
     Dim cadIdx As Long
     cadIdx = PullcoreMatches(matchIdx).CadPartIndex
@@ -7922,14 +8054,28 @@ On Error GoTo ErrHandler
     cadW = parts(cadIdx).Width
     cadT = parts(cadIdx).Thickness
 
-    If parts(cadIdx).BBoxVolume > 200# Then Exit Function
-    If cadT < 0.4 Then Exit Function
+    If parts(cadIdx).BBoxVolume > 500# Then Exit Function
+    If cadT < 0.25 Then Exit Function
 
-    If Abs(cadL - b.BomLength) > 1# Then Exit Function
-    If cadW < b.BomWidth - 0.4 Then Exit Function
-    If cadW > b.BomWidth + 1# Then Exit Function
+    Dim dL As Double
+    Dim dW As Double
+    Dim dT As Double
 
-    IsRoughPullcoreCandidateForBom = True
+    dL = Abs(cadL - b.BomLength)
+    dW = Abs(cadW - b.BomWidth)
+    dT = Abs(cadT - b.BomThickness)
+
+    ' Primary match: exact/fitted bounding box should be very close to BOM.
+    If dL <= PULLCORE_L_TOL And dW <= PULLCORE_W_TOL And dT <= PULLCORE_T_TOL Then
+        IsRoughPullcoreCandidateForBom = True
+        Exit Function
+    End If
+
+    ' Fallback: allow extended/rotated assembly boxes so every pullcore can be tested.
+    If dL <= 1.5 And dW <= 0.9 And dT <= 0.45 Then
+        IsRoughPullcoreCandidateForBom = True
+        Exit Function
+    End If
 
     Exit Function
 
@@ -8309,9 +8455,28 @@ End Function
 Private Function CleanPullcoreDisplayName(ByVal s As String) As String
     s = Trim(s)
 
+    s = Replace(s, "             Material", "", , , vbTextCompare)
+    s = Replace(s, "            Material", "", , , vbTextCompare)
+    s = Replace(s, "         Material", "", , , vbTextCompare)
+    s = Replace(s, "       Material", "", , , vbTextCompare)
+    s = Replace(s, " Material", "", , , vbTextCompare)
+
     Do While InStr(s, "  ") > 0
         s = Replace(s, "  ", " ")
     Loop
+
+    s = Trim(s)
+
+    ' Preserve the BOM wording, but normalize shop-facing pullcore tokens.
+    s = Replace(s, "PULLCORE", "Pullcore", , , vbTextCompare)
+    s = Replace(s, "PULL CORE", "Pullcore", , , vbTextCompare)
+    s = Replace(s, " CAM", " Cam", , , vbTextCompare)
+    s = Replace(s, " KEY", " Key", , , vbTextCompare)
+    s = Replace(s, " LE ", " Le ", , , vbTextCompare)
+    s = Replace(s, " TE ", " Te ", , , vbTextCompare)
+
+    If UCase(Left(s, 3)) = "LE " Then s = "Le " & Mid(s, 4)
+    If UCase(Left(s, 3)) = "TE " Then s = "Te " & Mid(s, 4)
 
     CleanPullcoreDisplayName = s
 End Function
@@ -10590,6 +10755,161 @@ ErrHandler:
     Close #f
 End Sub
 
+Private Sub WriteJobSignatureCsv(ByVal csvPath As String)
+On Error GoTo ErrHandler
+
+    csvPath = GetWritableCsvPath(csvPath)
+
+    Dim f As Integer
+    f = FreeFile
+
+    Open csvPath For Output As #f
+
+    Print #f, "JobNumber,CustomerNumber,DateCode,ComponentRole,QuoteName,CadComponent,CleanName,Length,Width,Thickness,Mass,CenterX,CenterY,CenterZ,HasCenter,Status"
+
+    WriteJobSignatureRow f, "TCP", "TCP", "TCP|TOP SMED|TOP CLAMPING|TOP CLAMPING PLATE|ID SMED"
+    WriteJobSignatureRow f, "BCP", "BCP", "BCP|BOTTOM SMED|BOT SMED|BOTTOM CLAMPING|BOTTOM CLAMPING PLATE|OD SMED"
+    WriteJobSignatureRow f, "ID HOLDER", "ID HOLDER", ID_HOLDER_KEYS
+    WriteJobSignatureRow f, "OD HOLDER", "OD HOLDER", OD_HOLDER_KEYS
+    WriteJobSignatureRow f, "ID POT", "ID POT BLOCK", "ID POT BLOCK|ID POT|TOP POT BLOCK|TOP POT|TCP POT BLOCK|TCP POT"
+    WriteJobSignatureRow f, "OD POT", "OD POT BLOCK", "OD POT BLOCK|OD POT|BOTTOM POT BLOCK|BOT POT BLOCK|BOTTOM POT|BOT POT|BCP POT BLOCK|BCP POT"
+
+    Close #f
+
+    LogLine "Wrote job signature CSV: " & csvPath
+    Exit Sub
+
+ErrHandler:
+    LogLine "WriteJobSignatureCsv error: " & Err.Description
+    On Error Resume Next
+    Close #f
+End Sub
+
+Private Sub WriteJobSignatureRow(ByVal f As Integer, _
+                                 ByVal roleName As String, _
+                                 ByVal quoteName As String, _
+                                 ByVal fallbackKeys As String)
+On Error Resume Next
+
+    Dim cadIdx As Long
+    cadIdx = FindCadIndexFromExportQuote(quoteName)
+
+    If cadIdx <= 0 Then
+        cadIdx = FindCadPartIndexByQuoteOrKeys(quoteName, fallbackKeys)
+    End If
+
+    Dim cadComponent As String
+    Dim cleanName As String
+    Dim statusText As String
+    Dim L As Double
+    Dim W As Double
+    Dim T As Double
+    Dim massVal As Double
+    Dim centerX As Double
+    Dim centerY As Double
+    Dim centerZ As Double
+    Dim hasCenter As Boolean
+
+    cadComponent = ""
+    cleanName = ""
+    statusText = "NO CAD MATCH"
+    L = 0#: W = 0#: T = 0#
+    massVal = 0#
+    centerX = 0#: centerY = 0#: centerZ = 0#
+    hasCenter = False
+
+    If cadIdx > 0 And cadIdx <= PartCount Then
+        cadComponent = parts(cadIdx).componentName
+        cleanName = parts(cadIdx).cleanName
+        L = parts(cadIdx).Length
+        W = parts(cadIdx).Width
+        T = parts(cadIdx).Thickness
+        massVal = parts(cadIdx).massValue
+        hasCenter = parts(cadIdx).hasAsmCenter
+        centerX = parts(cadIdx).AsmCenterX
+        centerY = parts(cadIdx).AsmCenterY
+        centerZ = parts(cadIdx).AsmCenterZ
+        statusText = "OK"
+    End If
+
+    Print #f, CsvText(CurrentJobNumber) & "," & _
+              CsvText(CustomerNumber) & "," & _
+              CsvText(DateCode) & "," & _
+              CsvText(roleName) & "," & _
+              CsvText(quoteName) & "," & _
+              CsvText(cadComponent) & "," & _
+              CsvText(cleanName) & "," & _
+              FormatNumberForCsv(L) & "," & _
+              FormatNumberForCsv(W) & "," & _
+              FormatNumberForCsv(T) & "," & _
+              FormatNumberForCsv(massVal) & "," & _
+              FormatNumberForCsv(centerX) & "," & _
+              FormatNumberForCsv(centerY) & "," & _
+              FormatNumberForCsv(centerZ) & "," & _
+              CStr(hasCenter) & "," & _
+              CsvText(statusText)
+End Sub
+
+Private Sub UploadJobSignatureToElgin(ByVal csvPath As String)
+On Error GoTo ErrHandler
+
+    If AUTO_UPLOAD_JOB_SIGNATURE_TO_ELGIN = False Then Exit Sub
+    If csvPath = "" Then Exit Sub
+
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    If fso.FileExists(csvPath) = False Then Exit Sub
+
+    Dim boundary As String
+    boundary = "----CMSXT" & Format(Now, "yyyymmddhhnnss")
+
+    Dim csvText As String
+    csvText = ReadAllTextFile(csvPath)
+
+    If Trim(csvText) = "" Then Exit Sub
+
+    Dim body As String
+    body = "--" & boundary & vbCrLf & _
+           "Content-Disposition: form-data; name=" & Chr(34) & "file" & Chr(34) & "; filename=" & Chr(34) & JOB_SIGNATURE_REPORT_FILE & Chr(34) & vbCrLf & _
+           "Content-Type: text/csv" & vbCrLf & vbCrLf & _
+           csvText & vbCrLf & _
+           "--" & boundary & "--" & vbCrLf
+
+    Dim url As String
+    url = Trim(ELGIN_API_BASE_URL)
+
+    Do While Right(url, 1) = "/"
+        url = Left(url, Len(url) - 1)
+    Loop
+
+    url = url & "/api/job-signatures/" & CurrentJobNumber & "/upload"
+
+    Dim http As Object
+    Set http = CreateObject("WinHttp.WinHttpRequest.5.1")
+
+    http.Open "POST", url, False
+    http.SetRequestHeader "Content-Type", "multipart/form-data; boundary=" & boundary
+    http.SetRequestHeader "X-Elgin-Api-Key", ELGIN_SIGNATURE_API_KEY
+    http.Send body
+
+    If CLng(http.Status) >= 200 And CLng(http.Status) < 300 Then
+        LogLine "Uploaded job signature to ELGIN: " & url
+    Else
+        LogLine "WARNING: ELGIN signature upload failed. HTTP " & CStr(http.Status) & " " & CStr(http.ResponseText)
+    End If
+
+CleanExit:
+    On Error Resume Next
+    Set http = Nothing
+    Set fso = Nothing
+    Exit Sub
+
+ErrHandler:
+    LogLine "WARNING: UploadJobSignatureToElgin error: " & Err.Description
+    Resume CleanExit
+End Sub
+
 Private Sub WriteExportCheckCsv(ByVal csvPath As String)
 On Error GoTo ErrHandler
 
@@ -10992,6 +11312,7 @@ On Error GoTo ErrHandler
 
         nameUpper = UCase(subFolder.Name)
 
+        If ShouldSkipJobSearchTopFolder(subFolder.Name, wantUpper) Then GoTo NextTop
         If nameUpper = UCase(EXTRACT_FOLDER_NAME) Then GoTo NextTop
         If InStr(nameUpper, " PRINTS") > 0 Then GoTo NextTop
         If InStr(nameUpper, "PULLCORE") > 0 Then GoTo NextTop
@@ -11021,8 +11342,10 @@ NextTop:
 
     For Each subFolder In root.SubFolders
         nameUpper = UCase(subFolder.Name)
-        If nameUpper <> UCase(EXTRACT_FOLDER_NAME) Then
-            SearchJobFolderRecursive subFolder, wantUpper, 1, bestPath, bestScore
+        If ShouldSkipJobSearchTopFolder(subFolder.Name, wantUpper) = False Then
+            If nameUpper <> UCase(EXTRACT_FOLDER_NAME) Then
+                SearchJobFolderRecursive subFolder, wantUpper, 1, bestPath, bestScore
+            End If
         End If
     Next subFolder
 
@@ -11036,6 +11359,34 @@ NextTop:
 ErrHandler:
     LogLine "FindJobFolderByText error: " & Err.Description
     FindJobFolderByText = ""
+End Function
+
+Private Function ShouldSkipJobSearchTopFolder(ByVal folderName As String, ByVal wantUpper As String) As Boolean
+On Error GoTo ErrHandler
+
+    ShouldSkipJobSearchTopFolder = False
+
+    If LIMIT_JOB_SEARCH_TO_CURRENT_AND_PREVIOUS_MONTH = False Then Exit Function
+
+    Dim n As String
+    n = UCase(folderName)
+
+    If InStr(n, wantUpper) > 0 Then Exit Function
+
+    Dim currentMonth As String
+    Dim previousMonth As String
+
+    currentMonth = UCase(Format(Date, "mmmm yyyy"))
+    previousMonth = UCase(Format(DateAdd("m", -1, Date), "mmmm yyyy"))
+
+    If InStr(n, currentMonth) > 0 Then Exit Function
+    If InStr(n, previousMonth) > 0 Then Exit Function
+
+    ShouldSkipJobSearchTopFolder = True
+    Exit Function
+
+ErrHandler:
+    ShouldSkipJobSearchTopFolder = False
 End Function
 
 Private Sub SearchJobFolderRecursive(ByVal folder As Object, _
@@ -12203,6 +12554,7 @@ On Error GoTo ErrHandler
     names = Array("XT_Export_BOM_Match_Report.csv", _
                   "XT_Export_CAD_Dimensions.csv", _
                   "XT_Export_BOM_PDF_Text.txt", _
+                  JOB_SIGNATURE_REPORT_FILE, _
                   PULLCORE_DIMENSIONS_REPORT_FILE)
 
     Dim i As Long
@@ -12551,6 +12903,8 @@ End Function
 
 Private Sub LogLine(ByVal msg As String)
 On Error Resume Next
+
+    If ENABLE_EXPORT_LOG = False Then Exit Sub
 
     Dim f As Integer
     f = FreeFile

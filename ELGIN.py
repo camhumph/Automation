@@ -99,6 +99,7 @@ MACHINE_RENAME_MAP = {
 }
 
 DB_PATH = os.environ.get("ELGIN_DB_PATH", os.environ.get("NEXUS_DB_PATH", "shop_analytics_pro.db"))
+ELGIN_SIGNATURE_API_KEY = os.environ.get("ELGIN_SIGNATURE_API_KEY", "cms-signature-upload")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(APP_SLUG)
@@ -139,6 +140,49 @@ GCODE_ANALYSIS_REFRESH_SEC = 6 * 60 * 60
 # If Q-code and G-code do not produce a runtime estimate, the system looks for
 # completed same-component jobs with similar physical job/catalog dimensions.
 SIMILAR_JOB_TOLERANCE = float(os.environ.get("ELGIN_SIMILAR_JOB_TOLERANCE", "0.03"))
+
+JOB_SIGNATURE_COMPONENTS = [
+    "TCP",
+    "BCP",
+    "ID HOLDER",
+    "OD HOLDER",
+    "ID POT",
+    "OD POT",
+]
+
+JOB_SIGNATURE_COMPONENT_ALIASES = {
+    "TCP": "TCP",
+    "TOPSMED": "TCP",
+    "TOPSMEDPLATE": "TCP",
+    "TOPCLAMPING": "TCP",
+    "TOPCLAMPINGPLATE": "TCP",
+    "BCP": "BCP",
+    "BOTTOMSMED": "BCP",
+    "BOTSMED": "BCP",
+    "BOTTOMSMEDPLATE": "BCP",
+    "BOTTOMCLAMPING": "BCP",
+    "BOTTOMCLAMPINGPLATE": "BCP",
+    "BOTCLAMPING": "BCP",
+    "IDHOLDER": "ID HOLDER",
+    "TOPHOLDER": "ID HOLDER",
+    "IDTEHOLDER": "ID HOLDER",
+    "ODHOLDER": "OD HOLDER",
+    "BOTTOMHOLDER": "OD HOLDER",
+    "BOTHOLDER": "OD HOLDER",
+    "ODTEHOLDER": "OD HOLDER",
+    "IDPOT": "ID POT",
+    "IDPOTBLOCK": "ID POT",
+    "TOPPOT": "ID POT",
+    "TOPPOTBLOCK": "ID POT",
+    "ODPOT": "OD POT",
+    "ODPOTBLOCK": "OD POT",
+    "BOTTOMPOT": "OD POT",
+    "BOTTOMPOTBLOCK": "OD POT",
+    "BOTPOT": "OD POT",
+    "BOTPOTBLOCK": "OD POT",
+}
+
+JOB_SIGNATURE_DEFAULT_LIMIT = int(os.environ.get("ELGIN_JOB_SIGNATURE_MATCH_LIMIT", "10"))
 
 
 # ============================================================
@@ -651,6 +695,19 @@ def is_admin_request(request: Request) -> bool:
 def require_admin_request(request: Request):
     if not is_admin_request(request):
         raise HTTPException(status_code=401, detail="Admin login required")
+
+
+def is_signature_api_request(request: Request) -> bool:
+    if not request:
+        return False
+    supplied = request.headers.get("X-Elgin-Api-Key", "")
+    return bool(ELGIN_SIGNATURE_API_KEY) and hmac.compare_digest(supplied, ELGIN_SIGNATURE_API_KEY)
+
+
+def require_signature_or_admin_request(request: Request):
+    if is_admin_request(request) or is_signature_api_request(request):
+        return
+    raise HTTPException(status_code=401, detail="Admin login or signature API key required")
 
 
 # ============================================================
@@ -1236,6 +1293,25 @@ def init_db():
             steel_sheet_url TEXT DEFAULT '',
             notes TEXT DEFAULT '',
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )""")
+
+        conn.execute("""CREATE TABLE IF NOT EXISTS job_signature_components (
+            job_num TEXT NOT NULL,
+            component_role TEXT NOT NULL,
+            quote_name TEXT DEFAULT '',
+            cad_component TEXT DEFAULT '',
+            clean_name TEXT DEFAULT '',
+            length REAL DEFAULT 0,
+            width REAL DEFAULT 0,
+            thickness REAL DEFAULT 0,
+            mass REAL DEFAULT 0,
+            center_x REAL DEFAULT 0,
+            center_y REAL DEFAULT 0,
+            center_z REAL DEFAULT 0,
+            has_center INTEGER DEFAULT 0,
+            source_file TEXT DEFAULT '',
+            imported_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (job_num, component_role)
         )""")
 
         conn.execute("""CREATE TABLE IF NOT EXISTS match_history (
@@ -4399,6 +4475,239 @@ def parts_are_similar(a: dict, b: dict, tolerance: float = SIMILAR_JOB_TOLERANCE
         and abs(float(a.get("com_z") or 0) - float(b.get("com_z") or 0)) <= tolerance
     )
 
+
+
+def _signature_key(v: str) -> str:
+    return re.sub(r"[^A-Z0-9]+", "", str(v or "").upper())
+
+
+def normalize_signature_component(v: str) -> str:
+    key = _signature_key(v)
+    if key in JOB_SIGNATURE_COMPONENT_ALIASES:
+        return JOB_SIGNATURE_COMPONENT_ALIASES[key]
+    return ""
+
+
+def _signature_float(row: dict, *names: str) -> float:
+    for name in names:
+        if name in row and row.get(name) not in (None, ""):
+            try:
+                return float(str(row.get(name)).strip())
+            except Exception:
+                pass
+    return 0.0
+
+
+def _signature_bool(row: dict, *names: str) -> bool:
+    for name in names:
+        v = row.get(name)
+        if v is None:
+            continue
+        s = str(v).strip().upper()
+        if s in {"TRUE", "YES", "Y", "1", "OK"}:
+            return True
+        if s in {"FALSE", "NO", "N", "0"}:
+            return False
+    return False
+
+
+def parse_job_signature_csv_text(text: str, fallback_job_num: str = "") -> list[dict]:
+    rows: list[dict] = []
+    reader = csv.DictReader(io.StringIO(text or ""))
+
+    for raw in reader:
+        # Accept the VBA macro headers and a few hand-written variants.
+        role = normalize_signature_component(
+            raw.get("ComponentRole")
+            or raw.get("component_role")
+            or raw.get("Role")
+            or raw.get("Component")
+            or raw.get("QuoteName")
+            or raw.get("quote_name")
+        )
+        if not role:
+            continue
+
+        job_num = normalize_job_num(
+            raw.get("JobNumber")
+            or raw.get("job_num")
+            or raw.get("Job")
+            or fallback_job_num
+        )
+        if not job_num:
+            job_num = normalize_job_num(fallback_job_num)
+
+        rows.append({
+            "job_num": job_num,
+            "component_role": role,
+            "quote_name": str(raw.get("QuoteName") or raw.get("quote_name") or "").strip(),
+            "cad_component": str(raw.get("CadComponent") or raw.get("cad_component") or "").strip(),
+            "clean_name": str(raw.get("CleanName") or raw.get("clean_name") or "").strip(),
+            "length": _signature_float(raw, "Length", "length", "L"),
+            "width": _signature_float(raw, "Width", "width", "W"),
+            "thickness": _signature_float(raw, "Thickness", "thickness", "T"),
+            "mass": _signature_float(raw, "Mass", "mass", "Weight", "weight"),
+            "center_x": _signature_float(raw, "CenterX", "center_x", "CogX", "cog_x", "ComX", "com_x"),
+            "center_y": _signature_float(raw, "CenterY", "center_y", "CogY", "cog_y", "ComY", "com_y"),
+            "center_z": _signature_float(raw, "CenterZ", "center_z", "CogZ", "cog_z", "ComZ", "com_z"),
+            "has_center": 1 if _signature_bool(raw, "HasCenter", "has_center") else 0,
+        })
+
+    return rows
+
+
+def upsert_job_signature_rows(conn, job_num: str, rows: list[dict], source_file: str = "") -> int:
+    j = normalize_job_num(job_num)
+    if not j:
+        raise ValueError("job number required")
+
+    cleaned = []
+    seen = set()
+    for row in rows:
+        role = normalize_signature_component(row.get("component_role") or "")
+        if not role or role in seen:
+            continue
+        seen.add(role)
+        r = dict(row)
+        r["job_num"] = j
+        r["component_role"] = role
+        cleaned.append(r)
+
+    conn.execute("DELETE FROM job_signature_components WHERE job_num=?", (j,))
+
+    for r in cleaned:
+        conn.execute("""
+            INSERT INTO job_signature_components (
+                job_num, component_role, quote_name, cad_component, clean_name,
+                length, width, thickness, mass,
+                center_x, center_y, center_z, has_center,
+                source_file, imported_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+        """, (
+            j,
+            r.get("component_role") or "",
+            r.get("quote_name") or "",
+            r.get("cad_component") or "",
+            r.get("clean_name") or "",
+            float(r.get("length") or 0),
+            float(r.get("width") or 0),
+            float(r.get("thickness") or 0),
+            float(r.get("mass") or 0),
+            float(r.get("center_x") or 0),
+            float(r.get("center_y") or 0),
+            float(r.get("center_z") or 0),
+            1 if r.get("has_center") else 0,
+            source_file or "",
+        ))
+
+    return len(cleaned)
+
+
+def load_job_signature(conn, job_num: str) -> dict:
+    j = normalize_job_num(job_num)
+    if not j:
+        return {}
+    rows = _rowdicts(conn.execute("""
+        SELECT *
+        FROM job_signature_components
+        WHERE job_num=?
+    """, (j,)))
+    return {normalize_signature_component(r.get("component_role") or ""): dict(r) for r in rows}
+
+
+def _relative_diff(a: float, b: float, floor: float = 0.001) -> float:
+    a = float(a or 0)
+    b = float(b or 0)
+    denom = max((abs(a) + abs(b)) / 2.0, floor)
+    return abs(a - b) / denom
+
+
+def compare_signature_component(current: dict, candidate: dict) -> dict:
+    dims = ["length", "width", "thickness"]
+    size_diff = sum(_relative_diff(current.get(k), candidate.get(k), 0.25) for k in dims) / 3.0
+    mass_diff = _relative_diff(current.get("mass"), candidate.get("mass"), 0.1)
+
+    center_distance = math.sqrt(
+        (float(current.get("center_x") or 0) - float(candidate.get("center_x") or 0)) ** 2 +
+        (float(current.get("center_y") or 0) - float(candidate.get("center_y") or 0)) ** 2 +
+        (float(current.get("center_z") or 0) - float(candidate.get("center_z") or 0)) ** 2
+    )
+    cur_diag = math.sqrt(sum(float(current.get(k) or 0) ** 2 for k in dims))
+    cand_diag = math.sqrt(sum(float(candidate.get(k) or 0) ** 2 for k in dims))
+    center_diff = center_distance / max((cur_diag + cand_diag) / 2.0, 1.0)
+
+    # Lower score is better. Size and mass dominate; center/COG separates same-size stacks.
+    diff_score = (0.45 * size_diff) + (0.35 * mass_diff) + (0.20 * center_diff)
+    similarity = max(0.0, min(100.0, 100.0 * (1.0 - diff_score)))
+
+    return {
+        "similarity": round(similarity, 2),
+        "diff_score": round(diff_score, 6),
+        "size_diff_pct": round(size_diff * 100.0, 3),
+        "mass_diff_pct": round(mass_diff * 100.0, 3),
+        "center_distance_in": round(center_distance, 4),
+        "center_diff_pct": round(center_diff * 100.0, 3),
+        "current": current,
+        "candidate": candidate,
+    }
+
+
+def compare_job_signature_to_previous(conn, job_num: str, limit: int = JOB_SIGNATURE_DEFAULT_LIMIT) -> list[dict]:
+    j = normalize_job_num(job_num)
+    current = load_job_signature(conn, j)
+    if not current:
+        return []
+
+    candidates = _rowdicts(conn.execute("""
+        SELECT DISTINCT job_num
+        FROM job_signature_components
+        WHERE job_num<>?
+        ORDER BY job_num DESC
+    """, (j,)))
+
+    results = []
+    for c in candidates:
+        cand_job = normalize_job_num(c.get("job_num") or "")
+        if not cand_job:
+            continue
+        cand_sig = load_job_signature(conn, cand_job)
+        component_results = []
+        missing_current = []
+        missing_candidate = []
+
+        for role in JOB_SIGNATURE_COMPONENTS:
+            cur = current.get(role)
+            cand = cand_sig.get(role)
+            if not cur:
+                missing_current.append(role)
+                continue
+            if not cand:
+                missing_candidate.append(role)
+                continue
+            comp = compare_signature_component(cur, cand)
+            comp["component_role"] = role
+            component_results.append(comp)
+
+        if not component_results:
+            continue
+
+        avg_similarity = sum(x["similarity"] for x in component_results) / len(component_results)
+        coverage = len(component_results) / len(JOB_SIGNATURE_COMPONENTS)
+        final_score = avg_similarity * (0.75 + 0.25 * coverage)
+
+        results.append({
+            "job_num": cand_job,
+            "score": round(final_score, 2),
+            "avg_component_similarity": round(avg_similarity, 2),
+            "matched_components": len(component_results),
+            "coverage_pct": round(coverage * 100.0, 1),
+            "missing_current": missing_current,
+            "missing_candidate": missing_candidate,
+            "components": sorted(component_results, key=lambda x: x["component_role"]),
+        })
+
+    results.sort(key=lambda x: x["score"], reverse=True)
+    return results[:max(1, int(limit or JOB_SIGNATURE_DEFAULT_LIMIT))]
 
 def job_family_root(conn, job_num: str) -> str:
     """
@@ -9314,6 +9623,62 @@ async def update_job_due_date(job_num: str, body: dict = Body(...)):
         "status": "ok",
         "job_num": j,
         "due_date": due_date,
+    }
+
+
+
+@app.post("/api/job-signatures/{job_num}/upload")
+async def upload_job_signature_csv(job_num: str, request: Request, file: UploadFile = File(...)):
+    require_signature_or_admin_request(request)
+
+    j = normalize_job_num(job_num)
+    if not j:
+        raise HTTPException(400, "Job number required")
+
+    data = await file.read()
+    try:
+        text = data.decode("utf-8-sig")
+    except Exception:
+        text = data.decode("latin-1", errors="replace")
+
+    rows = parse_job_signature_csv_text(text, fallback_job_num=j)
+    if not rows:
+        raise HTTPException(400, "No usable signature rows found in CSV")
+
+    with db_lock, sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        imported = upsert_job_signature_rows(conn, j, rows, source_file=file.filename or "")
+        matches = compare_job_signature_to_previous(conn, j, limit=JOB_SIGNATURE_DEFAULT_LIMIT)
+        conn.commit()
+
+    await manager.broadcast(json.dumps({"type": "refresh"}))
+
+    return {
+        "status": "ok",
+        "job_num": j,
+        "imported_components": imported,
+        "expected_components": JOB_SIGNATURE_COMPONENTS,
+        "matches": matches,
+    }
+
+
+@app.get("/api/job-signatures/{job_num}/matches")
+async def get_job_signature_matches(job_num: str, limit: int = JOB_SIGNATURE_DEFAULT_LIMIT):
+    j = normalize_job_num(job_num)
+    if not j:
+        raise HTTPException(400, "Job number required")
+
+    with db_lock, sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        current = load_job_signature(conn, j)
+        matches = compare_job_signature_to_previous(conn, j, limit=limit)
+
+    return {
+        "job_num": j,
+        "has_signature": bool(current),
+        "components": JOB_SIGNATURE_COMPONENTS,
+        "signature_components": sorted(current.keys()),
+        "matches": matches,
     }
 
 
