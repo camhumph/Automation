@@ -205,6 +205,8 @@ Private Const PULLCORE_ID_IS_HIGHER As Boolean = True
 Private Const PULLCORE_T_TOL As Double = 0.175
 Private Const PULLCORE_W_TOL As Double = 0.25
 Private Const PULLCORE_L_TOL As Double = 0.35
+Private Const PULLCORE_COMPARE_DECIMALS As Long = 2
+Private Const PULLCORE_ROUND_MATCH_TOL As Double = 0.011
 
 Private Const USE_PULLCORE_BEST_FIT_BBOX As Boolean = True
 Private Const PULLCORE_BEST_FIT_ALL_PARTS As Boolean = False
@@ -257,6 +259,11 @@ Private Const swSolidBody As Long = 0
 
 Private Const swComponentHidden As Long = 0
 Private Const swComponentVisible As Long = 1
+Private Const swComponentLightweight As Long = 2
+Private Const swComponentFullyResolved As Long = 3
+
+Private Const swBoundingBoxType_BestFit As Long = 1
+Private Const swBoundingBoxType_Centric As Long = 0
 
 Private Const xlCalculationManual As Long = -4135
 Private Const xlOpenXMLWorkbook As Long = 51
@@ -7302,6 +7309,14 @@ End Sub
 Private Sub MatchPullcoreRowsByClass()
 On Error GoTo ErrHandler
 
+    On Error Resume Next
+    If Not swModel Is Nothing Then
+        If swModel.GetType = swDocASSEMBLY Then
+            swModel.ResolveAllLightWeightComponents True
+        End If
+    End If
+    On Error GoTo ErrHandler
+
     Dim camRows() As Long
     Dim keyRows() As Long
     Dim camN As Long
@@ -7934,7 +7949,9 @@ On Error GoTo ErrHandler
                 If USE_PULLCORE_BEST_FIT_BBOX Then
                     gotFitted = TryGetPullcoreBestFitDims(i, bfL, bfW, bfT)
                     If gotFitted = False Then
-                        LogLine "PULLCORE candidate skipped (no fitted bbox): " & parts(i).componentName
+                        LogLine "PULLCORE candidate fitted bbox unavailable for '" & parts(i).componentName & _
+                                "'; raw assembly bbox=" & FormatNumberForCsv(parts(i).Length) & "/" & _
+                                FormatNumberForCsv(parts(i).Width) & "/" & FormatNumberForCsv(parts(i).Thickness)
                         GoTo NextPullcoreCandidate
                     End If
                 Else
@@ -8071,6 +8088,11 @@ Private Function PullcoreDimMatchesBomAxis(ByVal cadVal As Double, _
 On Error GoTo ErrHandler
 
     PullcoreDimMatchesBomAxis = False
+
+    If Abs(Round(cadVal, PULLCORE_COMPARE_DECIMALS) - Round(bomVal, PULLCORE_COMPARE_DECIMALS)) <= PULLCORE_ROUND_MATCH_TOL Then
+        PullcoreDimMatchesBomAxis = True
+        Exit Function
+    End If
 
     If RoundDimInches(cadVal) = RoundDimInches(bomVal) Then
         PullcoreDimMatchesBomAxis = True
@@ -9763,8 +9785,15 @@ On Error GoTo ErrHandler
     Dim partModel As Object
     Set partModel = GetModelDocForCadIndex(cadIdx)
 
-    If partModel Is Nothing Then Exit Function
-    If partModel.GetType <> swDocPART Then Exit Function
+    If partModel Is Nothing Then
+        LogLine "PULLCORE best-fit bbox skipped: could not open part model for '" & parts(cadIdx).componentName & "'"
+        Exit Function
+    End If
+
+    If partModel.GetType <> swDocPART Then
+        LogLine "PULLCORE best-fit bbox skipped: '" & parts(cadIdx).componentName & "' is not a part document."
+        Exit Function
+    End If
 
     If TryCreateAndReadBestFitBoundingBox(partModel, outL, outW, outT) Then
 
@@ -10393,13 +10422,35 @@ On Error GoTo ErrHandler
             Set swComp = FindAssemblyComponentByName(swModel, parts(cadIdx).componentName)
 
             If Not swComp Is Nothing Then
+
+                On Error Resume Next
+                If swComp.GetSuppression = swComponentLightweight Then
+                    swComp.SetSuppression2 swComponentFullyResolved
+                End If
+                On Error GoTo ErrHandler
+
                 Set GetModelDocForCadIndex = swComp.GetModelDoc2
-                If Not GetModelDocForCadIndex Is Nothing Then Exit Function
+
+                If GetModelDocForCadIndex Is Nothing And parts(cadIdx).filePath <> "" Then
+                    Dim openErrs As Long
+                    Dim openWarns As Long
+
+                    Set GetModelDocForCadIndex = swApp.OpenDoc6(parts(cadIdx).filePath, swDocPART, _
+                                                  swOpenDocOptions_Silent + swOpenDocOptions_ReadOnly, _
+                                                  parts(cadIdx).configName, openErrs, openWarns)
+                End If
+
+                If Not GetModelDocForCadIndex Is Nothing Then
+                    ActivateModelDocForPullcore GetModelDocForCadIndex
+                    Exit Function
+                End If
+
             End If
 
         ElseIf swModel.GetType = swDocPART Then
 
             Set GetModelDocForCadIndex = swModel
+            ActivateModelDocForPullcore GetModelDocForCadIndex
             Exit Function
 
         End If
@@ -10420,6 +10471,10 @@ On Error GoTo ErrHandler
                                           swOpenDocOptions_Silent + swOpenDocOptions_ReadOnly, _
                                           parts(cadIdx).configName, errs, warns)
 
+            If Not GetModelDocForCadIndex Is Nothing Then
+                ActivateModelDocForPullcore GetModelDocForCadIndex
+            End If
+
         End If
 
     End If
@@ -10429,6 +10484,159 @@ On Error GoTo ErrHandler
 ErrHandler:
     LogLine "GetModelDocForCadIndex error: " & Err.Description
     Set GetModelDocForCadIndex = Nothing
+End Function
+
+Private Sub ActivateModelDocForPullcore(ByVal partModel As Object)
+On Error Resume Next
+
+    If partModel Is Nothing Then Exit Sub
+    If swApp Is Nothing Then Exit Sub
+
+    Dim actErrs As Long
+    swApp.ActivateDoc3 partModel.GetTitle, False, 0, actErrs
+    EnsureSwHidden
+End Sub
+
+Private Function FindBoundingBoxProfileFeature(ByVal partModel As Object) As Object
+On Error GoTo ErrHandler
+
+    Set FindBoundingBoxProfileFeature = Nothing
+
+    If partModel Is Nothing Then Exit Function
+
+    Dim swFeat As Object
+    Set swFeat = partModel.FirstFeature
+
+    Do While Not swFeat Is Nothing
+
+        If LCase(swFeat.GetTypeName2()) = "boundingboxprofilefeat" Then
+            Set FindBoundingBoxProfileFeature = swFeat
+            Exit Function
+        End If
+
+        Set swFeat = swFeat.GetNextFeature
+    Loop
+
+    Exit Function
+
+ErrHandler:
+    Set FindBoundingBoxProfileFeature = Nothing
+End Function
+
+Private Function TryInsertPullcoreBestFitBoundingBox(ByVal partModel As Object) As Object
+On Error GoTo ErrHandler
+
+    Set TryInsertPullcoreBestFitBoundingBox = Nothing
+
+    If partModel Is Nothing Then Exit Function
+
+    Dim featMgr As Object
+    Set featMgr = partModel.FeatureManager
+
+    If featMgr Is Nothing Then Exit Function
+
+    Dim bboxFeat As Object
+    Dim status As Long
+    Dim bboxType As Long
+    Dim tryTypes(1 To 4) As Long
+    Dim t As Long
+
+    tryTypes(1) = swBoundingBoxType_BestFit
+    tryTypes(2) = swBoundingBoxType_Centric
+    tryTypes(3) = 0
+    tryTypes(4) = 1
+
+    partModel.ClearSelection2 True
+
+    For t = 1 To 4
+
+        bboxType = tryTypes(t)
+        Set bboxFeat = Nothing
+        status = 0
+
+        On Error Resume Next
+
+        Set bboxFeat = featMgr.InsertGlobalBoundingBox(bboxType, False, False, Nothing)
+
+        If bboxFeat Is Nothing Then
+            Set bboxFeat = featMgr.InsertGlobalBoundingBox(bboxType, False, False, Nothing, False)
+        End If
+
+        If bboxFeat Is Nothing Then
+            Set bboxFeat = featMgr.InsertGlobalBoundingBox(bboxType, False, False)
+        End If
+
+        If bboxFeat Is Nothing Then
+            Set bboxFeat = featMgr.InsertGlobalBoundingBox2(bboxType, False, False, Nothing)
+        End If
+
+        If bboxFeat Is Nothing Then
+            featMgr.InsertGlobalBoundingBox bboxType, False, False, status
+            Set bboxFeat = FindBoundingBoxProfileFeature(partModel)
+        End If
+
+        On Error GoTo ErrHandler
+
+        If Not bboxFeat Is Nothing Then
+            LogLine "PULLCORE best-fit bbox feature created with type=" & CStr(bboxType)
+            Set TryInsertPullcoreBestFitBoundingBox = bboxFeat
+            Exit Function
+        End If
+
+    Next t
+
+    Exit Function
+
+ErrHandler:
+    LogLine "TryInsertPullcoreBestFitBoundingBox error: " & Err.Description
+    Set TryInsertPullcoreBestFitBoundingBox = Nothing
+End Function
+
+Private Function TryReadBoundingBoxDimsFromFeature(ByVal bboxFeat As Object, _
+                                                   ByRef outL As Double, _
+                                                   ByRef outW As Double, _
+                                                   ByRef outT As Double) As Boolean
+On Error GoTo ErrHandler
+
+    TryReadBoundingBoxDimsFromFeature = False
+
+    outL = 0#
+    outW = 0#
+    outT = 0#
+
+    If bboxFeat Is Nothing Then Exit Function
+
+    If TryReadBoundingBoxFeatureSketchDims(bboxFeat, outL, outW, outT) Then
+        TryReadBoundingBoxDimsFromFeature = True
+        Exit Function
+    End If
+
+    Dim featName As String
+    featName = bboxFeat.Name
+
+    Dim partModel As Object
+    Set partModel = bboxFeat.GetModelDoc2
+
+    If Not partModel Is Nothing Then
+
+        On Error Resume Next
+        partModel.ClearSelection2 True
+        bboxFeat.Select2 False, 0
+        On Error GoTo ErrHandler
+
+        If TryReadBoundingBoxCustomProps(partModel, outL, outW, outT) Then
+            TryReadBoundingBoxDimsFromFeature = True
+            Exit Function
+        End If
+
+    End If
+
+    LogLine "PULLCORE bbox feature '" & featName & "' found but dimensions could not be read."
+
+    Exit Function
+
+ErrHandler:
+    TryReadBoundingBoxDimsFromFeature = False
 End Function
 
 Private Function TryCreateAndReadBestFitBoundingBox(ByVal partModel As Object, _
@@ -10446,56 +10654,62 @@ On Error GoTo ErrHandler
     If partModel Is Nothing Then Exit Function
     If partModel.GetType <> swDocPART Then Exit Function
 
+    ActivateModelDocForPullcore partModel
+
+    Dim gotDims As Boolean
+    Dim createdTemp As Boolean
     Dim bboxFeat As Object
+
+    gotDims = False
+    createdTemp = False
     Set bboxFeat = Nothing
 
     partModel.ClearSelection2 True
+    partModel.ForceRebuild3 False
 
-    Dim featMgr As Object
-    Set featMgr = partModel.FeatureManager
+    gotDims = TryReadBoundingBoxCustomProps(partModel, outL, outW, outT)
 
-    If Not featMgr Is Nothing Then
-        On Error Resume Next
-        Set bboxFeat = featMgr.InsertGlobalBoundingBox(0, False, False, Nothing)
-        If bboxFeat Is Nothing Then Set bboxFeat = featMgr.InsertGlobalBoundingBox(0, False, False, Nothing, False)
-        If bboxFeat Is Nothing Then Set bboxFeat = featMgr.InsertGlobalBoundingBox(0, False, False)
-        If bboxFeat Is Nothing Then Set bboxFeat = featMgr.InsertGlobalBoundingBox2(0, False, False, Nothing)
-        On Error GoTo ErrHandler
+    If gotDims = False Then
+        Set bboxFeat = FindBoundingBoxProfileFeature(partModel)
+        If Not bboxFeat Is Nothing Then
+            gotDims = TryReadBoundingBoxDimsFromFeature(bboxFeat, outL, outW, outT)
+        End If
     End If
 
-    Dim gotDims As Boolean
-    gotDims = False
+    If gotDims = False Then
+        Set bboxFeat = TryInsertPullcoreBestFitBoundingBox(partModel)
+        createdTemp = (Not bboxFeat Is Nothing)
 
-    If Not bboxFeat Is Nothing Then
+        If Not bboxFeat Is Nothing Then
+            partModel.ForceRebuild3 False
 
-        partModel.ForceRebuild3 False
+            gotDims = TryReadBoundingBoxCustomProps(partModel, outL, outW, outT)
 
-        gotDims = TryReadBoundingBoxCustomProps(partModel, outL, outW, outT)
-
-        If gotDims = False Then
-            gotDims = TryReadBoundingBoxFeatureSketchDims(bboxFeat, outL, outW, outT)
+            If gotDims = False Then
+                gotDims = TryReadBoundingBoxDimsFromFeature(bboxFeat, outL, outW, outT)
+            End If
         End If
+    End If
 
+    If createdTemp And Not bboxFeat Is Nothing Then
         On Error Resume Next
         partModel.ClearSelection2 True
         bboxFeat.Select2 False, 0
         partModel.EditDelete
         partModel.ClearSelection2 True
+        partModel.ForceRebuild3 False
         On Error GoTo ErrHandler
-
     End If
 
-    If gotDims = False Then
-
-        Dim dx As Double
-        Dim dy As Double
-        Dim dz As Double
-
-        If GetPartBoundingBoxInches(partModel, dx, dy, dz) Then
-            SortThreeDimensions dx, dy, dz, outL, outW, outT
-            gotDims = True
-        End If
-
+    If gotDims Then
+        SortThreeDimensions outL, outW, outT, outL, outW, outT
+        outL = RoundDimInches(outL)
+        outW = RoundDimInches(outW)
+        outT = RoundDimInches(outT)
+        LogLine "PULLCORE best-fit bbox read L/W/T=" & _
+                FormatNumberForCsv(outL) & "/" & FormatNumberForCsv(outW) & "/" & FormatNumberForCsv(outT)
+    Else
+        LogLine "PULLCORE best-fit bbox unavailable for part '" & partModel.GetTitle & "'."
     End If
 
     TryCreateAndReadBestFitBoundingBox = (gotDims And outL > 0 And outW > 0 And outT > 0)
@@ -10505,7 +10719,7 @@ ErrHandler:
     LogLine "TryCreateAndReadBestFitBoundingBox error: " & Err.Description
 
     On Error Resume Next
-    If Not bboxFeat Is Nothing Then
+    If createdTemp And Not bboxFeat Is Nothing Then
         partModel.ClearSelection2 True
         bboxFeat.Select2 False, 0
         partModel.EditDelete
@@ -10581,10 +10795,15 @@ On Error Resume Next
         If Trim(useStr) <> "" Then
 
             Dim v As Double
+            Dim isMm As Boolean
+
+            isMm = (InStr(LCase(useStr), "mm") > 0)
             v = ParseLeadingNumber(useStr)
 
             If v > 0 Then
-                If v < 3# Then
+                If isMm Then
+                    ReadBoundingBoxPropInches = v / 25.4
+                ElseIf v < 3# Then
                     ReadBoundingBoxPropInches = v * INCHES_PER_METER
                 Else
                     ReadBoundingBoxPropInches = v
