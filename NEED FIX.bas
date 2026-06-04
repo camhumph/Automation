@@ -4335,7 +4335,7 @@ On Error GoTo ErrHandler
     LogLine "HOLDERS DXF: saving native temp SLDASM:"
     LogLine "  " & holdersTempNativePath
 
-    SaveModelAs swModel, holdersTempNativePath
+    If SaveModelCopyAs(swModel, holdersTempNativePath) = False Then GoTo CleanExit
 
     CreateProjectedDxfFromNativePath holdersTempNativePath, holdersDxfPath, "HOLDERS", _
                                      CMS_TOP_VIEW_NAME, "*Top", _
