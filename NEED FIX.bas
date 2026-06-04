@@ -22,7 +22,7 @@ Option Explicit
 ' USER SETTINGS
 ' ============================================================
 
-Private Const ROOT_JOB_PATH As String = "C:\Users\lenovo\Desktop\000000005.May 2026"
+Private Const ROOT_JOB_PATH As String = "\\Mycloudex2ultra\mexico\Downloads"
 Private Const EXTRACT_FOLDER_NAME As String = "_EXTRACTED_ZIP"
 Private Const OUTPUT_FOLDER_SUFFIX As String = " PRINTS"
 
@@ -33,6 +33,7 @@ Private Const DELETE_EXTRACTED_ZIP_AFTER_FLATTEN As Boolean = True
 
 Private Const USE_ACTIVE_SOLIDWORKS_DOC_FIRST As Boolean = False
 Private Const SHOW_ERROR_MESSAGES As Boolean = True
+Private Const LIMIT_JOB_SEARCH_TO_CURRENT_AND_PREVIOUS_MONTH As Boolean = True
 
 Private Const READ_PDF_BOM_WITH_PDFTOTEXT As Boolean = True
 Private Const PDFTOTEXT_EXE As String = "C:\Users\lenovo\Downloads\New folder (9)\poppler-26.02.0\Library\bin\pdftotext.exe"
@@ -194,7 +195,7 @@ Private Const CREATE_PULLCORE_CAM_KEY_PACKAGE As Boolean = True
 Private Const PULLCORE_CAM_KEY_FOLDER_NAME As String = "PULLCORE CAM AND KEY"
 
 Private Const AUTO_LABEL_PULLCORE_ID_OD_BY_HEIGHT As Boolean = True
-Private Const PULLCORE_ID_OD_HEIGHT_AXIS As String = "AUTO"
+Private Const PULLCORE_ID_OD_HEIGHT_AXIS As String = "Y"
 Private Const PULLCORE_ID_IS_HIGHER As Boolean = True
 
 Private Const PULLCORE_T_TOL As Double = 0.175
@@ -7105,7 +7106,7 @@ Private Sub AddPullcoreMatchRow(ByRef b As BomInfo, ByVal cadIdx As Long, _
         End If
 
     Else
-        PullcoreMatches(PullcoreMatchCount).Status = "NO CAD MATCH"
+        PullcoreMatches(PullcoreMatchCount).Status = "NO CAD MATCH - BOUNDING BOX NOT FOUND"
     End If
 
     Dim cadNameForLog As String
@@ -7580,6 +7581,26 @@ ErrHandler:
     GetPullcoreMatchHeightValue = 0#
 End Function
 
+Private Function ShouldAutoRelabelPullcoreMatch(ByVal matchIdx As Long) As Boolean
+On Error GoTo ErrHandler
+
+    ShouldAutoRelabelPullcoreMatch = False
+
+    If matchIdx <= 0 Or matchIdx > PullcoreMatchCount Then Exit Function
+
+    Dim d As String
+    d = NormalizeText(PullcoreMatches(matchIdx).Description)
+
+    ' If the BOM already says ID/OD/LE/TE, keep that BOM name.
+    If GetPullcoreLocationCode(d) <> "" Then Exit Function
+
+    ShouldAutoRelabelPullcoreMatch = True
+    Exit Function
+
+ErrHandler:
+    ShouldAutoRelabelPullcoreMatch = False
+End Function
+
 Private Sub SetPullcoreMatchLabel(ByVal matchIdx As Long, _
                                   ByVal newName As String, _
                                   ByVal axisName As String)
@@ -7587,7 +7608,11 @@ On Error Resume Next
 
     If matchIdx <= 0 Or matchIdx > PullcoreMatchCount Then Exit Sub
 
-    PullcoreMatches(matchIdx).quoteName = newName
+    If ShouldAutoRelabelPullcoreMatch(matchIdx) Then
+        PullcoreMatches(matchIdx).quoteName = newName
+    Else
+        PullcoreMatches(matchIdx).quoteName = CleanPullcoreDisplayName(PullcoreMatches(matchIdx).Description)
+    End If
 
     Dim cadIdx As Long
     cadIdx = PullcoreMatches(matchIdx).CadPartIndex
@@ -8020,14 +8045,28 @@ On Error GoTo ErrHandler
     cadW = parts(cadIdx).Width
     cadT = parts(cadIdx).Thickness
 
-    If parts(cadIdx).BBoxVolume > 200# Then Exit Function
-    If cadT < 0.4 Then Exit Function
+    If parts(cadIdx).BBoxVolume > 500# Then Exit Function
+    If cadT < 0.25 Then Exit Function
 
-    If Abs(cadL - b.BomLength) > 1# Then Exit Function
-    If cadW < b.BomWidth - 0.4 Then Exit Function
-    If cadW > b.BomWidth + 1# Then Exit Function
+    Dim dL As Double
+    Dim dW As Double
+    Dim dT As Double
 
-    IsRoughPullcoreCandidateForBom = True
+    dL = Abs(cadL - b.BomLength)
+    dW = Abs(cadW - b.BomWidth)
+    dT = Abs(cadT - b.BomThickness)
+
+    ' Primary match: exact/fitted bounding box should be very close to BOM.
+    If dL <= PULLCORE_L_TOL And dW <= PULLCORE_W_TOL And dT <= PULLCORE_T_TOL Then
+        IsRoughPullcoreCandidateForBom = True
+        Exit Function
+    End If
+
+    ' Fallback: allow extended/rotated assembly boxes so every pullcore can be tested.
+    If dL <= 1.5 And dW <= 0.9 And dT <= 0.45 Then
+        IsRoughPullcoreCandidateForBom = True
+        Exit Function
+    End If
 
     Exit Function
 
@@ -8407,9 +8446,28 @@ End Function
 Private Function CleanPullcoreDisplayName(ByVal s As String) As String
     s = Trim(s)
 
+    s = Replace(s, "             Material", "", , , vbTextCompare)
+    s = Replace(s, "            Material", "", , , vbTextCompare)
+    s = Replace(s, "         Material", "", , , vbTextCompare)
+    s = Replace(s, "       Material", "", , , vbTextCompare)
+    s = Replace(s, " Material", "", , , vbTextCompare)
+
     Do While InStr(s, "  ") > 0
         s = Replace(s, "  ", " ")
     Loop
+
+    s = Trim(s)
+
+    ' Preserve the BOM wording, but normalize shop-facing pullcore tokens.
+    s = Replace(s, "PULLCORE", "Pullcore", , , vbTextCompare)
+    s = Replace(s, "PULL CORE", "Pullcore", , , vbTextCompare)
+    s = Replace(s, " CAM", " Cam", , , vbTextCompare)
+    s = Replace(s, " KEY", " Key", , , vbTextCompare)
+    s = Replace(s, " LE ", " Le ", , , vbTextCompare)
+    s = Replace(s, " TE ", " Te ", , , vbTextCompare)
+
+    If UCase(Left(s, 3)) = "LE " Then s = "Le " & Mid(s, 4)
+    If UCase(Left(s, 3)) = "TE " Then s = "Te " & Mid(s, 4)
 
     CleanPullcoreDisplayName = s
 End Function
@@ -11185,6 +11243,7 @@ On Error GoTo ErrHandler
 
         nameUpper = UCase(subFolder.Name)
 
+        If ShouldSkipJobSearchTopFolder(subFolder.Name, wantUpper) Then GoTo NextTop
         If nameUpper = UCase(EXTRACT_FOLDER_NAME) Then GoTo NextTop
         If InStr(nameUpper, " PRINTS") > 0 Then GoTo NextTop
         If InStr(nameUpper, "PULLCORE") > 0 Then GoTo NextTop
@@ -11214,8 +11273,10 @@ NextTop:
 
     For Each subFolder In root.SubFolders
         nameUpper = UCase(subFolder.Name)
-        If nameUpper <> UCase(EXTRACT_FOLDER_NAME) Then
-            SearchJobFolderRecursive subFolder, wantUpper, 1, bestPath, bestScore
+        If ShouldSkipJobSearchTopFolder(subFolder.Name, wantUpper) = False Then
+            If nameUpper <> UCase(EXTRACT_FOLDER_NAME) Then
+                SearchJobFolderRecursive subFolder, wantUpper, 1, bestPath, bestScore
+            End If
         End If
     Next subFolder
 
@@ -11229,6 +11290,34 @@ NextTop:
 ErrHandler:
     LogLine "FindJobFolderByText error: " & Err.Description
     FindJobFolderByText = ""
+End Function
+
+Private Function ShouldSkipJobSearchTopFolder(ByVal folderName As String, ByVal wantUpper As String) As Boolean
+On Error GoTo ErrHandler
+
+    ShouldSkipJobSearchTopFolder = False
+
+    If LIMIT_JOB_SEARCH_TO_CURRENT_AND_PREVIOUS_MONTH = False Then Exit Function
+
+    Dim n As String
+    n = UCase(folderName)
+
+    If InStr(n, wantUpper) > 0 Then Exit Function
+
+    Dim currentMonth As String
+    Dim previousMonth As String
+
+    currentMonth = UCase(Format(Date, "mmmm yyyy"))
+    previousMonth = UCase(Format(DateAdd("m", -1, Date), "mmmm yyyy"))
+
+    If InStr(n, currentMonth) > 0 Then Exit Function
+    If InStr(n, previousMonth) > 0 Then Exit Function
+
+    ShouldSkipJobSearchTopFolder = True
+    Exit Function
+
+ErrHandler:
+    ShouldSkipJobSearchTopFolder = False
 End Function
 
 Private Sub SearchJobFolderRecursive(ByVal folder As Object, _
