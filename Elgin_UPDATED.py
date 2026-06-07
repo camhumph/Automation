@@ -11810,8 +11810,13 @@ def ms_fmt_num(v) -> str:
 
 def ms_classify_component_filename(fn: str) -> str:
     """Map a job artifact filename to TCP/BCP/holder/pot kind."""
-    u = fn.upper().replace("_", " ")
+    fnu = fn.upper()
+    u = fnu.replace("_", " ")
     compact = re.sub(r"[^A-Z0-9]", "", u)
+    # Combined ID+OD holder assembly: J8455_HOLDERS_861000210_05-20-2026.igs
+    if "_HOLDERS_" in fnu or compact.startswith("J") and "HOLDERS" in compact and "HOLDER" in compact:
+        if "IDHOLDER" not in compact and "ODHOLDER" not in compact:
+            return "HOLDERS"
     if "IDHOLDER" in compact or ("HOLDER" in u and "ID" in u and "OD" not in u):
         return "ID HOLDER"
     if "ODHOLDER" in compact or ("HOLDER" in u and ("OD" in u or "BOT" in u)):
@@ -11854,6 +11859,14 @@ def _ms_job_search_roots(job_num: str) -> list[str]:
     local_job = os.path.join(ELGIN_LOCAL_WORKSPACE_ROOT, j)
     if os.path.isdir(local_job) and local_job not in seen:
         roots.append(local_job)
+    for sub in (f"{j} HOLDERS", f"J{j} HOLDERS", f"{j} Base", f"J{j} Base", f"{j} PRINTS"):
+        cand = os.path.join(local_job, sub)
+        cand = os.path.normpath(cand)
+        if cand in seen:
+            continue
+        if os.path.isdir(cand):
+            seen.add(cand)
+            roots.append(cand)
     return roots
 
 
@@ -11921,6 +11934,7 @@ def ms_find_job_models(job_num: str, kind: str = "") -> list[dict]:
         return cached[1]
 
     want = (kind or "").strip().upper()
+    holder_compare = want in ("ID HOLDER", "OD HOLDER", "HOLDERS")
     found = []
     seen = set()
     for full, fn in _ms_walk_job_files(job_num, _MS_MODEL_EXTS):
@@ -11929,7 +11943,8 @@ def ms_find_job_models(job_num: str, kind: str = "") -> list[dict]:
         seen.add(full)
         ck = ms_classify_component_filename(fn)
         if want and ck != want:
-            continue
+            if not (holder_compare and ck == "HOLDERS"):
+                continue
         ext = os.path.splitext(fn)[1].lower()
         found.append({
             "kind": ck,
@@ -11938,14 +11953,16 @@ def ms_find_job_models(job_num: str, kind: str = "") -> list[dict]:
             "format": ext.lstrip("."),
         })
 
-    # Prefer per-component IGS for browser overlay; skip whole-assembly BASE blobs.
     fmt_rank = {".igs": 0, ".iges": 0, ".easm": 1, ".x_t": 2, ".xt": 2, ".step": 3, ".stp": 3}
 
     def _model_sort_key(x: dict) -> tuple:
         fnu = x["label"].upper()
         base_penalty = 1 if ("_BASE_" in fnu or fnu.endswith("_BASE.IGS")) else 0
-        holders_penalty = 1 if ("_HOLDERS_" in fnu and want in ("ID HOLDER", "OD HOLDER", "TCP", "BCP")) else 0
-        return (fmt_rank.get("." + x["format"], 9), base_penalty, holders_penalty, x["label"].lower())
+        holders_bonus = 0 if "_HOLDERS_" in fnu else 1
+        if holder_compare:
+            return (holders_bonus, fmt_rank.get("." + x["format"], 9), base_penalty, x["label"].lower())
+        per_holder_penalty = 1 if ("_HOLDERS_" in fnu and want in ("TCP", "BCP")) else 0
+        return (fmt_rank.get("." + x["format"], 9), base_penalty, per_holder_penalty, x["label"].lower())
 
     found.sort(key=_model_sort_key)
     _ms_model_cache[cache_key] = (now, found)
@@ -12435,8 +12452,8 @@ function bindOverlayJpegs(curJob, matchJob, kind){
       if(anyOk){ ph.style.display='none'; }
       else {
         ph.textContent=isHolderIgsKind(kind)
-          ? (kind+' — no ISO JPG yet. Re-run export (macro saves '+curJob+'_'+kind+' ISO.jpg + .igs).')
-          : (kind+' — ISO/JPG previews are exported for ID HOLDER and OD HOLDER only.');
+          ? (kind+' — re-run export for '+curJob+' HOLDERS\\'+curJob+'_HOLDERS_….igs (both holders) and ISO JPG.')
+          : (kind+' — holder ISO/JPG on ID/OD HOLDER tabs only.');
         ph.style.display='block';
       }
     }
@@ -12599,8 +12616,8 @@ function renderOverlay(m){
         +'<span class="muted">'+esc(STATE.job)+' (current)</span></div>'
       +'<div class="legend">'+(
         isHolderIgsKind(k)
-          ? 'Holder compare: ISO <b>JPG</b> fade above. Spin the color-coded <b>IGS</b> models below (drag=orbit, scroll=zoom).'
-          : 'ISO <b>JPG</b> fade when <code>J'+esc(STATE.job)+'_'+esc(k)+' ISO.jpg</code> exists. IGS 3D is holders only (ID/OD HOLDER tabs).'
+          ? 'Holder compare uses combined <b>J'+esc(STATE.job)+'_HOLDERS_….igs</b> (both holders together). Drag to spin, scroll to zoom.'
+          : 'ISO <b>JPG</b> fade when exported. Combined holder <b>IGS</b> is on ID/OD HOLDER tabs only.'
       )+'</div>'
       +(isHolderIgsKind(k)
         ? '<div class="ms3d" id="ms3dHost"><div class="muted" style="padding:18px">Loading holder IGS…</div></div>'
@@ -12633,7 +12650,7 @@ async function loadMs3dOverlay(curJob, matchJob, kind, containerId){
     var mCur=await fetchModel(curJob);
     var mMatch=await fetchModel(matchJob);
     if(!mCur && !mMatch){
-      host.innerHTML='<div class="muted" style="padding:18px">No <b>IGS</b> for <b>'+esc(kind)+'</b>. Re-run CMS export — the macro saves <code>'+esc(curJob)+'_'+esc(kind)+'_….igs</code> next to the XT in PRINTS.</div>';
+      host.innerHTML='<div class="muted" style="padding:18px">No <b>HOLDERS</b> IGS for <b>'+esc(kind)+'</b>. Re-run export — expect <code>'+esc(curJob)+' HOLDERS\\'+esc(curJob)+'_HOLDERS_….igs</code> (ID+OD together).</div>';
       return;
     }
     if(!isHolderIgsKind(kind)){

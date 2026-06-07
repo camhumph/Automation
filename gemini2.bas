@@ -124,9 +124,9 @@ Private Const FAST_SKIP_PRINTS_DXF As Boolean = True
 Private Const FAST_SKIP_BASE_PACKAGE_DXF As Boolean = True
 Private Const FAST_SKIP_HOLDERS_PACKAGE_DXF As Boolean = True
 
-' Match Studio: holders only (ID/OD HOLDER IGS + ISO JPG). Skips TCP/BCP/POT to save export time.
+' Match Studio: ISO JPG for holders only. Combined holder IGS comes from HOLDERS package (both together).
 Private Const CREATE_COMPONENT_ISO_JPEGS As Boolean = True
-Private Const CREATE_COMPONENT_IGS_WITH_XT As Boolean = True
+Private Const CREATE_COMPONENT_IGS_WITH_XT As Boolean = False
 Private Const CREATE_COMPONENT_EASM_WITH_XT As Boolean = False
 
 ' UPDATED: this is now honored for BASE/HOLDERS too in later DXF code.
@@ -3481,13 +3481,6 @@ On Error GoTo ErrHandler
     folder = GetParentFolderPath(xtPath)
     EnsureFolderDeep folder
 
-    If CREATE_COMPONENT_IGS_WITH_XT Then
-        Dim igsPath As String
-        igsPath = ReplaceExtension(xtPath, "igs")
-        SaveModelAs assyModel, igsPath
-        LogLine "Match Studio holder IGS: " & igsPath
-    End If
-
     If CREATE_COMPONENT_EASM_WITH_XT Then
         If assyModel.GetType = swDocASSEMBLY Then
             Dim easmPath As String
@@ -4501,7 +4494,9 @@ On Error GoTo ErrHandler
     If idHolderIdx <= 0 Or idHolderIdx > PartCount Then Exit Sub
     If odHolderIdx <= 0 Or odHolderIdx > PartCount Then Exit Sub
 
-    EnsureFolderDeep outputFolder
+    Dim holdersFolder As String
+    holdersFolder = outputFolder & "\" & CurrentJobNumber & " HOLDERS"
+    EnsureFolderDeep holdersFolder
 
     Dim idPart As PartInfo
     Dim odPart As PartInfo
@@ -4524,8 +4519,8 @@ On Error GoTo ErrHandler
     Dim holdersIgsPath As String
     Dim holdersDxfPath As String
 
-    holdersIgsPath = outputFolder & "\" & CurrentJobNumber & "_" & holderToken & "_" & custToken & "_" & dateToken & ".igs"
-    holdersDxfPath = outputFolder & "\" & CurrentJobNumber & "_" & holderToken & "_" & custToken & "_" & dateToken & ".dxf"
+    holdersIgsPath = holdersFolder & "\" & CurrentJobNumber & "_" & holderToken & "_" & custToken & "_" & dateToken & ".igs"
+    holdersDxfPath = holdersFolder & "\" & CurrentJobNumber & "_" & holderToken & "_" & custToken & "_" & dateToken & ".dxf"
 
     holdersIgsPath = GetUniqueFilePath(holdersIgsPath)
     holdersDxfPath = GetUniqueFilePath(holdersDxfPath)
@@ -7614,6 +7609,7 @@ On Error GoTo ErrHandler
     ' Preserve descriptive BOM names and make sure no two matches end up with
     ' an identical quote name (which would collide on export).
     DisambiguatePullcoreQuoteNames
+    FinalizePullcoreCamIdOdNames
 
     On Error Resume Next
     If Not swModel Is Nothing Then
@@ -7863,9 +7859,9 @@ On Error Resume Next
 
     If matchIdx <= 0 Or matchIdx > PullcoreMatchCount Then Exit Sub
 
-    ' Do not clobber a BOM name that already states its location.
+    ' Keep TE/LE style BOM names; generic "Pullcore Cam" rows get ID/OD labels.
     If PULLCORE_PRESERVE_DESCRIPTIVE_BOM_NAMES Then
-        If GetPullcoreLocationCode(PullcoreMatches(matchIdx).Description) <> "" Then
+        If PullcoreLocationNameIsDescriptive(PullcoreMatches(matchIdx).Description) Then
             LogLine "Pullcore keeping descriptive BOM name '" & _
                     PullcoreMatches(matchIdx).quoteName & "' (would have been '" & newName & "')"
             Exit Sub
@@ -7873,6 +7869,7 @@ On Error Resume Next
     End If
 
     PullcoreMatches(matchIdx).quoteName = newName
+    PullcoreMatches(matchIdx).Description = newName
 
     Dim cadIdx As Long
     cadIdx = PullcoreMatches(matchIdx).CadPartIndex
@@ -8182,6 +8179,141 @@ On Error Resume Next
         End If
 
     Next i
+End Sub
+
+' True when the BOM already names TE/LE/IDTE/ODTE etc. — do not overwrite those.
+Private Function PullcoreLocationNameIsDescriptive(ByVal desc As String) As Boolean
+    Dim d As String
+    Dim loc As String
+    d = NormalizeText(desc)
+    loc = GetPullcoreLocationCode(d)
+    If loc = "IDTE" Or loc = "ODTE" Or loc = "IDLE" Or loc = "ODLE" Then
+        PullcoreLocationNameIsDescriptive = True
+        Exit Function
+    End If
+    If InStr(d, " TE ") > 0 Or InStr(d, " LE ") > 0 Then
+        PullcoreLocationNameIsDescriptive = True
+        Exit Function
+    End If
+    If Right(d, 3) = " TE" Or Right(d, 3) = " LE" Then
+        PullcoreLocationNameIsDescriptive = True
+    End If
+End Function
+
+' After matching, force ID/OD PULLCORE CAM (and KEY pairs) from assembly Y center.
+Private Sub FinalizePullcoreCamIdOdNames()
+On Error GoTo ErrHandler
+
+    If PullcoreMatchCount <= 0 Then Exit Sub
+
+    Dim camIdx() As Long
+    Dim camN As Long
+    camN = 0
+    ReDim camIdx(1 To PullcoreMatchCount)
+
+    Dim i As Long
+    Dim ci As Long
+    For i = 1 To PullcoreMatchCount
+        If PullcoreMatches(i).isCam And PullcoreMatches(i).CadPartIndex > 0 Then
+            ci = PullcoreMatches(i).CadPartIndex
+            If ci > 0 And ci <= PartCount Then
+                If parts(ci).hasAsmCenter Then
+                    camN = camN + 1
+                    camIdx(camN) = i
+                End If
+            End If
+        End If
+    Next i
+
+    If camN < 2 Then
+        LogLine "Pullcore ID/OD finalize skipped: need 2 CAM matches with centers (have " & camN & ")."
+        Exit Sub
+    End If
+
+    Dim axisName As String
+    axisName = UCase(Trim(PULLCORE_ID_OD_HEIGHT_AXIS))
+    If axisName <> "Y" And axisName <> "Z" Then axisName = "Y"
+    PullcoreIdOdHeightAxisUsed = axisName
+
+    Dim sorted() As Long
+    ReDim sorted(1 To camN)
+    For i = 1 To camN
+        sorted(i) = camIdx(i)
+    Next i
+
+    Dim a As Long
+    Dim b As Long
+    Dim tmp As Long
+    Dim va As Double
+    Dim vb As Double
+    For a = 1 To camN - 1
+        For b = a + 1 To camN
+            va = GetPullcoreMatchHeightValue(sorted(a), axisName)
+            vb = GetPullcoreMatchHeightValue(sorted(b), axisName)
+            If PULLCORE_ID_IS_HIGHER Then
+                If va < vb Then tmp = sorted(a): sorted(a) = sorted(b): sorted(b) = tmp
+            Else
+                If va > vb Then tmp = sorted(a): sorted(a) = sorted(b): sorted(b) = tmp
+            End If
+        Next b
+    Next a
+
+    ForcePullcoreMatchLabel sorted(1), "ID PULLCORE CAM"
+    ForcePullcoreMatchLabel sorted(camN), "OD PULLCORE CAM"
+
+    If camN > 2 Then
+        For i = 2 To camN - 1
+            ForcePullcoreMatchLabel sorted(i), "PULLCORE CAM " & CStr(i)
+        Next i
+    End If
+
+    Dim keyIdx() As Long
+    Dim keyN As Long
+    keyN = 0
+    ReDim keyIdx(1 To PullcoreMatchCount)
+    For i = 1 To PullcoreMatchCount
+        If (Not PullcoreMatches(i).isCam) And PullcoreMatches(i).CadPartIndex > 0 Then
+            keyN = keyN + 1
+            keyIdx(keyN) = i
+        End If
+    Next i
+
+    If keyN = 2 Then
+        Dim idCam As Long
+        Dim odCam As Long
+        idCam = sorted(1)
+        odCam = sorted(camN)
+        Dim k1 As Long
+        Dim k2 As Long
+        k1 = keyIdx(1)
+        k2 = keyIdx(2)
+        If PullcoreMatchDistanceSq(k1, idCam) + PullcoreMatchDistanceSq(k2, odCam) <= _
+           PullcoreMatchDistanceSq(k2, idCam) + PullcoreMatchDistanceSq(k1, odCam) Then
+            ForcePullcoreMatchLabel k1, "ID PULLCORE KEY"
+            ForcePullcoreMatchLabel k2, "OD PULLCORE KEY"
+        Else
+            ForcePullcoreMatchLabel k2, "ID PULLCORE KEY"
+            ForcePullcoreMatchLabel k1, "OD PULLCORE KEY"
+        End If
+    ElseIf keyN = 1 Then
+        If PullcoreMatchDistanceSq(keyIdx(1), sorted(1)) <= PullcoreMatchDistanceSq(keyIdx(1), sorted(camN)) Then
+            ForcePullcoreMatchLabel keyIdx(1), "ID PULLCORE KEY"
+        Else
+            ForcePullcoreMatchLabel keyIdx(1), "OD PULLCORE KEY"
+        End If
+    End If
+
+    Exit Sub
+ErrHandler:
+    LogLine "FinalizePullcoreCamIdOdNames error: " & Err.Description
+End Sub
+
+Private Sub ForcePullcoreMatchLabel(ByVal matchIdx As Long, ByVal newName As String)
+On Error Resume Next
+    If matchIdx <= 0 Or matchIdx > PullcoreMatchCount Then Exit Sub
+    PullcoreMatches(matchIdx).quoteName = newName
+    PullcoreMatches(matchIdx).Description = newName
+    LogLine "Pullcore export name finalized: '" & newName & "'"
 End Sub
 
 ' Replace the trailing "Cam" in a pullcore cam name with "Key", preserving the
@@ -12271,11 +12403,23 @@ Private Sub OrganizeJobFiles()
     Dim fso As Object
     Set fso = CreateObject("Scripting.FileSystemObject")
     If Not fso.FolderExists(CurrentJobFolder) Then Exit Sub
-    Dim baseDir As String, pdfDir As String
-    baseDir = CurrentJobFolder & "\base"
+    Dim baseDir As String, pdfDir As String, legacyBase As String
+    baseDir = CurrentJobFolder & "\" & CurrentJobNumber & " Base"
+    legacyBase = CurrentJobFolder & "\base"
     pdfDir = CurrentJobFolder & "\pdf"
     EnsureFolderDeep baseDir
     EnsureFolderDeep pdfDir
+    If fso.FolderExists(legacyBase) Then
+        Dim legF As Object
+        For Each legF In fso.GetFolder(legacyBase).Files
+            On Error Resume Next
+            fso.MoveFile legF.Path, GetUniqueFilePath(baseDir & "\" & legF.Name)
+            On Error GoTo eh
+        Next legF
+        On Error Resume Next
+        If fso.GetFolder(legacyBase).Files.Count = 0 Then fso.DeleteFolder legacyBase, True
+        On Error GoTo eh
+    End If
     Dim names As Collection, f As Object
     Set names = New Collection
     For Each f In fso.GetFolder(CurrentJobFolder).Files
@@ -12306,7 +12450,7 @@ Private Sub OrganizeJobFiles()
             If dest = baseDir Then movedBase = movedBase + 1 Else movedPdf = movedPdf + 1
         End If
     Next idx
-    LogLine "OrganizeJobFiles: moved " & movedBase & " CAD file(s) -> base, " & movedPdf & " report(s) -> pdf"
+    LogLine "OrganizeJobFiles: moved " & movedBase & " CAD file(s) -> " & CurrentJobNumber & " Base, " & movedPdf & " report(s) -> pdf"
     Exit Sub
 eh:
     LogLine "OrganizeJobFiles error: " & Err.Description
