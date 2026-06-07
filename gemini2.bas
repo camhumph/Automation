@@ -2814,6 +2814,11 @@ Private Function FindExistingPart(ByVal filePath As String, ByVal configName As 
             If LCase(parts(i).filePath) = LCase(filePath) And _
                LCase(parts(i).configName) = LCase(configName) Then
 
+                ' Different assembly instances (Part-6-1 vs Part-6-2) must stay separate.
+                If compName <> "" Then
+                    If LCase(parts(i).componentName) <> LCase(compName) Then GoTo NextPart
+                End If
+
                 ' Same file/config at a different Y center = separate pullcore instance (ID vs OD).
                 If newHasCenter And parts(i).hasAsmCenter Then
                     If Abs(parts(i).AsmCenterY - newCenterY) > 0.05 Then GoTo NextPart
@@ -7200,8 +7205,6 @@ Private Function IsPullcoreBomRow(ByRef b As BomInfo) As Boolean
     Dim d As String
     d = NormalizeText(b.Description)
 
-    If InStr(d, "CAM") = 0 And InStr(d, "KEY") = 0 Then Exit Function
-
     If InStr(d, "EJECTOR") > 0 Then Exit Function
     If InStr(d, "FLIPPER") > 0 Then Exit Function
     If InStr(d, "COVER") > 0 Then Exit Function
@@ -7220,7 +7223,69 @@ Private Function IsPullcoreBomRow(ByRef b As BomInfo) As Boolean
 
     If HasPullcoreLocationToken(d) Then
         IsPullcoreBomRow = True
+        Exit Function
     End If
+
+    ' BOM qty-2 rows that only list material (H-13 cam / A-2 key) without "Pullcore" text.
+    If b.hasDims Then
+        If IsPullcoreCamBomRow(b) And LooksLikePullcoreCamBomDims(b) Then
+            IsPullcoreBomRow = True
+            Exit Function
+        End If
+        If IsPullcoreKeyBomRow(b) And LooksLikePullcoreKeyBomDims(b) Then
+            IsPullcoreBomRow = True
+            Exit Function
+        End If
+    End If
+
+    If InStr(d, "CAM") = 0 And InStr(d, "KEY") = 0 Then Exit Function
+
+    If InStr(d, "PULLCORE") > 0 Or InStr(d, "PULL CORE") > 0 Then
+        IsPullcoreBomRow = True
+    End If
+End Function
+
+Private Function IsPullcoreCamBomRow(ByRef b As BomInfo) As Boolean
+    Dim d As String
+    d = NormalizeText(b.Description)
+
+    If InStr(d, "KEY") > 0 And InStr(d, "CAM") = 0 Then Exit Function
+    If InStr(d, "CAM") > 0 Then IsPullcoreCamBomRow = True: Exit Function
+    If NormalizeSteelType(b.material) = "H13" Then IsPullcoreCamBomRow = True
+End Function
+
+Private Function IsPullcoreKeyBomRow(ByRef b As BomInfo) As Boolean
+    Dim d As String
+    d = NormalizeText(b.Description)
+
+    If InStr(d, "CAM") > 0 And InStr(d, "KEY") = 0 Then Exit Function
+    If InStr(d, "KEY") > 0 Then IsPullcoreKeyBomRow = True: Exit Function
+
+    If NormalizeSteelType(b.material) = "A-2" Then
+        If InStr(d, "EJECTOR") = 0 And InStr(d, "J-BLOCK") = 0 And InStr(d, "J BLOCK") = 0 Then
+            IsPullcoreKeyBomRow = True
+        End If
+    End If
+End Function
+
+Private Function LooksLikePullcoreCamBomDims(ByRef b As BomInfo) As Boolean
+    If b.hasDims = False Then Exit Function
+
+    If b.BomLength < 3.4 Or b.BomLength > 4.6 Then Exit Function
+    If b.BomWidth < 2# Or b.BomWidth > 3.2 Then Exit Function
+    If b.BomThickness < 0.75 Or b.BomThickness > 1.6 Then Exit Function
+
+    LooksLikePullcoreCamBomDims = True
+End Function
+
+Private Function LooksLikePullcoreKeyBomDims(ByRef b As BomInfo) As Boolean
+    If b.hasDims = False Then Exit Function
+
+    If b.BomLength < 2.5 Or b.BomLength > 3.6 Then Exit Function
+    If b.BomWidth < 0.9 Or b.BomWidth > 1.7 Then Exit Function
+    If b.BomThickness < 0.55 Or b.BomThickness > 1.1 Then Exit Function
+
+    LooksLikePullcoreKeyBomDims = True
 End Function
 
 Private Function HasPullcoreLocationToken(ByVal d As String) As Boolean
@@ -7259,7 +7324,7 @@ Private Sub AddPullcoreMatchRow(ByRef b As BomInfo, ByVal cadIdx As Long, _
     PullcoreMatches(PullcoreMatchCount).Quantity = b.Quantity
 
     PullcoreMatches(PullcoreMatchCount).CadPartIndex = cadIdx
-    PullcoreMatches(PullcoreMatchCount).isCam = (InStr(NormalizeText(b.Description), "CAM") > 0)
+    PullcoreMatches(PullcoreMatchCount).isCam = IsPullcoreCamBomRow(b)
 
     PullcoreMatches(PullcoreMatchCount).BomThickness = b.BomThickness
     PullcoreMatches(PullcoreMatchCount).BomWidth = b.BomWidth
@@ -7502,7 +7567,7 @@ On Error GoTo ErrHandler
             If reps > 8 Then reps = 8
 
             Dim isCamRow As Boolean
-            isCamRow = (InStr(NormalizeText(BomRows(i).Description), "CAM") > 0)
+            isCamRow = IsPullcoreCamBomRow(BomRows(i))
 
             ' Old behavior forced every key row to count at least twice, which
             ' invented phantom "NO CAD MATCH" rows when the model held only one
@@ -8263,6 +8328,214 @@ ErrHandler:
     LogLine "RelabelPullcoreKeysByNestedCam error: " & Err.Description
 End Sub
 
+Private Function PullcoreDimDistanceScore(ByVal cadL As Double, ByVal cadW As Double, ByVal cadT As Double, _
+                                        ByRef b As BomInfo) As Double
+    PullcoreDimDistanceScore = Abs(cadL - b.BomLength) * 3# _
+                             + Abs(cadW - b.BomWidth) _
+                             + Abs(cadT - b.BomThickness)
+End Function
+
+Private Sub MarkPullcoreCandidateSlotsUsed(ByRef candIdx() As Long, ByVal candN As Long, _
+                                           ByRef candUsed() As Boolean, ByVal usedCadIdx As Long)
+    Dim j As Long
+
+    For j = 1 To candN
+        If candIdx(j) = usedCadIdx Then candUsed(j) = True
+    Next j
+End Sub
+
+Private Function GetPullcoreCandidateAxisValue(ByVal cadIdx As Long, ByVal axisName As String) As Double
+    GetPullcoreCandidateAxisValue = 0#
+
+    If cadIdx <= 0 Or cadIdx > PartCount Then Exit Function
+    If parts(cadIdx).hasAsmCenter = False Then Exit Function
+
+    If UCase(axisName) = "Z" Then
+        GetPullcoreCandidateAxisValue = parts(cadIdx).AsmCenterZ
+    Else
+        GetPullcoreCandidateAxisValue = parts(cadIdx).AsmCenterY
+    End If
+End Function
+
+' When BOM qty expands to 2+ identical rows, pick distinct CAD parts and rank
+' them by assembly Y (higher Y = ID pullcore when PULLCORE_ID_IS_HIGHER).
+Private Function TryMatchPullcoreRowsByYRank(ByRef rIdx() As Long, ByVal rowN As Long, _
+                                             ByRef candIdx() As Long, _
+                                             ByRef candL() As Double, _
+                                             ByRef candW() As Double, _
+                                             ByRef candT() As Double, _
+                                             ByVal candN As Long, _
+                                             ByRef candLoc() As String, _
+                                             ByRef rowUsed() As Boolean, _
+                                             ByRef candUsed() As Boolean) As Boolean
+On Error GoTo ErrHandler
+
+    TryMatchPullcoreRowsByYRank = False
+
+    If rowN < 2 Then Exit Function
+    If candN < rowN Then Exit Function
+
+    Dim refBom As BomInfo
+    refBom = BomRows(rIdx(1))
+
+    Dim uniqCad() As Long
+    Dim uniqScore() As Double
+    Dim uniqLoc() As String
+    Dim uniqN As Long
+
+    uniqN = 0
+    ReDim uniqCad(1 To candN)
+    ReDim uniqScore(1 To candN)
+    ReDim uniqLoc(1 To candN)
+
+    Dim j As Long
+    Dim k As Long
+    Dim already As Boolean
+
+    For j = 1 To candN
+
+        already = False
+
+        For k = 1 To uniqN
+            If uniqCad(k) = candIdx(j) Then
+                already = True
+                Exit For
+            End If
+        Next k
+
+        If already = False Then
+            uniqN = uniqN + 1
+            uniqCad(uniqN) = candIdx(j)
+            uniqScore(uniqN) = PullcoreDimDistanceScore(candL(j), candW(j), candT(j), refBom)
+            uniqLoc(uniqN) = candLoc(j)
+        End If
+
+    Next j
+
+    If uniqN < rowN Then Exit Function
+
+    ' Pick the rowN best dimension fits among unique CAD parts.
+    Dim pickCad() As Long
+    Dim pickScore() As Double
+    Dim pickLoc() As String
+    Dim pickN As Long
+
+    pickN = 0
+    ReDim pickCad(1 To rowN)
+    ReDim pickScore(1 To rowN)
+    ReDim pickLoc(1 To rowN)
+
+    Dim usedUniq() As Boolean
+    ReDim usedUniq(1 To uniqN)
+
+    Dim pickStep As Long
+    Dim bestU As Long
+    Dim bestScore As Double
+
+    For pickStep = 1 To rowN
+
+        bestU = 0
+        bestScore = 1E+99
+
+        For k = 1 To uniqN
+            If usedUniq(k) = False Then
+                If uniqScore(k) < bestScore Then
+                    bestScore = uniqScore(k)
+                    bestU = k
+                End If
+            End If
+        Next k
+
+        If bestU = 0 Then Exit Function
+
+        pickN = pickN + 1
+        pickCad(pickN) = uniqCad(bestU)
+        pickScore(pickN) = uniqScore(bestU)
+        pickLoc(pickN) = uniqLoc(bestU)
+        usedUniq(bestU) = True
+
+    Next pickStep
+
+    Dim axisName As String
+    axisName = UCase(Trim(PULLCORE_ID_OD_HEIGHT_AXIS))
+    If axisName <> "Y" And axisName <> "Z" Then axisName = "Y"
+
+    ' Sort selected parts by Y/Z so ID (higher) and OD (lower) are distinct.
+    Dim swapped As Boolean
+    Dim needSwap As Boolean
+    Dim tmpCad As Long
+    Dim tmpScore As Double
+    Dim tmpLoc As String
+    Dim va As Double
+    Dim vb As Double
+
+    Do
+        swapped = False
+
+        For k = 1 To pickN - 1
+            va = GetPullcoreCandidateAxisValue(pickCad(k), axisName)
+            vb = GetPullcoreCandidateAxisValue(pickCad(k + 1), axisName)
+
+            needSwap = False
+            If PULLCORE_ID_IS_HIGHER Then
+                If va < vb Then needSwap = True
+            Else
+                If va > vb Then needSwap = True
+            End If
+
+            If needSwap Then
+                tmpCad = pickCad(k): pickCad(k) = pickCad(k + 1): pickCad(k + 1) = tmpCad
+                tmpScore = pickScore(k): pickScore(k) = pickScore(k + 1): pickScore(k + 1) = tmpScore
+                tmpLoc = pickLoc(k): pickLoc(k) = pickLoc(k + 1): pickLoc(k + 1) = tmpLoc
+                swapped = True
+            End If
+        Next k
+    Loop While swapped
+
+    LogLine "PULLCORE qty-" & rowN & " Y-ranked match on axis " & axisName & ":"
+
+    For k = 1 To pickN
+        If pickCad(k) > 0 And pickCad(k) <= PartCount Then
+            LogLine "  rank " & k & ": " & parts(pickCad(k)).componentName & _
+                    " Y=" & FormatNumberForCsv(parts(pickCad(k)).AsmCenterY) & _
+                    " score=" & FormatNumberForCsv(pickScore(k))
+        End If
+    Next k
+
+    For k = 1 To pickN
+        If rowUsed(k) = False Then
+            Dim bfL As Double
+            Dim bfW As Double
+            Dim bfT As Double
+
+            bfL = parts(pickCad(k)).Length
+            bfW = parts(pickCad(k)).Width
+            bfT = parts(pickCad(k)).Thickness
+
+            If USE_PULLCORE_BEST_FIT_BBOX Then
+                If TryGetPullcoreBestFitDims(pickCad(k), bfL, bfW, bfT) = False Then
+                    bfL = parts(pickCad(k)).Length
+                    bfW = parts(pickCad(k)).Width
+                    bfT = parts(pickCad(k)).Thickness
+                End If
+            End If
+
+            AddPullcoreMatchRow BomRows(rIdx(k)), pickCad(k), bfL, bfW, bfT
+
+            parts(pickCad(k)).UsedForBomMatch = True
+            rowUsed(k) = True
+            MarkPullcoreCandidateSlotsUsed candIdx, candN, candUsed, pickCad(k)
+        End If
+    Next k
+
+    TryMatchPullcoreRowsByYRank = True
+    Exit Function
+
+ErrHandler:
+    LogLine "TryMatchPullcoreRowsByYRank error: " & Err.Description
+    TryMatchPullcoreRowsByYRank = False
+End Function
+
 Private Sub AssignPullcoreClass(ByRef bomRowIdx() As Long, ByVal rowN As Long, ByVal wantCam As Boolean)
 On Error GoTo ErrHandler
 
@@ -8326,30 +8599,6 @@ On Error GoTo ErrHandler
                 candW(candN) = bfW
                 candT(candN) = bfT
 
-                ' Identical instances are de-duplicated into one part (Quantity
-                ' counts the copies). Offer one candidate slot per instance so a
-                ' mirrored / repeated key can satisfy more than one BOM row.
-                If PULLCORE_EXPAND_CANDIDATES_BY_QTY Then
-                    Dim instCount As Long
-                    Dim rep As Long
-
-                    instCount = parts(i).Quantity
-                    If instCount < 1 Then instCount = 1
-                    If instCount > 8 Then instCount = 8
-
-                    For rep = 2 To instCount
-                        candN = candN + 1
-                        ReDim Preserve candIdx(1 To candN)
-                        ReDim Preserve candL(1 To candN)
-                        ReDim Preserve candW(1 To candN)
-                        ReDim Preserve candT(1 To candN)
-                        candIdx(candN) = i
-                        candL(candN) = bfL
-                        candW(candN) = bfW
-                        candT(candN) = bfT
-                    Next rep
-                End If
-
             End If
 
         End If
@@ -8395,72 +8644,82 @@ On Error GoTo ErrHandler
         Next j
     End If
 
-    Dim pairCount As Long
+    Dim matchedByYRank As Boolean
+    matchedByYRank = False
 
-    pairCount = rowN
-    If candN < pairCount Then pairCount = candN
+    If rowN >= 2 And candN >= rowN Then
+        matchedByYRank = TryMatchPullcoreRowsByYRank(rIdx, rowN, candIdx, candL, candW, candT, _
+                                                     candN, candLoc, rowUsed, candUsed)
+    End If
 
-    Dim pairStep As Long
+    If matchedByYRank = False Then
 
-    For pairStep = 1 To pairCount
+        Dim pairCount As Long
 
-        Dim bestR As Long
-        Dim bestC As Long
-        Dim bestDist As Double
+        pairCount = rowN
+        If candN < pairCount Then pairCount = candN
 
-        bestR = 0
-        bestC = 0
-        bestDist = 1E+99
+        Dim pairStep As Long
 
-        For i = 1 To rowN
+        For pairStep = 1 To pairCount
 
-            If rowUsed(i) = False Then
+            Dim bestR As Long
+            Dim bestC As Long
+            Dim bestDist As Double
 
-                For j = 1 To candN
+            bestR = 0
+            bestC = 0
+            bestDist = 1E+99
 
-                    If candUsed(j) = False Then
+            For i = 1 To rowN
 
-                        Dim d As Double
+                If rowUsed(i) = False Then
 
-                        d = Abs(candL(j) - BomRows(rIdx(i)).BomLength) * 3# _
-                          + Abs(candW(j) - BomRows(rIdx(i)).BomWidth) _
-                          + Abs(candT(j) - BomRows(rIdx(i)).BomThickness)
+                    For j = 1 To candN
 
-                        ' Steer "OD ..." rows toward OD-side parts and
-                        ' "ID ..." rows toward ID-side parts. Zero effect when
-                        ' the BOM row or the candidate has no usable location.
-                        If PULLCORE_USE_LOCATION_AWARE_MATCH Then
-                            d = d + PULLCORE_LOCATION_MATCH_WEIGHT * _
-                                PullcoreLocationScore( _
-                                    GetPullcoreLocationCode(BomRows(rIdx(i)).Description), _
-                                    candLoc(j))
+                        If candUsed(j) = False Then
+
+                            Dim d As Double
+
+                            d = PullcoreDimDistanceScore(candL(j), candW(j), candT(j), BomRows(rIdx(i)))
+
+                            ' Steer "OD ..." rows toward OD-side parts and
+                            ' "ID ..." rows toward ID-side parts. Zero effect when
+                            ' the BOM row or the candidate has no usable location.
+                            If PULLCORE_USE_LOCATION_AWARE_MATCH Then
+                                d = d + PULLCORE_LOCATION_MATCH_WEIGHT * _
+                                    PullcoreLocationScore( _
+                                        GetPullcoreLocationCode(BomRows(rIdx(i)).Description), _
+                                        candLoc(j))
+                            End If
+
+                            If d < bestDist Then
+                                bestDist = d
+                                bestR = i
+                                bestC = j
+                            End If
+
                         End If
 
-                        If d < bestDist Then
-                            bestDist = d
-                            bestR = i
-                            bestC = j
-                        End If
+                    Next j
 
-                    End If
+                End If
 
-                Next j
+            Next i
 
-            End If
+            If bestR = 0 Or bestC = 0 Then Exit For
 
-        Next i
+            AddPullcoreMatchRow BomRows(rIdx(bestR)), candIdx(bestC), _
+                                candL(bestC), candW(bestC), candT(bestC)
 
-        If bestR = 0 Or bestC = 0 Then Exit For
+            parts(candIdx(bestC)).UsedForBomMatch = True
 
-        AddPullcoreMatchRow BomRows(rIdx(bestR)), candIdx(bestC), _
-                            candL(bestC), candW(bestC), candT(bestC)
+            rowUsed(bestR) = True
+            MarkPullcoreCandidateSlotsUsed candIdx, candN, candUsed, candIdx(bestC)
 
-        parts(candIdx(bestC)).UsedForBomMatch = True
+        Next pairStep
 
-        rowUsed(bestR) = True
-        candUsed(bestC) = True
-
-    Next pairStep
+    End If
 
     For i = 1 To rowN
         If rowUsed(i) = False Then
@@ -8594,9 +8853,9 @@ On Error GoTo ErrHandler
     If parts(cadIdx).BBoxVolume > 200# Then Exit Function
     If cadT < 0.4 Then Exit Function
 
-    If Abs(cadL - b.BomLength) > 1# Then Exit Function
-    If cadW < b.BomWidth - 0.4 Then Exit Function
-    If cadW > b.BomWidth + 1# Then Exit Function
+    If Abs(cadL - b.BomLength) > PULLCORE_L_TOL Then Exit Function
+    If Abs(cadW - b.BomWidth) > PULLCORE_W_TOL Then Exit Function
+    If Abs(cadT - b.BomThickness) > PULLCORE_T_TOL Then Exit Function
 
     IsRoughPullcoreCandidateForBom = True
 
