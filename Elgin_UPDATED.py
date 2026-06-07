@@ -12293,6 +12293,14 @@ MATCH_STUDIO_HTML = r"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>CMS Match Studio</title>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
 <style>
 :root{
   --bg:#0b1220; --panel:#111a2e; --panel2:#0f1729; --line:#22304d;
@@ -12416,6 +12424,27 @@ function scoreColor(s){var h=Math.max(0,Math.min(120,(Number(s)||0)*1.2));return
 function imgURL(job,kind){return '/api/match/image?job='+encodeURIComponent(job)+'&kind='+encodeURIComponent(kind)+'&i=0';}
 function modelURL(job,kind){return '/api/match/model?job='+encodeURIComponent(job)+'&kind='+encodeURIComponent(kind)+'&i=0';}
 function modelMetaURL(job,kind){return '/api/match/model-meta?job='+encodeURIComponent(job)+'&kind='+encodeURIComponent(kind)+'&i=0';}
+
+async function loadThreeDeps(){
+  var bases=[
+    { three:'three', orbit:'three/addons/controls/OrbitControls.js' },
+    {
+      three:'https://esm.sh/three@0.160.0',
+      orbit:'https://esm.sh/three@0.160.0/examples/jsm/controls/OrbitControls.js'
+    }
+  ];
+  var lastErr=null;
+  for(var i=0;i<bases.length;i++){
+    try{
+      var THREE=await import(bases[i].three);
+      var ocMod=await import(bases[i].orbit);
+      var OrbitControls=ocMod.OrbitControls;
+      if(!OrbitControls) throw new Error('OrbitControls missing');
+      return { THREE:THREE, OrbitControls:OrbitControls };
+    }catch(e){ lastErr=e; }
+  }
+  throw lastErr||new Error('three.js failed to load');
+}
 
 async function initOcctImportJs(){
   var bases=['https://esm.sh/occt-import-js@0.0.22','https://cdn.jsdelivr.net/npm/occt-import-js@0.0.22/dist/occt-import-js.js'];
@@ -12637,8 +12666,9 @@ async function loadMs3dOverlay(curJob, matchJob, kind, containerId){
   if(!host) return;
   try{
     var occt=await initOcctImportJs();
-    var THREE=await import('https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js');
-    var OrbitControls=(await import('https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js')).OrbitControls;
+    var threeDeps=await loadThreeDeps();
+    var THREE=threeDeps.THREE;
+    var OrbitControls=threeDeps.OrbitControls;
     async function fetchModel(job){
       var metaR=await fetch(modelMetaURL(job,kind));
       if(!metaR.ok) return null;
