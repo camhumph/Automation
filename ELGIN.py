@@ -100,9 +100,75 @@ MACHINE_RENAME_MAP = {
 
 DB_PATH = os.environ.get("ELGIN_DB_PATH", os.environ.get("NEXUS_DB_PATH", "shop_analytics_pro.db"))
 ELGIN_SIGNATURE_API_KEY = os.environ.get("ELGIN_SIGNATURE_API_KEY", "cms-signature-upload")
+ELGIN_MATCHING_SOFTWARE_DIR = os.environ.get(
+    "ELGIN_MATCHING_SOFTWARE_DIR",
+    r"\\Mycloudex2ultra\mexico\Cameron's stuff\Matching software",
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(APP_SLUG)
+
+
+# ============================================================
+# NETWORK-AWARE DATA ROOT
+# On the company Netgear Wi-Fi  -> PUBLIC share (office can see it).
+# Anywhere else                 -> PRIVATE local folder.
+# Force with ELGIN_NETWORK_MODE = auto | local | company
+# ============================================================
+ELGIN_COMPANY_SSID = os.environ.get("ELGIN_COMPANY_SSID", "NETGEAR")
+ELGIN_NETWORK_MODE = os.environ.get("ELGIN_NETWORK_MODE", "auto").strip().lower()
+ELGIN_PUBLIC_DATA_ROOT = os.environ.get(
+    "ELGIN_PUBLIC_DATA_ROOT",
+    r"\\Mycloudex2ultra\mexico\Cameron's stuff\Matching software",
+)
+ELGIN_PRIVATE_DATA_ROOT = os.environ.get(
+    "ELGIN_PRIVATE_DATA_ROOT",
+    r"C:\CMS_Local_Workspace\Matching",
+)
+
+
+def _ms_get_wifi_ssid() -> str:
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["netsh", "wlan", "show", "interfaces"],
+            capture_output=True, text=True, timeout=4,
+        ).stdout or ""
+    except Exception:
+        return ""
+    for line in out.splitlines():
+        s = line.strip()
+        if s.upper().startswith("SSID") and ":" in s:
+            return s.split(":", 1)[1].strip()
+    return ""
+
+
+def ms_on_company_network() -> bool:
+    if ELGIN_NETWORK_MODE == "local":
+        return False
+    if ELGIN_NETWORK_MODE == "company":
+        return True
+    ssid = _ms_get_wifi_ssid()
+    if ssid and ELGIN_COMPANY_SSID.upper() in ssid.upper():
+        return True
+    return False
+
+
+def resolve_cms_data_root() -> str:
+    return ELGIN_PUBLIC_DATA_ROOT if ms_on_company_network() else ELGIN_PRIVATE_DATA_ROOT
+
+
+ELGIN_CMS_ON_COMPANY = ms_on_company_network()
+if "ELGIN_MATCHING_SOFTWARE_DIR" not in os.environ:
+    ELGIN_MATCHING_SOFTWARE_DIR = resolve_cms_data_root()
+try:
+    os.makedirs(ELGIN_PRIVATE_DATA_ROOT, exist_ok=True)
+except Exception:
+    pass
+logger.info(
+    "CMS data root: %s  (network mode=%s, on_company=%s)",
+    ELGIN_MATCHING_SOFTWARE_DIR, ELGIN_NETWORK_MODE, ELGIN_CMS_ON_COMPANY,
+)
 
 HTTPS_CERT_FILE = os.environ.get("ELGIN_SSL_CERT", os.environ.get("NEXUS_SSL_CERT", ""))
 HTTPS_KEY_FILE = os.environ.get("ELGIN_SSL_KEY", os.environ.get("NEXUS_SSL_KEY", ""))
@@ -4709,6 +4775,88 @@ def compare_job_signature_to_previous(conn, job_num: str, limit: int = JOB_SIGNA
     results.sort(key=lambda x: x["score"], reverse=True)
     return results[:max(1, int(limit or JOB_SIGNATURE_DEFAULT_LIMIT))]
 
+def sync_matching_software_signatures(conn, folder: str = ELGIN_MATCHING_SOFTWARE_DIR) -> dict:
+    """
+    Import every XT_Export_Job_Signature CSV found in the shared matching folder.
+    Scans the matching root (flat files) and one level of job subfolders so
+    macro publish paths both work without manual upload.
+    """
+    result = {"folder": folder, "scanned": 0, "imported_files": 0, "imported_components": 0, "errors": []}
+    if not folder or not os.path.isdir(folder):
+        return result
+
+    seen_paths: set[str] = set()
+
+    def _job_num_from_signature_filename(name: str) -> str:
+        base = os.path.splitext(os.path.basename(name))[0]
+        m = re.search(r"job_signature[_-]?(.*)$", base, re.I)
+        if m and m.group(1):
+            return normalize_job_num(m.group(1))
+        return normalize_job_num(base.split("_")[0])
+
+    def _consider(path: str) -> None:
+        if path in seen_paths:
+            return
+        seen_paths.add(path)
+        result["scanned"] += 1
+        name = os.path.basename(path)
+        try:
+            with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
+                data = f.read()
+            fallback_job = _job_num_from_signature_filename(name)
+            rows = parse_job_signature_csv_text(data, fallback_job_num=fallback_job)
+            if not rows:
+                return
+            job_num = normalize_job_num(rows[0].get("job_num") or fallback_job)
+            if not job_num:
+                return
+            imported = upsert_job_signature_rows(conn, job_num, rows, source_file=path)
+            result["imported_files"] += 1
+            result["imported_components"] += imported
+        except Exception as exc:
+            result["errors"].append(f"{name}: {exc}")
+
+    try:
+        for name in sorted(os.listdir(folder)):
+            path = os.path.join(folder, name)
+            if os.path.isfile(path) and name.lower().endswith(".csv") and "job_signature" in name.lower():
+                _consider(path)
+            elif os.path.isdir(path):
+                try:
+                    for fn in sorted(os.listdir(path)):
+                        if not fn.lower().endswith(".csv") or "job_signature" not in fn.lower():
+                            continue
+                        sub_path = os.path.join(path, fn)
+                        if os.path.isfile(sub_path):
+                            _consider(sub_path)
+                except Exception as exc:
+                    result["errors"].append(f"{name}/: {exc}")
+    except Exception as exc:
+        result["errors"].append(str(exc))
+    return result
+
+
+def recent_signature_match_summaries(conn, limit: int = 8) -> list[dict]:
+    jobs = _rowdicts(conn.execute("""
+        SELECT job_num, MAX(imported_at) AS imported_at
+        FROM job_signature_components
+        GROUP BY job_num
+        ORDER BY imported_at DESC
+        LIMIT ?
+    """, (max(1, int(limit or 8)),)))
+    out = []
+    for row in jobs:
+        job_num = normalize_job_num(row.get("job_num") or "")
+        if not job_num:
+            continue
+        matches = compare_job_signature_to_previous(conn, job_num, limit=3)
+        out.append({
+            "job_num": job_num,
+            "imported_at": row.get("imported_at") or "",
+            "matches": matches,
+        })
+    return out
+
 def job_family_root(conn, job_num: str) -> str:
     """
     Returns the physical/matched family root.
@@ -8694,6 +8842,11 @@ async def get_dashboard(request: Request):
 
         machines_out = safe_machine_public_state(tool_catalog)
 
+        signature_sync = sync_matching_software_signatures(conn)
+        signature_recent_matches = recent_signature_match_summaries(conn)
+        conn.commit()
+
+
         network_info = {
             "app_name": APP_NAME,
             "short_name": APP_SHORT_NAME,
@@ -8723,6 +8876,8 @@ async def get_dashboard(request: Request):
             "job_status_log": job_status_log,
             "catalog": catalog,
             "match_history": match_history,
+            "signature_sync": signature_sync,
+            "signature_recent_matches": signature_recent_matches,
             "shop_board_rows": shop_board_rows,
             "eff_day": merge_efficiency_rows(eff_day, "day") if admin_ok else [],
             "eff_month": merge_efficiency_rows(eff_month, "month") if admin_ok else [],
@@ -11551,6 +11706,679 @@ safeBind('corner-admin-pass','keydown',e=>{if(e.key==='Enter')cornerAdminLogin()
 @app.get("/")
 async def root():
     return HTMLResponse(HTML)
+
+
+# ============================================================
+# MATCH STUDIO  (added integration)
+# Beautiful job-matching workspace: matching list, holder JPG
+# overlay compare, quote estimate, steel/quote sheet links, and
+# one-click "order steel" email. Reuses the existing matching
+# engine, job_series financials and steel_sheet_items.
+# ============================================================
+
+import urllib.parse as _ms_urlparse
+
+# ---- Match Studio configuration (override via environment) ----
+ELGIN_STEEL_VENDOR_EMAIL = os.environ.get("ELGIN_STEEL_VENDOR_EMAIL", "steel-vendor@example.com")
+ELGIN_STEEL_PRICE_PER_LB = float(os.environ.get("ELGIN_STEEL_PRICE_PER_LB", "1.50"))
+ELGIN_STEEL_DENSITY_LB_IN3 = float(os.environ.get("ELGIN_STEEL_DENSITY_LB_IN3", "0.283"))
+ELGIN_PULLCORE_RATE = float(os.environ.get("ELGIN_PULLCORE_RATE", "77.98"))
+ELGIN_JOB_IMAGE_DIRS = [
+    p.strip() for p in os.environ.get("ELGIN_JOB_IMAGE_DIRS", ELGIN_MATCHING_SOFTWARE_DIR).split(";") if p.strip()
+]
+ELGIN_QUOTE_SHEET_DIRS = [
+    p.strip() for p in os.environ.get("ELGIN_QUOTE_SHEET_DIRS", ELGIN_MATCHING_SOFTWARE_DIR).split(";") if p.strip()
+]
+_MS_IMG_EXTS = (".jpg", ".jpeg", ".png", ".gif", ".webp")
+_MS_SHEET_EXTS = (".xls", ".xlsx", ".xlsm", ".pdf")
+_ms_img_cache = {}
+
+
+def ms_fmt_num(v) -> str:
+    try:
+        f = float(v)
+    except Exception:
+        return str(v)
+    if abs(f - round(f)) < 1e-6:
+        return str(int(round(f)))
+    return ("%.3f" % f).rstrip("0").rstrip(".")
+
+
+def ms_classify_image(fn: str) -> str:
+    u = fn.upper()
+    if "HOLDER" in u and ("OD" in u or "BOT" in u):
+        return "OD HOLDER"
+    if "HOLDER" in u and ("ID" in u or "TOP" in u):
+        return "ID HOLDER"
+    if "HOLDER" in u:
+        return "ID HOLDER"
+    if "POT" in u and ("OD" in u or "BOT" in u):
+        return "OD POT"
+    if "POT" in u and ("ID" in u or "TOP" in u):
+        return "ID POT"
+    if "TCP" in u or "TOP CLAMP" in u:
+        return "TCP"
+    if "BCP" in u or "BOTTOM CLAMP" in u:
+        return "BCP"
+    if "BACK" in u and "ISO" in u:
+        return "BACK ISO"
+    if "ISO" in u:
+        return "ISO"
+    return "OTHER"
+
+
+def ms_find_job_images(job_num: str):
+    j = normalize_job_num(job_num) or (job_num or "")
+    key = j.upper()
+    now = time.time()
+    cached = _ms_img_cache.get(key)
+    if cached and (now - cached[0]) < 30:
+        return cached[1]
+
+    jnorm = re.sub(r"[^A-Z0-9]", "", key)
+    found = []
+    seen = set()
+    if jnorm:
+        for base in ELGIN_JOB_IMAGE_DIRS:
+            if not base or not os.path.isdir(base):
+                continue
+            scanned = 0
+            for root, dirs, files in os.walk(base):
+                depth = root[len(base):].count(os.sep)
+                if depth > 4:
+                    dirs[:] = []
+                    continue
+                for fn in files:
+                    ext = os.path.splitext(fn)[1].lower()
+                    if ext not in _MS_IMG_EXTS:
+                        continue
+                    fnnorm = re.sub(r"[^A-Z0-9]", "", fn.upper())
+                    if jnorm in fnnorm:
+                        full = os.path.join(root, fn)
+                        if full in seen:
+                            continue
+                        seen.add(full)
+                        found.append({"kind": ms_classify_image(fn), "label": fn, "path": full})
+                    scanned += 1
+                    if scanned > 8000:
+                        break
+                if scanned > 8000:
+                    break
+
+    order = {"ID HOLDER": 0, "OD HOLDER": 1, "ID POT": 2, "OD POT": 3,
+             "TCP": 4, "BCP": 5, "ISO": 6, "BACK ISO": 7, "OTHER": 9}
+    found.sort(key=lambda x: (order.get(x["kind"], 8), x["label"]))
+    _ms_img_cache[key] = (now, found)
+    return found
+
+
+def ms_locate_sheet(j: str, kind: str) -> str:
+    j = normalize_job_num(j) or (j or "")
+    jnorm = re.sub(r"[^A-Z0-9]", "", j.upper())
+    if kind == "steel":
+        try:
+            with db_lock, sqlite3.connect(DB_PATH) as conn:
+                r = conn.execute("SELECT steel_sheet_file FROM job_series WHERE job_num=?", (j,)).fetchone()
+            if r and r[0]:
+                cand = os.path.join(STEEL_UPLOAD_DIR, r[0])
+                if os.path.isfile(cand):
+                    return cand
+        except Exception:
+            pass
+        keywords = ("STEEL", "J000")
+    else:
+        keywords = ("QUOTE", "GRINDING")
+
+    if not jnorm:
+        return ""
+    for base in ELGIN_QUOTE_SHEET_DIRS:
+        if not base or not os.path.isdir(base):
+            continue
+        scanned = 0
+        for root, dirs, files in os.walk(base):
+            depth = root[len(base):].count(os.sep)
+            if depth > 4:
+                dirs[:] = []
+                continue
+            for fn in files:
+                ext = os.path.splitext(fn)[1].lower()
+                if ext not in _MS_SHEET_EXTS:
+                    continue
+                up = fn.upper()
+                fnnorm = re.sub(r"[^A-Z0-9]", "", up)
+                if jnorm in fnnorm and any(k in up for k in keywords):
+                    return os.path.join(root, fn)
+                scanned += 1
+                if scanned > 8000:
+                    break
+            if scanned > 8000:
+                break
+    return ""
+
+
+def ms_estimate(conn, j: str) -> dict:
+    items = _rowdicts(conn.execute("SELECT * FROM steel_sheet_items WHERE job_num=?", (j,)))
+    steel_vol = 0.0
+    pc_vol = 0.0
+    for it in items:
+        try:
+            d1 = float(it.get("dim_1") or 0)
+            d2 = float(it.get("dim_2") or 0)
+            d3 = float(it.get("dim_3") or 0)
+            q = float(it.get("qty") or 0) or 1.0
+        except Exception:
+            continue
+        v = d1 * d2 * d3 * q
+        if v <= 0:
+            continue
+        nm = (it.get("item_name") or "").upper()
+        if "CAM" in nm or "KEY" in nm:
+            pc_vol += v
+        else:
+            steel_vol += v
+
+    weight = steel_vol * ELGIN_STEEL_DENSITY_LB_IN3
+    steel_mat = weight * ELGIN_STEEL_PRICE_PER_LB
+    pc_price = pc_vol * ELGIN_PULLCORE_RATE
+
+    js = conn.execute(
+        "SELECT revenue, grinding_cost, status, due_date FROM job_series WHERE job_num=?", (j,)
+    ).fetchone()
+    revenue = _money(js["revenue"]) if js and js["revenue"] is not None else 0.0
+    grinding = _money(js["grinding_cost"]) if js and js["grinding_cost"] is not None else 0.0
+
+    fin = compute_job_financial(conn, j) or {}
+    labor_cost = float(fin.get("labor_cost") or 0.0)
+
+    computed = round(steel_mat + pc_price + grinding + labor_cost, 2)
+    suggested = revenue if revenue > 0 else computed
+
+    return {
+        "revenue": round(revenue, 2),
+        "suggested_estimate": round(suggested, 2),
+        "computed_estimate": computed,
+        "steel_volume_cuin": round(steel_vol, 2),
+        "steel_weight_lb": round(weight, 2),
+        "steel_material_est": round(steel_mat, 2),
+        "price_per_lb": ELGIN_STEEL_PRICE_PER_LB,
+        "pullcore_volume_cuin": round(pc_vol, 2),
+        "pullcore_est": round(pc_price, 2),
+        "pullcore_rate": ELGIN_PULLCORE_RATE,
+        "grinding_cost": round(grinding, 2),
+        "labor_cost": round(labor_cost, 2),
+        "total_cost": float(fin.get("total_cost") or 0.0),
+        "profit": float(fin.get("profit") or 0.0),
+        "margin_pct": float(fin.get("margin_pct") or 0.0),
+        "item_count": len(items),
+        "status": (js["status"] if js else "") or "",
+        "due_date": (js["due_date"] if js else "") or "",
+    }
+
+
+def ms_order_email(conn, j: str) -> dict:
+    items = _rowdicts(conn.execute("SELECT * FROM steel_sheet_items WHERE job_num=? ORDER BY id", (j,)))
+    lines = []
+    for it in items:
+        q = it.get("qty") or 0
+        nm = it.get("item_name") or ""
+        dims = " x ".join(
+            ms_fmt_num(d) for d in (it.get("dim_1"), it.get("dim_2"), it.get("dim_3"))
+            if (float(d or 0) > 0)
+        )
+        mat = it.get("material") or ""
+        line = ms_fmt_num(q) + " pc  " + str(nm).strip()
+        if dims:
+            line += "   " + dims
+        if mat:
+            line += "   [" + str(mat).strip() + "]"
+        lines.append(line.strip())
+
+    body = (
+        "Hello,\n\nPlease quote / supply the following steel for Job " + j + ":\n\n"
+        + ("\n".join(lines) if lines else "(No parsed steel items are on file for this job yet.)")
+        + "\n\nPlease confirm pricing and lead time.\n\nThank you,\nElgin Custom Mold Services"
+    )
+    subject = "Steel Order - Job " + j
+    to = ELGIN_STEEL_VENDOR_EMAIL
+    mailto = (
+        "mailto:" + _ms_urlparse.quote(to)
+        + "?subject=" + _ms_urlparse.quote(subject)
+        + "&body=" + _ms_urlparse.quote(body)
+    )
+    return {"to": to, "subject": subject, "body": body, "mailto": mailto, "item_count": len(items)}
+
+
+# ---------------- Match Studio API ----------------
+@app.get("/api/match/overview")
+async def ms_overview(limit: int = 80):
+    with db_lock, sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        try:
+            sync_matching_software_signatures(conn)
+        except Exception:
+            pass
+        jobs = _rowdicts(conn.execute(
+            """SELECT job_num, MAX(imported_at) AS imported_at
+               FROM job_signature_components
+               GROUP BY job_num ORDER BY imported_at DESC LIMIT ?""",
+            (max(1, int(limit)),),
+        ))
+        out = []
+        for jr in jobs:
+            j = normalize_job_num(jr.get("job_num") or "")
+            if not j:
+                continue
+            best_list = compare_job_signature_to_previous(conn, j, limit=1)
+            best = best_list[0] if best_list else None
+            est = ms_estimate(conn, j)
+            out.append({
+                "job_num": j,
+                "best_match": (best or {}).get("job_num", ""),
+                "best_score": (best or {}).get("score", 0),
+                "matched_components": (best or {}).get("matched_components", 0),
+                "revenue": est.get("revenue", 0),
+                "suggested_estimate": est.get("suggested_estimate", 0),
+                "steel_material_est": est.get("steel_material_est", 0),
+                "status": est.get("status", ""),
+                "due_date": est.get("due_date", ""),
+            })
+    return {"jobs": out, "count": len(out)}
+
+
+@app.get("/api/match/job/{job_num}")
+async def ms_job(job_num: str, limit: int = 12):
+    j = normalize_job_num(job_num)
+    if not j:
+        raise HTTPException(400, "Job number required")
+    with db_lock, sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        try:
+            sync_matching_software_signatures(conn)
+        except Exception:
+            pass
+        current = load_job_signature(conn, j)
+        matches = compare_job_signature_to_previous(conn, j, limit=limit)
+        est = ms_estimate(conn, j)
+        email = ms_order_email(conn, j)
+    return {
+        "job_num": j,
+        "has_signature": bool(current),
+        "signature_components": sorted(current.keys()),
+        "components": JOB_SIGNATURE_COMPONENTS,
+        "matches": matches,
+        "estimate": est,
+        "order_email": email,
+        "sheets": {
+            "steel": bool(ms_locate_sheet(j, "steel")),
+            "quote": bool(ms_locate_sheet(j, "quote")),
+        },
+    }
+
+
+@app.get("/api/match/images/{job_num}")
+async def ms_images_list(job_num: str):
+    imgs = ms_find_job_images(job_num)
+    out = []
+    bykind = {}
+    for x in imgs:
+        k = x["kind"]
+        idx = bykind.get(k, 0)
+        out.append({"kind": k, "label": x["label"], "index": idx})
+        bykind[k] = idx + 1
+    return {"job_num": normalize_job_num(job_num), "images": out, "count": len(imgs)}
+
+
+@app.get("/api/match/image")
+async def ms_image(job: str, kind: str = "", i: int = 0):
+    from fastapi.responses import FileResponse
+    imgs = ms_find_job_images(job)
+    if kind:
+        filtered = [x for x in imgs if x["kind"] == kind]
+        if filtered:
+            imgs = filtered
+    if not imgs:
+        raise HTTPException(404, "No image found for this job")
+    idx = max(0, min(int(i), len(imgs) - 1))
+    path = imgs[idx]["path"]
+    if not os.path.isfile(path):
+        raise HTTPException(404, "Image file missing")
+    return FileResponse(path)
+
+
+@app.get("/api/match/file")
+async def ms_file(job: str, kind: str = "steel"):
+    from fastapi.responses import FileResponse
+    path = ms_locate_sheet(job, kind)
+    if not path or not os.path.isfile(path):
+        raise HTTPException(404, "Sheet not found for this job")
+    return FileResponse(path, filename=os.path.basename(path))
+
+
+@app.get("/api/match/order-email/{job_num}")
+async def ms_order_email_route(job_num: str):
+    j = normalize_job_num(job_num)
+    if not j:
+        raise HTTPException(400, "Job number required")
+    with db_lock, sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        return ms_order_email(conn, j)
+
+
+@app.get("/match-studio")
+async def ms_page():
+    return HTMLResponse(MATCH_STUDIO_HTML)
+
+
+MATCH_STUDIO_NAV_INJECT = """
+<script>
+(function(){
+  if (document.getElementById('cms-match-studio-fab')) return;
+  var a = document.createElement('a');
+  a.id = 'cms-match-studio-fab';
+  a.href = '/match-studio';
+  a.title = 'Open Match Studio';
+  a.textContent = '\\u2316 Match Studio';
+  a.style.cssText = 'position:fixed;right:18px;bottom:18px;z-index:99999;background:linear-gradient(135deg,#2563eb,#1e40af);color:#fff;padding:12px 18px;border-radius:999px;font:600 14px system-ui,-apple-system,sans-serif;box-shadow:0 8px 24px rgba(30,64,175,.45);text-decoration:none;letter-spacing:.2px;';
+  if (document.body) document.body.appendChild(a);
+})();
+</script>
+"""
+
+
+MATCH_STUDIO_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CMS Match Studio</title>
+<style>
+:root{
+  --bg:#0b1220; --panel:#111a2e; --panel2:#0f1729; --line:#22304d;
+  --ink:#e8eefc; --muted:#8aa0c6; --accent:#3b82f6; --accent2:#1e40af;
+  --good:#22c55e; --warn:#f59e0b; --bad:#ef4444; --chip:#16223c;
+}
+*{box-sizing:border-box}
+body{margin:0;background:radial-gradient(1200px 600px at 80% -10%,#16223f 0%,var(--bg) 55%);color:var(--ink);font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+a{color:var(--accent);text-decoration:none}
+.top{display:flex;align-items:center;gap:18px;padding:14px 22px;border-bottom:1px solid var(--line);background:rgba(10,16,30,.7);backdrop-filter:blur(8px);position:sticky;top:0;z-index:10}
+.brand{font-weight:800;font-size:18px;letter-spacing:.3px;display:flex;align-items:center;gap:10px}
+.brand .dot{width:11px;height:11px;border-radius:3px;background:linear-gradient(135deg,var(--accent),var(--accent2));box-shadow:0 0 14px var(--accent)}
+.top .sub{color:var(--muted);font-size:12px}
+.spacer{flex:1}
+.search{display:flex;gap:8px;align-items:center}
+.search input{background:var(--panel2);border:1px solid var(--line);color:var(--ink);padding:9px 12px;border-radius:9px;width:170px;outline:none}
+.btn{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff;border:0;padding:9px 14px;border-radius:9px;font-weight:600;cursor:pointer}
+.btn.ghost{background:var(--chip);border:1px solid var(--line);color:var(--ink)}
+.btn.ghost:hover{border-color:var(--accent)}
+.btn:disabled{opacity:.4;cursor:not-allowed}
+.wrap{display:grid;grid-template-columns:340px 1fr;gap:18px;padding:18px;max-width:1500px;margin:0 auto}
+.side{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:14px;height:calc(100vh - 110px);overflow:auto;position:sticky;top:86px}
+.side h3{margin:2px 0 10px;font-size:13px;text-transform:uppercase;letter-spacing:.8px;color:var(--muted)}
+.filter{width:100%;background:var(--panel2);border:1px solid var(--line);color:var(--ink);padding:9px 11px;border-radius:9px;margin-bottom:10px;outline:none}
+.jobcard{border:1px solid var(--line);background:var(--panel2);border-radius:11px;padding:11px 12px;margin-bottom:9px;cursor:pointer;transition:.15s}
+.jobcard:hover{border-color:var(--accent);transform:translateY(-1px)}
+.jobcard.active{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent) inset}
+.jobcard .jn{font-weight:700;font-size:15px}
+.jobcard .row{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-top:6px;font-size:12px;color:var(--muted)}
+.bar{height:7px;border-radius:6px;background:#1b2741;overflow:hidden;margin-top:7px}
+.bar > i{display:block;height:100%;border-radius:6px}
+.pill{padding:2px 8px;border-radius:999px;background:var(--chip);border:1px solid var(--line);font-size:11px;color:var(--ink)}
+.main{min-width:0}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:18px;margin-bottom:16px}
+.card h2{margin:0 0 4px;font-size:18px}
+.muted{color:var(--muted)}
+.empty{display:flex;align-items:center;justify-content:center;height:60vh;color:var(--muted);text-align:center;flex-direction:column;gap:8px}
+.estgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-top:14px}
+.kpi{background:var(--panel2);border:1px solid var(--line);border-radius:11px;padding:12px 14px}
+.kpi .lbl{font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:var(--muted)}
+.kpi .val{font-size:20px;font-weight:800;margin-top:3px}
+.kpi.big .val{font-size:30px}
+.kpi.big{background:linear-gradient(135deg,#16223f,#101a30);border-color:#2a3c63}
+.actions{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:6px}
+select.dd{background:var(--panel2);border:1px solid var(--line);color:var(--ink);padding:9px 12px;border-radius:9px;outline:none}
+.matchrow{display:flex;align-items:center;gap:12px;padding:11px 12px;border:1px solid var(--line);background:var(--panel2);border-radius:11px;margin-bottom:9px;cursor:pointer;transition:.15s}
+.matchrow:hover{border-color:var(--accent)}
+.matchrow.active{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent) inset}
+.matchrow .jn{font-weight:700;min-width:90px}
+.matchrow .grow{flex:1}
+.scorebadge{font-weight:800;min-width:58px;text-align:right}
+.tbl{width:100%;border-collapse:collapse;margin-top:6px}
+.tbl th,.tbl td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);font-size:13px}
+.tbl th{color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.5px}
+.simbar{height:8px;border-radius:6px;background:#1b2741;overflow:hidden;min-width:90px}
+.simbar > i{display:block;height:100%}
+.cmpbar{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0}
+.chipbtn{padding:7px 12px;border-radius:9px;border:1px solid var(--line);background:var(--panel2);color:var(--ink);cursor:pointer;font-size:12px}
+.chipbtn.active{background:var(--accent);border-color:var(--accent);color:#fff}
+.ovstage{display:grid;grid-template-columns:1fr;gap:14px}
+.ovwrap{position:relative;width:100%;max-width:680px;margin:0 auto;border:1px solid var(--line);border-radius:12px;background:#0a101e;min-height:240px;display:flex;align-items:center;justify-content:center;overflow:hidden}
+.ovimg{max-width:100%;display:block}
+.ovtop{position:absolute;inset:0;margin:auto;max-width:100%;max-height:100%;mix-blend-mode:normal}
+.sbs{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.imgbox{border:1px solid var(--line);border-radius:12px;background:#0a101e;min-height:220px;display:flex;flex-direction:column}
+.imgbox .cap{padding:8px 12px;border-bottom:1px solid var(--line);font-size:12px;color:var(--muted);display:flex;justify-content:space-between}
+.imgbox .body{flex:1;display:flex;align-items:center;justify-content:center;padding:8px}
+.imgbox img{max-width:100%;max-height:360px}
+.ph{color:#56678c;font-size:13px;text-align:center;padding:30px}
+.slider{display:flex;align-items:center;gap:12px;max-width:680px;margin:12px auto 0}
+.slider input{flex:1}
+.toggle{display:flex;gap:6px}
+.legend{font-size:11px;color:var(--muted);margin-top:8px}
+.note{font-size:12px;color:var(--muted);margin-top:8px}
+code{background:#0a101e;border:1px solid var(--line);padding:1px 6px;border-radius:6px}
+</style>
+</head>
+<body>
+<div class="top">
+  <div class="brand"><span class="dot"></span> CMS Match Studio</div>
+  <div class="sub">job matching &middot; holder overlay &middot; quote estimate &middot; steel order</div>
+  <div class="spacer"></div>
+  <div class="search">
+    <input id="jobInput" placeholder="Job # (e.g. C18488)" onkeydown="if(event.key==='Enter')openJob(this.value)">
+    <button class="btn" onclick="openJob(document.getElementById('jobInput').value)">Open</button>
+  </div>
+  <a class="btn ghost" href="/">&larr; App</a>
+</div>
+
+<div class="wrap">
+  <div class="side">
+    <h3>Matching List</h3>
+    <input class="filter" id="listFilter" placeholder="Filter jobs..." oninput="renderList()">
+    <div id="jobList"><div class="muted">Loading…</div></div>
+  </div>
+  <div class="main" id="main">
+    <div class="empty">
+      <div style="font-size:40px">&#9166;</div>
+      <div>Pick a job from the matching list, or search a job number above.</div>
+    </div>
+  </div>
+</div>
+
+<script>
+var STATE={jobs:[],job:null,data:null,match:null,cmpKind:'ID HOLDER',cmpMode:'overlay',imgCur:{},imgMatch:{}};
+var COMPONENTS=['TCP','BCP','ID HOLDER','OD HOLDER','ID POT','OD POT'];
+
+function api(p){return fetch(p).then(function(r){if(!r.ok)throw new Error(r.status);return r.json();});}
+function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
+function money(v){var n=Number(v||0);return '$'+n.toLocaleString(undefined,{minimumFractionDigits:0,maximumFractionDigits:0});}
+function money2(v){var n=Number(v||0);return '$'+n.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});}
+function scoreColor(s){var h=Math.max(0,Math.min(120,(Number(s)||0)*1.2));return 'hsl('+h+',75%,52%)';}
+function imgURL(job,kind){return '/api/match/image?job='+encodeURIComponent(job)+'&kind='+encodeURIComponent(kind)+'&i=0';}
+
+function loadOverview(){
+  api('/api/match/overview?limit=120').then(function(d){
+    STATE.jobs=d.jobs||[];renderList();
+  }).catch(function(){document.getElementById('jobList').innerHTML='<div class="muted">No signatures imported yet.</div>';});
+}
+
+function renderList(){
+  var f=(document.getElementById('listFilter').value||'').toUpperCase();
+  var host=document.getElementById('jobList');
+  var rows=STATE.jobs.filter(function(j){return !f||j.job_num.toUpperCase().indexOf(f)>=0||(j.best_match||'').toUpperCase().indexOf(f)>=0;});
+  if(!rows.length){host.innerHTML='<div class="muted">No matching jobs.</div>';return;}
+  host.innerHTML=rows.map(function(j){
+    var sc=Number(j.best_score||0);
+    var est=j.suggested_estimate||j.steel_material_est||0;
+    return '<div class="jobcard'+(STATE.job===j.job_num?' active':'')+'" onclick="openJob(\''+esc(j.job_num)+'\')">'
+      +'<div class="jn">'+esc(j.job_num)+'</div>'
+      +'<div class="row"><span>'+(j.best_match?('best: '+esc(j.best_match)):'no match')+'</span><span class="pill">'+(est?money(est):'--')+'</span></div>'
+      +(j.best_match?('<div class="bar"><i style="width:'+sc+'%;background:'+scoreColor(sc)+'"></i></div>'):'')
+      +'</div>';
+  }).join('');
+}
+
+function openJob(job){
+  job=(job||'').trim();if(!job)return;
+  STATE.job=job;STATE.match=null;STATE.data=null;renderList();
+  document.getElementById('main').innerHTML='<div class="empty">Loading '+esc(job)+'…</div>';
+  api('/api/match/job/'+encodeURIComponent(job)).then(function(d){
+    STATE.data=d;STATE.job=d.job_num;renderJob();renderList();
+  }).catch(function(){document.getElementById('main').innerHTML='<div class="empty">Could not load '+esc(job)+'.</div>';});
+}
+
+function renderJob(){
+  var d=STATE.data,e=d.estimate||{};
+  var sig=d.has_signature?'<span class="pill" style="border-color:#2b6">&#10003; signature ('+d.signature_components.length+'/'+COMPONENTS.length+')</span>':'<span class="pill" style="border-color:#a55">no signature</span>';
+  var quoted=e.revenue>0;
+  var html=''
+  +'<div class="card">'
+    +'<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap">'
+      +'<div><h2>Job '+esc(d.job_num)+'</h2><div class="muted">'+(e.status?esc(e.status):'')+(e.due_date?(' &middot; due '+esc(e.due_date)):'')+'</div></div>'
+      +'<div>'+sig+'</div>'
+    +'</div>'
+    +'<div class="estgrid">'
+      +'<div class="kpi big"><div class="lbl">'+(quoted?'Quoted price':'Estimated price')+'</div><div class="val">'+money(e.suggested_estimate)+'</div></div>'
+      +'<div class="kpi"><div class="lbl">Steel material</div><div class="val">'+money(e.steel_material_est)+'</div><div class="muted" style="font-size:11px">'+ (e.steel_weight_lb||0)+' lb @ $'+e.price_per_lb+'/lb</div></div>'
+      +'<div class="kpi"><div class="lbl">Pull cores</div><div class="val">'+money(e.pullcore_est)+'</div><div class="muted" style="font-size:11px">'+(e.pullcore_volume_cuin||0)+' in&sup3;</div></div>'
+      +'<div class="kpi"><div class="lbl">Total cost</div><div class="val">'+money(e.total_cost)+'</div></div>'
+      +'<div class="kpi"><div class="lbl">Profit</div><div class="val" style="color:'+((e.profit||0)>=0?'var(--good)':'var(--bad)')+'">'+money(e.profit)+'</div><div class="muted" style="font-size:11px">'+(e.margin_pct||0)+'% margin</div></div>'
+    +'</div>'
+    +'<div class="actions" style="margin-top:14px">'
+      +'<select class="dd" id="sheetDD"><option value="">Open a sheet…</option>'
+        +'<option value="steel"'+(d.sheets.steel?'':' disabled')+'>Steel Order Sheet'+(d.sheets.steel?'':' (not found)')+'</option>'
+        +'<option value="quote"'+(d.sheets.quote?'':' disabled')+'>Quote / Steel-Grinding Sheet'+(d.sheets.quote?'':' (not found)')+'</option>'
+      +'</select>'
+      +'<button class="btn ghost" onclick="openSheet()">Open</button>'
+      +'<button class="btn" onclick="orderSteel()">&#9993; Order Steel</button>'
+      +'<button class="btn ghost" onclick="copyEmail()">Copy email</button>'
+      +'<span class="note" id="actNote"></span>'
+    +'</div>'
+    +(quoted?'':'<div class="note">No quote saved on this job &mdash; showing a material-based estimate (steel + pull cores + grinding + labor). Set $/lb via <code>ELGIN_STEEL_PRICE_PER_LB</code>.</div>')
+  +'</div>';
+
+  // matches
+  html+='<div class="card"><h2>Job Matches</h2><div class="muted">Ranked by signature similarity. Click one to compare holders.</div><div id="matchList" style="margin-top:12px"></div></div>';
+  html+='<div id="compareHost"></div>';
+  document.getElementById('main').innerHTML=html;
+  renderMatches();
+}
+
+function renderMatches(){
+  var ms=STATE.data.matches||[];
+  var host=document.getElementById('matchList');
+  if(!ms.length){host.innerHTML='<div class="muted">No previous jobs to compare against yet.</div>';return;}
+  host.innerHTML=ms.map(function(m){
+    var sc=Number(m.score||0);
+    return '<div class="matchrow'+(STATE.match===m.job_num?' active':'')+'" onclick="selectMatch(\''+esc(m.job_num)+'\')">'
+      +'<div class="jn">'+esc(m.job_num)+'</div>'
+      +'<div class="grow"><div class="bar"><i style="width:'+sc+'%;background:'+scoreColor(sc)+'"></i></div>'
+      +'<div class="muted" style="font-size:11px;margin-top:4px">'+m.matched_components+'/'+COMPONENTS.length+' parts &middot; '+m.coverage_pct+'% coverage</div></div>'
+      +'<div class="scorebadge" style="color:'+scoreColor(sc)+'">'+sc.toFixed(0)+'%</div>'
+      +'</div>';
+  }).join('');
+}
+
+function selectMatch(mj){
+  STATE.match=mj;renderMatches();
+  var m=(STATE.data.matches||[]).filter(function(x){return x.job_num===mj;})[0];
+  if(!m)return;
+  // pick default compare component that has data
+  var comps=m.components||[];
+  var have=comps.map(function(c){return c.component_role;});
+  if(have.indexOf(STATE.cmpKind)<0)STATE.cmpKind=have.indexOf('ID HOLDER')>=0?'ID HOLDER':(have[0]||'ID HOLDER');
+  renderCompare(m);
+}
+
+function renderCompare(m){
+  var rows=(m.components||[]).slice().sort(function(a,b){return COMPONENTS.indexOf(a.component_role)-COMPONENTS.indexOf(b.component_role);});
+  var tbl='<table class="tbl"><thead><tr><th>Component</th><th>Similarity</th><th>Size &Delta;</th><th>Mass &Delta;</th><th>COG dist</th></tr></thead><tbody>';
+  rows.forEach(function(c){
+    var s=Number(c.similarity||0);
+    tbl+='<tr><td><b>'+esc(c.component_role)+'</b></td>'
+      +'<td><div style="display:flex;align-items:center;gap:8px"><div class="simbar"><i style="width:'+s+'%;background:'+scoreColor(s)+'"></i></div><span>'+s.toFixed(1)+'%</span></div></td>'
+      +'<td>'+(c.size_diff_pct)+'%</td><td>'+(c.mass_diff_pct)+'%</td><td>'+(c.center_distance_in)+'"</td></tr>';
+  });
+  tbl+='</tbody></table>';
+
+  var chips=COMPONENTS.map(function(k){
+    return '<button class="chipbtn'+(STATE.cmpKind===k?' active':'')+'" onclick="setCmpKind(\''+k+'\')">'+k+'</button>';
+  }).join('');
+
+  var html='<div class="card"><div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">'
+    +'<h2>Compare: '+esc(STATE.job)+' vs '+esc(m.job_num)+'</h2>'
+    +'<div class="toggle"><button class="chipbtn'+(STATE.cmpMode==='overlay'?' active':'')+'" onclick="setCmpMode(\'overlay\')">Overlay</button>'
+    +'<button class="chipbtn'+(STATE.cmpMode==='sbs'?' active':'')+'" onclick="setCmpMode(\'sbs\')">Side by side</button></div></div>'
+    +tbl
+    +'<div style="margin-top:16px"><div class="muted" style="font-size:12px;text-transform:uppercase;letter-spacing:.6px;margin-bottom:8px">Holder / plate overlay</div>'
+    +'<div class="cmpbar">'+chips+'</div>'
+    +'<div id="ovStage"></div></div></div>';
+  document.getElementById('compareHost').innerHTML=html;
+  renderOverlay(m);
+}
+
+function setCmpKind(k){STATE.cmpKind=k;var m=curMatch();if(m){renderCompare(m);}}
+function setCmpMode(md){STATE.cmpMode=md;var m=curMatch();if(m){renderOverlay(m);document.querySelectorAll('.toggle .chipbtn').forEach(function(b){b.classList.toggle('active',b.textContent.toLowerCase().indexOf(md==='sbs'?'side':'overlay')>=0);});}}
+function curMatch(){return (STATE.data.matches||[]).filter(function(x){return x.job_num===STATE.match;})[0];}
+
+function imgTag(job,kind,cls){
+  var u=imgURL(job,kind);
+  return '<img class="'+cls+'" src="'+u+'" onerror="this.style.display=\'none\';this.parentNode.querySelector(\'.ph\')&&(this.parentNode.querySelector(\'.ph\').style.display=\'block\')">';
+}
+
+function renderOverlay(m){
+  var k=STATE.cmpKind, stage=document.getElementById('ovStage');
+  if(STATE.cmpMode==='sbs'){
+    stage.innerHTML='<div class="sbs">'
+      +'<div class="imgbox"><div class="cap"><span>'+esc(STATE.job)+' (current)</span><span>'+esc(k)+'</span></div><div class="body">'+imgTag(STATE.job,k,'')+'<div class="ph" style="display:none">no '+esc(k)+' image</div></div></div>'
+      +'<div class="imgbox"><div class="cap"><span>'+esc(m.job_num)+' (match)</span><span>'+esc(k)+'</span></div><div class="body">'+imgTag(m.job_num,k,'')+'<div class="ph" style="display:none">no '+esc(k)+' image</div></div></div>'
+      +'</div>';
+  }else{
+    stage.innerHTML='<div class="ovstage">'
+      +'<div class="ovwrap">'
+        +'<img class="ovimg" src="'+imgURL(m.job_num,k)+'" onerror="this.style.visibility=\'hidden\'">'
+        +'<img class="ovimg ovtop" id="ovTop" src="'+imgURL(STATE.job,k)+'" style="opacity:.5" onerror="this.style.visibility=\'hidden\'">'
+        +'<div class="ph" id="ovPh" style="position:absolute">'+esc(k)+' images load here when present</div>'
+      +'</div>'
+      +'<div class="slider"><span class="muted">'+esc(m.job_num)+'</span>'
+        +'<input type="range" min="0" max="100" value="50" oninput="document.getElementById(\'ovTop\').style.opacity=this.value/100">'
+        +'<span class="muted">'+esc(STATE.job)+'</span></div>'
+      +'<div class="legend">Slide to fade between the matched holder (left) and the current holder (right) to judge similarity.</div>'
+    +'</div>';
+  }
+}
+
+function openSheet(){
+  var k=document.getElementById('sheetDD').value;if(!k)return;
+  window.open('/api/match/file?job='+encodeURIComponent(STATE.job)+'&kind='+k,'_blank');
+}
+function orderSteel(){
+  var em=(STATE.data&&STATE.data.order_email)||{};
+  if(!em.mailto){note('No email available');return;}
+  note('Opening your email app…');
+  window.location.href=em.mailto;
+}
+function copyEmail(){
+  var em=(STATE.data&&STATE.data.order_email)||{};
+  var txt='To: '+(em.to||'')+'\nSubject: '+(em.subject||'')+'\n\n'+(em.body||'');
+  if(navigator.clipboard){navigator.clipboard.writeText(txt).then(function(){note('Email copied to clipboard');});}
+  else note('Copy not supported');
+}
+function note(t){var n=document.getElementById('actNote');if(n){n.textContent=t;setTimeout(function(){if(n.textContent===t)n.textContent='';},4000);}}
+
+loadOverview();
+</script>
+</body>
+</html>"""
 
 
 # ============================================================

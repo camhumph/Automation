@@ -4783,36 +4783,61 @@ def compare_job_signature_to_previous(conn, job_num: str, limit: int = JOB_SIGNA
 def sync_matching_software_signatures(conn, folder: str = ELGIN_MATCHING_SOFTWARE_DIR) -> dict:
     """
     Import every XT_Export_Job_Signature CSV found in the shared matching folder.
-    This makes newly exported SolidWorks jobs appear in ELGIN without a manual lookup/upload.
+    Scans the matching root (flat files) and one level of job subfolders so
+    macro publish paths both work without manual upload.
     """
     result = {"folder": folder, "scanned": 0, "imported_files": 0, "imported_components": 0, "errors": []}
     if not folder or not os.path.isdir(folder):
         return result
 
-    try:
-        names = [n for n in os.listdir(folder) if n.lower().endswith(".csv") and "job_signature" in n.lower()]
-    except Exception as exc:
-        result["errors"].append(str(exc))
-        return result
+    seen_paths: set[str] = set()
 
-    for name in sorted(names):
+    def _job_num_from_signature_filename(name: str) -> str:
+        base = os.path.splitext(os.path.basename(name))[0]
+        m = re.search(r"job_signature[_-]?(.*)$", base, re.I)
+        if m and m.group(1):
+            return normalize_job_num(m.group(1))
+        return normalize_job_num(base.split("_")[0])
+
+    def _consider(path: str) -> None:
+        if path in seen_paths:
+            return
+        seen_paths.add(path)
         result["scanned"] += 1
-        path = os.path.join(folder, name)
+        name = os.path.basename(path)
         try:
             with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
                 data = f.read()
-            fallback_job = name.split("_")[0]
+            fallback_job = _job_num_from_signature_filename(name)
             rows = parse_job_signature_csv_text(data, fallback_job_num=fallback_job)
             if not rows:
-                continue
+                return
             job_num = normalize_job_num(rows[0].get("job_num") or fallback_job)
             if not job_num:
-                continue
+                return
             imported = upsert_job_signature_rows(conn, job_num, rows, source_file=path)
             result["imported_files"] += 1
             result["imported_components"] += imported
         except Exception as exc:
             result["errors"].append(f"{name}: {exc}")
+
+    try:
+        for name in sorted(os.listdir(folder)):
+            path = os.path.join(folder, name)
+            if os.path.isfile(path) and name.lower().endswith(".csv") and "job_signature" in name.lower():
+                _consider(path)
+            elif os.path.isdir(path):
+                try:
+                    for fn in sorted(os.listdir(path)):
+                        if not fn.lower().endswith(".csv") or "job_signature" not in fn.lower():
+                            continue
+                        sub_path = os.path.join(path, fn)
+                        if os.path.isfile(sub_path):
+                            _consider(sub_path)
+                except Exception as exc:
+                    result["errors"].append(f"{name}/: {exc}")
+    except Exception as exc:
+        result["errors"].append(str(exc))
     return result
 
 

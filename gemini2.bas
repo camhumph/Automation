@@ -22,11 +22,24 @@ Option Explicit
 ' USER SETTINGS
 ' ============================================================
 
-Private Const ROOT_JOB_PATH As String = "C:\Users\lenovo\Desktop\000000005.May 2026"
+' Job downloads root is resolved at runtime (company share vs local fallback).
+Private Const PUBLIC_DOWNLOADS_PATH As String = "\\Mycloudex2ultra\mexico\Downloads"
+Private Const LOCAL_DOWNLOADS_FALLBACK As String = "C:\Users\lenovo\Desktop"
 Private Const EXTRACT_FOLDER_NAME As String = "_EXTRACTED_ZIP"
 Private Const OUTPUT_FOLDER_SUFFIX As String = " PRINTS"
 
 Private Const LOCAL_WORKSPACE_ROOT As String = "C:\CMS_Local_Workspace"
+
+' --- Network-aware Elgin publish (no manual UNC paste needed) ---
+Private Const COMPANY_WIFI_SSID As String = "NETGEAR"
+Private Const PUBLIC_DATA_ROOT As String = "\\Mycloudex2ultra\mexico\Cameron's stuff\Matching software"
+Private Const PRIVATE_DATA_ROOT As String = "C:\CMS_Local_Workspace\Matching"
+Private Const FORCE_LOCAL_PUBLISH As Boolean = False
+Private Const PUBLISH_OUTPUTS As Boolean = True
+Private Const AUTO_UPLOAD_JOB_SIGNATURE_TO_ELGIN As Boolean = True
+Private Const ELGIN_API_BASE_URL As String = "http://localhost:2926"
+Private Const ELGIN_SIGNATURE_API_KEY As String = "cms-signature-upload"
+Private Const LIMIT_JOB_SEARCH_TO_CURRENT_AND_PREVIOUS_MONTH As Boolean = True
 
 Private Const PUSH_OUTPUTS_TO_NETWORK As Boolean = False
 Private Const DELETE_EXTRACTED_ZIP_AFTER_FLATTEN As Boolean = True
@@ -86,7 +99,7 @@ Private Const PERSIST_CMS_TOP_AS_STANDARD_VIEWS_BEFORE_BASE_SAVE As Boolean = Tr
 Private Const DISABLE_STABILIZE_DELAYS As Boolean = True
 Private Const DISABLE_MAIN_VIEWPORT_GRAPHICS As Boolean = True
 Private Const RUN_SOLIDWORKS_INVISIBLE As Boolean = True
-Private Const ENABLE_EXPORT_LOG As Boolean = False
+Private Const ENABLE_EXPORT_LOG As Boolean = True
 
 ' ============================================================
 ' TOP/BOT INSERT GEOMETRY FALLBACK
@@ -194,7 +207,7 @@ Private Const CREATE_PULLCORE_CAM_KEY_PACKAGE As Boolean = True
 Private Const PULLCORE_CAM_KEY_FOLDER_NAME As String = "PULLCORE CAM AND KEY"
 
 Private Const AUTO_LABEL_PULLCORE_ID_OD_BY_HEIGHT As Boolean = True
-Private Const PULLCORE_ID_OD_HEIGHT_AXIS As String = "AUTO"
+Private Const PULLCORE_ID_OD_HEIGHT_AXIS As String = "Y"
 Private Const PULLCORE_ID_IS_HIGHER As Boolean = True
 
 Private Const PULLCORE_T_TOL As Double = 0.175
@@ -237,7 +250,7 @@ Private Const PULLCORE_NAME_KEYS_BY_NESTED_CAM As Boolean = True
 ' nested-cam naming above (which uses real geometry instead of guessing a
 ' height axis), so it is OFF by default. Set True only to re-enable the older
 ' heuristic; it has no effect on key NAMES when nested-cam naming is on.
-Private Const PULLCORE_USE_LOCATION_AWARE_MATCH As Boolean = False
+Private Const PULLCORE_USE_LOCATION_AWARE_MATCH As Boolean = True
 Private Const PULLCORE_LOCATION_MATCH_WEIGHT As Double = 0.6
 ' --------------------------------------------------------------------------
 
@@ -473,7 +486,8 @@ On Error GoTo ErrHandler
 
     LogLine "========================================"
     LogLine "MACRO STARTED"
-    LogLine "Root path: " & ROOT_JOB_PATH
+    LogLine "Root path: " & ResolveRootJobPath()
+    LogLine "Matching publish root: " & ResolveMatchingRoot()
     LogLine "Local workspace root: " & LOCAL_WORKSPACE_ROOT
     LogLine "Push outputs to network: " & CStr(PUSH_OUTPUTS_TO_NETWORK)
     LogLine "Run SolidWorks invisible: " & CStr(RUN_SOLIDWORKS_INVISIBLE)
@@ -646,7 +660,7 @@ On Error GoTo ErrHandler
 
     LogStart "Find network job folder"
 
-    NetworkJobFolder = FindJobFolderByText(ROOT_JOB_PATH, CurrentJobNumber)
+    NetworkJobFolder = FindJobFolderByText(ResolveRootJobPath(), CurrentJobNumber)
     LogLine "Network job folder result: " & NetworkJobFolder
 
     If NetworkJobFolder = "" Then
@@ -863,7 +877,15 @@ On Error GoTo ErrHandler
     LogDone "Set TCP-top orientation from matched TCP/BCP, then save BASE"
 
     WriteExportCheckCsv CurrentJobFolder & "\XT_Export_BOM_Match_Report.csv"
-    WriteJobSignatureCsv CurrentJobFolder & "\" & JOB_SIGNATURE_REPORT_FILE
+
+    Dim jobSignaturePath As String
+    jobSignaturePath = CurrentJobFolder & "\" & JOB_SIGNATURE_REPORT_FILE
+
+    WriteJobSignatureCsv jobSignaturePath
+    UploadJobSignatureToElgin jobSignaturePath
+    PublishJobOutputs
+
+    WriteExportLogBomSummary
 
     If CREATE_PULLCORE_DIMENSIONS_EXCEL And PullcoreMatchCount > 0 Then
         LogStart "Write Pull Core Dimensions Excel"
@@ -912,7 +934,7 @@ On Error GoTo ErrHandler
 
     LogDone "Restore visibility/state"
 
-    CollectJobPdfsAndReports
+    OrganizeJobFiles
 
     If PUSH_OUTPUTS_TO_NETWORK Then
         LogStart "Push finished outputs back to network"
@@ -925,6 +947,7 @@ On Error GoTo ErrHandler
 
     LogLine "========================================"
     LogLine "DONE JOB. Total seconds=" & DateDiff("s", MacroStartTime, Now)
+    LogLine "Export log file: " & RunLogPath
     LogLine "Local output folder: " & outputFolder
     LogLine "Pull Core Dimensions report: " & PullCoreDimensionsReportPath
     LogLine "========================================"
@@ -1316,6 +1339,9 @@ On Error GoTo ErrHandler
 
     CopyFileIfExists CurrentJobFolder & "\XT_Export_BOM_PDF_Text.txt", _
                      NetworkJobFolder & "\XT_Export_BOM_PDF_Text.txt"
+
+    CopyFileIfExists CurrentJobFolder & "\" & JOB_SIGNATURE_REPORT_FILE, _
+                     NetworkJobFolder & "\" & JOB_SIGNATURE_REPORT_FILE
 
     CopyFileIfExists CurrentJobFolder & "\CMS_XT_Export_Log.txt", _
                      NetworkJobFolder & "\CMS_XT_Export_Log.txt"
@@ -2582,8 +2608,15 @@ On Error GoTo SafeExit
     If swCompModel Is Nothing Then Exit Sub
     If swCompModel.GetType <> swDocPART Then Exit Sub
 
+    Dim cx As Double
+    Dim cy As Double
+    Dim cz As Double
+    Dim hasCenter As Boolean
+
+    hasCenter = TryGetComponentCenterInches(swComp, cx, cy, cz)
+
     Dim existingIndex As Long
-    existingIndex = FindExistingPart(compPath, configName, compName)
+    existingIndex = FindExistingPart(compPath, configName, compName, cy, hasCenter)
 
     If existingIndex > 0 Then
         parts(existingIndex).Quantity = parts(existingIndex).Quantity + 1
@@ -2599,13 +2632,6 @@ On Error GoTo SafeExit
     Dim massValue As Double
     massValue = GetModelMassOrVolumeValue(swCompModel)
 
-    Dim cx As Double
-    Dim cy As Double
-    Dim cz As Double
-    Dim hasCenter As Boolean
-
-    hasCenter = TryGetComponentCenterInches(swComp, cx, cy, cz)
-
     Dim asmBoxL As Double
     Dim asmBoxW As Double
     Dim asmBoxT As Double
@@ -2614,12 +2640,16 @@ On Error GoTo SafeExit
     hasAsmBox = TryGetComponentAssemblyBoundingBoxInches(swComp, asmBoxL, asmBoxW, asmBoxT)
 
     If hasAsmBox Then
-        LogLine "Assembly/world bbox for " & compName & " = " & _
-                FormatNumberForCsv(asmBoxL) & "/" & _
-                FormatNumberForCsv(asmBoxW) & "/" & _
-                FormatNumberForCsv(asmBoxT)
+        If VERBOSE_PROGRESS_LOG Then
+            LogLine "Assembly/world bbox for " & compName & " = " & _
+                    FormatNumberForCsv(asmBoxL) & "/" & _
+                    FormatNumberForCsv(asmBoxW) & "/" & _
+                    FormatNumberForCsv(asmBoxT)
+        End If
     Else
-        LogLine "Assembly/world bbox unavailable for " & compName & "; using part-local bbox."
+        If VERBOSE_PROGRESS_LOG Then
+            LogLine "Assembly/world bbox unavailable for " & compName & "; using part-local bbox."
+        End If
     End If
 
     AddCadPart compName, _
@@ -2760,7 +2790,9 @@ Private Sub AddCadPart(ByVal componentName As String, _
     parts(PartCount).isBodyOnly = isBodyOnly
 End Sub
 
-Private Function FindExistingPart(ByVal filePath As String, ByVal configName As String, ByVal compName As String) As Long
+Private Function FindExistingPart(ByVal filePath As String, ByVal configName As String, ByVal compName As String, _
+                                  Optional ByVal newCenterY As Double = 0#, _
+                                  Optional ByVal newHasCenter As Boolean = False) As Long
 
     Dim i As Long
 
@@ -2770,6 +2802,11 @@ Private Function FindExistingPart(ByVal filePath As String, ByVal configName As 
 
             If LCase(parts(i).filePath) = LCase(filePath) And _
                LCase(parts(i).configName) = LCase(configName) Then
+
+                ' Same file/config at a different Y center = separate pullcore instance (ID vs OD).
+                If newHasCenter And parts(i).hasAsmCenter Then
+                    If Abs(parts(i).AsmCenterY - newCenterY) > 0.05 Then GoTo NextPart
+                End If
 
                 FindExistingPart = i
                 Exit Function
@@ -2785,6 +2822,7 @@ Private Function FindExistingPart(ByVal filePath As String, ByVal configName As 
 
         End If
 
+NextPart:
     Next i
 
     FindExistingPart = 0
@@ -8225,6 +8263,16 @@ On Error GoTo ErrHandler
     ReDim candLoc(1 To candN)
     ComputePullcoreCandidateSideCodes candIdx, candN, candLoc
 
+    If PULLCORE_USE_LOCATION_AWARE_MATCH Then
+        For j = 1 To candN
+            If candLoc(j) <> "" And candIdx(j) > 0 Then
+                LogLine "PULLCORE side-by-Y: " & parts(candIdx(j)).componentName & _
+                        " Y=" & FormatNumberForCsv(parts(candIdx(j)).AsmCenterY) & _
+                        " -> " & candLoc(j)
+            End If
+        Next j
+    End If
+
     Dim pairCount As Long
 
     pairCount = rowN
@@ -11586,6 +11634,7 @@ On Error GoTo ErrHandler
 
         nameUpper = UCase(subFolder.name)
 
+        If ShouldSkipJobSearchTopFolder(subFolder.name, wantUpper) Then GoTo NextTop
         If nameUpper = UCase(EXTRACT_FOLDER_NAME) Then GoTo NextTop
         If InStr(nameUpper, " PRINTS") > 0 Then GoTo NextTop
         If InStr(nameUpper, "PULLCORE") > 0 Then GoTo NextTop
@@ -11615,8 +11664,10 @@ NextTop:
 
     For Each subFolder In root.SubFolders
         nameUpper = UCase(subFolder.name)
-        If nameUpper <> UCase(EXTRACT_FOLDER_NAME) Then
-            SearchJobFolderRecursive subFolder, wantUpper, 1, bestPath, bestScore
+        If ShouldSkipJobSearchTopFolder(subFolder.name, wantUpper) = False Then
+            If nameUpper <> UCase(EXTRACT_FOLDER_NAME) Then
+                SearchJobFolderRecursive subFolder, wantUpper, 1, bestPath, bestScore
+            End If
         End If
     Next subFolder
 
@@ -11631,6 +11682,293 @@ ErrHandler:
     LogLine "FindJobFolderByText error: " & Err.Description
     FindJobFolderByText = ""
 End Function
+
+Private Function ShouldSkipJobSearchTopFolder(ByVal folderName As String, ByVal wantUpper As String) As Boolean
+On Error GoTo ErrHandler
+
+    ShouldSkipJobSearchTopFolder = False
+
+    If LIMIT_JOB_SEARCH_TO_CURRENT_AND_PREVIOUS_MONTH = False Then Exit Function
+
+    Dim n As String
+    n = UCase(folderName)
+
+    If InStr(n, wantUpper) > 0 Then Exit Function
+
+    Dim currentMonth As String
+    Dim previousMonth As String
+
+    currentMonth = UCase(Format(Date, "mmmm yyyy"))
+    previousMonth = UCase(Format(DateAdd("m", -1, Date), "mmmm yyyy"))
+
+    If InStr(n, currentMonth) > 0 Then Exit Function
+    If InStr(n, previousMonth) > 0 Then Exit Function
+
+    ShouldSkipJobSearchTopFolder = True
+    Exit Function
+
+ErrHandler:
+    ShouldSkipJobSearchTopFolder = False
+End Function
+
+' ============================================================
+' NETWORK-AWARE PATHS + ELGIN PUBLISH
+' ============================================================
+
+Private Function ResolveRootJobPath() As String
+    On Error Resume Next
+    Dim root As String
+    If IsOnCompanyWifi() Then
+        root = PUBLIC_DOWNLOADS_PATH
+    Else
+        root = LOCAL_DOWNLOADS_FALLBACK
+        Dim fso As Object
+        Set fso = CreateObject("Scripting.FileSystemObject")
+        If fso.FolderExists(PUBLIC_DOWNLOADS_PATH) Then root = PUBLIC_DOWNLOADS_PATH
+    End If
+    ResolveRootJobPath = root
+End Function
+
+Private Function GetWifiSsidVba() As String
+    On Error Resume Next
+    Dim sh As Object, ex As Object, out As String
+    Set sh = CreateObject("WScript.Shell")
+    Set ex = sh.Exec("netsh wlan show interfaces")
+    If ex Is Nothing Then Exit Function
+    out = ex.StdOut.ReadAll
+    Dim arr() As String, i As Long, s As String, p As Long
+    arr = Split(out, vbCrLf)
+    For i = LBound(arr) To UBound(arr)
+        s = Trim(arr(i))
+        If InStr(1, s, "SSID", vbTextCompare) = 1 Then
+            p = InStr(s, ":")
+            If p > 0 Then
+                GetWifiSsidVba = Trim(Mid(s, p + 1))
+                Exit Function
+            End If
+        End If
+    Next i
+End Function
+
+Private Function IsOnCompanyWifi() As Boolean
+    If FORCE_LOCAL_PUBLISH Then Exit Function
+    Dim ssid As String
+    ssid = UCase$(GetWifiSsidVba())
+    If ssid <> "" Then
+        If InStr(ssid, UCase$(COMPANY_WIFI_SSID)) > 0 Then IsOnCompanyWifi = True
+        Exit Function
+    End If
+    If PUBLIC_DATA_ROOT <> "" Then
+        Dim fso As Object
+        Set fso = CreateObject("Scripting.FileSystemObject")
+        On Error Resume Next
+        If fso.FolderExists(PUBLIC_DATA_ROOT) Then IsOnCompanyWifi = True
+    End If
+End Function
+
+Private Function ResolveMatchingRoot() As String
+    Dim root As String
+    If IsOnCompanyWifi() Then root = PUBLIC_DATA_ROOT Else root = PRIVATE_DATA_ROOT
+    If root = "" Then root = PRIVATE_DATA_ROOT
+    EnsureFolderDeep root
+    ResolveMatchingRoot = root
+End Function
+
+Private Sub PublishJobOutputs()
+    On Error GoTo eh
+    If Not PUBLISH_OUTPUTS Then Exit Sub
+    Dim onCo As Boolean
+    onCo = IsOnCompanyWifi()
+    Dim root As String
+    root = ResolveMatchingRoot()
+    If root = "" Then LogLine "Publish: no matching root resolved.": Exit Sub
+    LogLine "Publish destination (" & IIf(onCo, "PUBLIC company share", "PRIVATE local folder") & "): " & root
+
+    Dim sigPath As String
+    sigPath = root & "\XT_Export_Job_Signature_" & CleanFileName(CurrentJobNumber) & ".csv"
+    WriteJobSignatureCsv sigPath
+
+    Dim jobOut As String
+    jobOut = root & "\" & CleanFileName(CurrentJobNumber)
+    EnsureFolderDeep jobOut
+    CopyMatchingArtifacts CurrentJobFolder, jobOut
+    LogLine "Published job outputs to: " & jobOut
+    Exit Sub
+eh:
+    LogLine "PublishJobOutputs error: " & Err.Description
+End Sub
+
+Private Sub CopyMatchingArtifacts(ByVal srcFolder As String, ByVal dstFolder As String)
+    On Error Resume Next
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    If Not fso.FolderExists(srcFolder) Then Exit Sub
+    Dim f As Object, nm As String, up As String, ext As String, take As Boolean
+    For Each f In fso.GetFolder(srcFolder).Files
+        nm = f.Name
+        up = UCase$(nm)
+        ext = UCase$(GetFileExtension(nm))
+        take = False
+        If ext = "JPG" Or ext = "JPEG" Or ext = "PNG" Then take = True
+        If ext = "CSV" Then take = True
+        If ext = "TXT" Then take = True
+        If ext = "PDF" Then take = True
+        If (ext = "XLS" Or ext = "XLSX" Or ext = "XLSM") Then take = True
+        If take Then fso.CopyFile f.Path, dstFolder & "\" & nm, True
+    Next f
+End Sub
+
+Private Sub UploadJobSignatureToElgin(ByVal csvPath As String)
+On Error GoTo ErrHandler
+
+    If AUTO_UPLOAD_JOB_SIGNATURE_TO_ELGIN = False Then Exit Sub
+    If csvPath = "" Then Exit Sub
+
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    If fso.FileExists(csvPath) = False Then Exit Sub
+
+    Dim boundary As String
+    boundary = "----CMSXT" & Format(Now, "yyyymmddhhnnss")
+
+    Dim csvText As String
+    csvText = ReadAllTextFile(csvPath)
+
+    If Trim(csvText) = "" Then Exit Sub
+
+    Dim body As String
+    body = "--" & boundary & vbCrLf & _
+           "Content-Disposition: form-data; name=" & Chr(34) & "file" & Chr(34) & "; filename=" & Chr(34) & JOB_SIGNATURE_REPORT_FILE & Chr(34) & vbCrLf & _
+           "Content-Type: text/csv" & vbCrLf & vbCrLf & _
+           csvText & vbCrLf & _
+           "--" & boundary & "--" & vbCrLf
+
+    Dim url As String
+    url = Trim(ELGIN_API_BASE_URL)
+
+    Do While Right(url, 1) = "/"
+        url = Left(url, Len(url) - 1)
+    Loop
+
+    url = url & "/api/job-signatures/" & CurrentJobNumber & "/upload"
+
+    Dim http As Object
+    Set http = CreateObject("WinHttp.WinHttpRequest.5.1")
+
+    http.Open "POST", url, False
+    http.SetRequestHeader "Content-Type", "multipart/form-data; boundary=" & boundary
+    http.SetRequestHeader "X-Elgin-Api-Key", ELGIN_SIGNATURE_API_KEY
+    http.Send body
+
+    If CLng(http.Status) >= 200 And CLng(http.Status) < 300 Then
+        LogLine "Uploaded job signature to ELGIN: " & url
+    Else
+        LogLine "WARNING: ELGIN signature upload failed. HTTP " & CStr(http.Status) & " " & CStr(http.ResponseText)
+    End If
+
+CleanExit:
+    On Error Resume Next
+    Set http = Nothing
+    Set fso = Nothing
+    Exit Sub
+
+ErrHandler:
+    LogLine "WARNING: UploadJobSignatureToElgin error: " & Err.Description
+    Resume CleanExit
+End Sub
+
+Private Sub OrganizeJobFiles()
+    On Error GoTo eh
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    If Not fso.FolderExists(CurrentJobFolder) Then Exit Sub
+    Dim baseDir As String, pdfDir As String
+    baseDir = CurrentJobFolder & "\base"
+    pdfDir = CurrentJobFolder & "\pdf"
+    EnsureFolderDeep baseDir
+    EnsureFolderDeep pdfDir
+    Dim names As Collection, f As Object
+    Set names = New Collection
+    For Each f In fso.GetFolder(CurrentJobFolder).Files
+        names.Add f.Name
+    Next f
+    Dim idx As Long, nm As String, ext As String, dest As String, src As String, target As String
+    For idx = 1 To names.Count
+        nm = names(idx)
+        ext = UCase$(GetFileExtension(nm))
+        dest = ""
+        If ext = "SLDPRT" Or ext = "SLDASM" Then
+            dest = baseDir
+        ElseIf ext = "PDF" Or ext = "XLS" Or ext = "XLSX" Or ext = "XLSM" Then
+            dest = pdfDir
+        ElseIf ext = "CSV" And (InStr(UCase$(nm), "EXPORT") > 0 Or InStr(UCase$(nm), "SIGNATURE") > 0 Or InStr(UCase$(nm), "PULL") > 0) Then
+            dest = pdfDir
+        End If
+        If dest <> "" Then
+            src = CurrentJobFolder & "\" & nm
+            target = dest & "\" & nm
+            On Error Resume Next
+            If fso.FileExists(target) Then target = GetUniqueFilePath(target)
+            fso.MoveFile src, target
+            On Error GoTo eh
+            LogLine "Organized: " & nm & " -> " & dest
+        End If
+    Next idx
+    Exit Sub
+eh:
+    LogLine "OrganizeJobFiles error: " & Err.Description
+End Sub
+
+Private Sub WriteExportLogBomSummary()
+On Error GoTo ErrHandler
+
+    If ENABLE_EXPORT_LOG = False Then Exit Sub
+    If BomCount <= 0 Then Exit Sub
+
+    LogLine "========== BOM MATERIAL / PURCHASE LOG =========="
+    LogLine "Type          Qty  Description                              L        W        T        Material"
+    LogLine "--------------------------------------------------------------------------------"
+
+    Dim i As Long
+    Dim typ As String
+    Dim line As String
+
+    For i = 1 To BomCount
+        typ = Trim(BomRows(i).TypeField)
+        If typ = "" Then
+            If Len(BomRows(i).material) > 0 Then
+                typ = "Material"
+            ElseIf IsPullcoreBomRow(BomRows(i)) Then
+                typ = "Pullcore"
+            Else
+                typ = "Purchase"
+            End If
+        End If
+
+        line = Left(typ & Space(14), 14) & _
+               Right(Space(4) & CStr(BomRows(i).Quantity), 4) & "  " & _
+               Left(BomRows(i).Description & Space(40), 40)
+
+        If BomRows(i).hasDims Then
+            line = line & "  " & Format(BomRows(i).BomLength, "0.000") & _
+                   "  " & Format(BomRows(i).BomWidth, "0.000") & _
+                   "  " & Format(BomRows(i).BomThickness, "0.000")
+        End If
+
+        If Len(BomRows(i).material) > 0 Then
+            line = line & "  " & BomRows(i).material
+        End If
+
+        LogLine line
+    Next i
+
+    LogLine "========== END BOM LOG (" & BomCount & " rows) =========="
+    Exit Sub
+
+ErrHandler:
+    LogLine "WriteExportLogBomSummary error: " & Err.Description
+End Sub
 
 Private Sub SearchJobFolderRecursive(ByVal folder As Object, _
                                      ByVal wantUpper As String, _
