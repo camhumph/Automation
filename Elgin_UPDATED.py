@@ -11899,9 +11899,15 @@ def ms_find_job_images(job_num: str):
         kind = ms_classify_image(fn)
         found.append({"kind": kind, "label": fn, "path": full})
 
-    order = {"ID HOLDER": 0, "OD HOLDER": 1, "ID POT": 2, "OD POT": 3,
-             "TCP": 4, "BCP": 5, "ISO": 6, "BACK ISO": 7, "OTHER": 9}
-    found.sort(key=lambda x: (order.get(x["kind"], 8), x["label"]))
+    def _img_sort_key(x: dict) -> tuple:
+        fnu = x["label"].upper().replace("_", " ")
+        order = {"ID HOLDER": 0, "OD HOLDER": 1, "ID POT": 2, "OD POT": 3,
+                 "TCP": 4, "BCP": 5, "ISO": 6, "BACK ISO": 7, "OTHER": 9}
+        # Per-component ISO JPG from macro: J8454_OD HOLDER ISO.jpg
+        iso_rank = 0 if (" ISO." in fnu or " ISO " in fnu or fnu.endswith(" ISO")) else 1
+        return (order.get(x["kind"], 8), iso_rank, x["label"].lower())
+
+    found.sort(key=_img_sort_key)
     _ms_img_cache[key] = (now, found)
     return found
 
@@ -11932,9 +11938,16 @@ def ms_find_job_models(job_num: str, kind: str = "") -> list[dict]:
             "format": ext.lstrip("."),
         })
 
-    # Prefer IGS for browser overlay, then EASM, then XT.
+    # Prefer per-component IGS for browser overlay; skip whole-assembly BASE blobs.
     fmt_rank = {".igs": 0, ".iges": 0, ".easm": 1, ".x_t": 2, ".xt": 2, ".step": 3, ".stp": 3}
-    found.sort(key=lambda x: (fmt_rank.get("." + x["format"], 9), x["label"]))
+
+    def _model_sort_key(x: dict) -> tuple:
+        fnu = x["label"].upper()
+        base_penalty = 1 if ("_BASE_" in fnu or fnu.endswith("_BASE.IGS")) else 0
+        holders_penalty = 1 if ("_HOLDERS_" in fnu and want in ("ID HOLDER", "OD HOLDER", "TCP", "BCP")) else 0
+        return (fmt_rank.get("." + x["format"], 9), base_penalty, holders_penalty, x["label"].lower())
+
+    found.sort(key=_model_sort_key)
     _ms_model_cache[cache_key] = (now, found)
     return found
 
@@ -12198,7 +12211,23 @@ async def ms_model_file(job: str, kind: str = "", i: int = 0):
     path = models[idx]["path"]
     if not os.path.isfile(path):
         raise HTTPException(404, "Model file missing")
-    return FileResponse(path, filename=os.path.basename(path))
+    return FileResponse(path, filename=os.path.basename(path), media_type="application/octet-stream")
+
+
+@app.get("/api/match/model-meta")
+async def ms_model_meta(job: str, kind: str = "", i: int = 0):
+    models = ms_find_job_models(job, kind)
+    if not models:
+        raise HTTPException(404, "No 3D model found for this job/component")
+    idx = max(0, min(int(i), len(models) - 1))
+    m = models[idx]
+    return {
+        "job": normalize_job_num(job),
+        "kind": kind,
+        "label": m["label"],
+        "format": m["format"],
+        "url": f"/api/match/model?job={normalize_job_num(job)}&kind={kind}&i={idx}",
+    }
 
 
 @app.get("/api/match/file")
@@ -12365,6 +12394,52 @@ function money2(v){var n=Number(v||0);return '$'+n.toLocaleString(undefined,{min
 function scoreColor(s){var h=Math.max(0,Math.min(120,(Number(s)||0)*1.2));return 'hsl('+h+',75%,52%)';}
 function imgURL(job,kind){return '/api/match/image?job='+encodeURIComponent(job)+'&kind='+encodeURIComponent(kind)+'&i=0';}
 function modelURL(job,kind){return '/api/match/model?job='+encodeURIComponent(job)+'&kind='+encodeURIComponent(kind)+'&i=0';}
+function modelMetaURL(job,kind){return '/api/match/model-meta?job='+encodeURIComponent(job)+'&kind='+encodeURIComponent(kind)+'&i=0';}
+
+async function initOcctImportJs(){
+  var bases=['https://esm.sh/occt-import-js@0.0.22','https://cdn.jsdelivr.net/npm/occt-import-js@0.0.22/dist/occt-import-js.js'];
+  var lastErr=null;
+  for(var bi=0;bi<bases.length;bi++){
+    try{
+      var occMod=await import(bases[bi]);
+      var factory=occMod.default||occMod.occtimportjs||occMod;
+      if(factory && typeof factory!=='function' && typeof factory.default==='function') factory=factory.default;
+      if(typeof factory!=='function'){
+        for(var k in occMod){ if(typeof occMod[k]==='function'){ factory=occMod[k]; break; } }
+      }
+      if(typeof factory!=='function') throw new Error('no occt factory');
+      var wasmBase='https://cdn.jsdelivr.net/npm/occt-import-js@0.0.22/dist/';
+      var occt=await factory({ locateFile:function(p){ return wasmBase+p; } });
+      if(occt && typeof occt.then==='function') occt=await occt;
+      if(!occt || typeof occt.ReadIgesFile!=='function') throw new Error('occt API missing');
+      return occt;
+    }catch(e){ lastErr=e; }
+  }
+  throw lastErr||new Error('occt-import-js failed to load');
+}
+
+function bindOverlayJpegs(curJob, matchJob, kind){
+  var ph=document.getElementById('ovPh');
+  var base=document.querySelector('.ovwrap .ovimg:not(.ovtop)');
+  var top=document.getElementById('ovTop');
+  var pending=2, anyOk=false;
+  function done(ok){
+    if(ok) anyOk=true;
+    pending--;
+    if(pending>0) return;
+    if(ph){
+      if(anyOk){ ph.style.display='none'; }
+      else { ph.textContent=kind+' — no ISO JPG yet. Re-run CMS export (macro saves '+curJob+'_'+kind+' ISO.jpg). Using IGS viewer below.'; ph.style.display='block'; }
+    }
+  }
+  function wire(img,isTop){
+    if(!img){ done(false); return; }
+    img.onload=function(){ img.style.visibility='visible'; done(true); };
+    img.onerror=function(){ img.style.display='none'; done(false); };
+    img.src=imgURL(isTop?curJob:matchJob, kind)+'&_='+Date.now();
+  }
+  wire(base,false); wire(top,true);
+}
 
 function loadOverview(){
   api('/api/match/overview?limit=120').then(function(d){
@@ -12506,16 +12581,17 @@ function renderOverlay(m){
   }else{
     stage.innerHTML='<div class="ovstage">'
       +'<div class="ovwrap">'
-        +'<img class="ovimg" src="'+imgURL(m.job_num,k)+'" onerror="this.style.visibility=\'hidden\'">'
-        +'<img class="ovimg ovtop" id="ovTop" src="'+imgURL(STATE.job,k)+'" style="opacity:.5" onerror="this.style.visibility=\'hidden\'">'
-        +'<div class="ph" id="ovPh" style="position:absolute">'+esc(k)+' preview loading…</div>'
+        +'<img class="ovimg" alt="match">'
+        +'<img class="ovimg ovtop" id="ovTop" style="opacity:.5" alt="current">'
+        +'<div class="ph" id="ovPh" style="position:absolute">'+esc(k)+' ISO preview loading…</div>'
       +'</div>'
-      +'<div class="slider"><span class="muted">'+esc(m.job_num)+' (orange 3D)</span>'
+      +'<div class="slider"><span class="muted">'+esc(m.job_num)+' (match)</span>'
         +'<input type="range" min="0" max="100" value="50" oninput="document.getElementById(\'ovTop\').style.opacity=this.value/100">'
-        +'<span class="muted">'+esc(STATE.job)+' (blue 3D)</span></div>'
-      +'<div class="legend">JPG overlay when ISO previews exist. Otherwise use the color-coded IGS/EASM viewer below (drag to orbit).</div>'
-      +'<div class="ms3d" id="ms3dHost"><div class="muted" style="padding:18px">Loading 3D overlay…</div></div>'
+        +'<span class="muted">'+esc(STATE.job)+' (current)</span></div>'
+      +'<div class="legend">ISO <b>JPG</b> fade on top when the macro exports <code>J'+esc(STATE.job)+'_'+esc(k)+' ISO.jpg</code>. Color-coded <b>IGS</b> 3D overlay below (orange=match, blue=current).</div>'
+      +'<div class="ms3d" id="ms3dHost"><div class="muted" style="padding:18px">Loading IGS 3D overlay…</div></div>'
     +'</div>';
+    bindOverlayJpegs(STATE.job, m.job_num, k);
     loadMs3dOverlay(STATE.job, m.job_num, k, 'ms3dHost');
   }
 }
@@ -12524,19 +12600,21 @@ async function loadMs3dOverlay(curJob, matchJob, kind, containerId){
   var host=document.getElementById(containerId);
   if(!host) return;
   try{
-    var occMod=await import('https://cdn.jsdelivr.net/npm/occt-import-js@0.0.22/dist/occt-import-js.js');
-    var occt=await occMod.default();
+    var occt=await initOcctImportJs();
     var THREE=await import('https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js');
     var OrbitControls=(await import('https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js')).OrbitControls;
-    async function fetchBuf(job){
-      var r=await fetch(modelURL(job,kind));
-      if(!r.ok) return null;
-      return r.arrayBuffer();
+    async function fetchModel(job){
+      var metaR=await fetch(modelMetaURL(job,kind));
+      if(!metaR.ok) return null;
+      var meta=await metaR.json();
+      var bufR=await fetch(meta.url||modelURL(job,kind));
+      if(!bufR.ok) return null;
+      return { buf: await bufR.arrayBuffer(), format: (meta.format||'').toLowerCase(), label: meta.label||'' };
     }
-    var bufCur=await fetchBuf(curJob);
-    var bufMatch=await fetchBuf(matchJob);
-    if(!bufCur && !bufMatch){
-      host.innerHTML='<div class="muted" style="padding:18px">No IGS/EASM for <b>'+esc(kind)+'</b>. The macro saves these in the job folder (e.g. J'+esc(curJob)+'_ID HOLDER_….igs). Re-run export or open the EASM from the job folder.</div>';
+    var mCur=await fetchModel(curJob);
+    var mMatch=await fetchModel(matchJob);
+    if(!mCur && !mMatch){
+      host.innerHTML='<div class="muted" style="padding:18px">No <b>IGS</b> for <b>'+esc(kind)+'</b>. Re-run CMS export — the macro saves <code>'+esc(curJob)+'_'+esc(kind)+'_….igs</code> next to the XT in PRINTS.</div>';
       return;
     }
     host.innerHTML='';
@@ -12552,41 +12630,62 @@ async function loadMs3dOverlay(curJob, matchJob, kind, containerId){
     controls.enableDamping=true;
     var light1=new THREE.DirectionalLight(0xffffff,1.1);light1.position.set(1,2,1);scene.add(light1);
     scene.add(new THREE.AmbientLight(0xffffff,0.45));
-    function addMeshes(buf,color,opacity){
-      if(!buf) return;
-      var ext=(kind||'').toLowerCase();
+    function parseCad(buf, fmt){
+      if(!buf) return null;
+      var u8=new Uint8Array(buf);
       var parsed=null;
-      try{ parsed=occt.ReadIgesFile(new Uint8Array(buf)); }catch(e){parsed=null;}
-      if(!parsed || !parsed.meshes || !parsed.meshes.length){
-        try{ parsed=occt.ReadStepFile(new Uint8Array(buf)); }catch(e2){parsed=null;}
+      if(fmt==='igs'||fmt==='iges'){
+        try{ parsed=occt.ReadIgesFile(u8); }catch(e1){parsed=null;}
+      } else if(fmt==='stp'||fmt==='step'){
+        try{ parsed=occt.ReadStepFile(u8); }catch(e2){parsed=null;}
+      } else {
+        try{ parsed=occt.ReadIgesFile(u8); }catch(e3){parsed=null;}
+        if(!parsed||!parsed.meshes||!parsed.meshes.length){
+          try{ parsed=occt.ReadStepFile(u8); }catch(e4){parsed=null;}
+        }
       }
-      if(!parsed || !parsed.meshes) return;
+      return parsed;
+    }
+    function addMeshes(model,color,opacity){
+      if(!model||!model.buf) return;
+      if(model.format==='easm'||model.format==='x_t'||model.format==='xt'){
+        return;
+      }
+      var parsed=parseCad(model.buf, model.format);
+      if(!parsed || !parsed.meshes || !parsed.meshes.length) return;
       parsed.meshes.forEach(function(mh){
+        var pos=mh.attributes&&mh.attributes.position?mh.attributes.position.array:null;
+        if(!pos||!pos.length) return;
         var geom=new THREE.BufferGeometry();
-        geom.setAttribute('position',new THREE.Float32BufferAttribute(mh.attributes.position.array,3));
-        if(mh.attributes.normal) geom.setAttribute('normal',new THREE.Float32BufferAttribute(mh.attributes.normal.array,3));
-        if(mh.index) geom.setIndex(mh.index.array);
-        geom.computeBoundingSphere();
+        geom.setAttribute('position',new THREE.Float32BufferAttribute(pos,3));
+        if(mh.attributes&&mh.attributes.normal) geom.setAttribute('normal',new THREE.Float32BufferAttribute(mh.attributes.normal.array,3));
+        if(mh.index&&mh.index.array) geom.setIndex(mh.index.array);
+        if(!mh.attributes||!mh.attributes.normal) geom.computeVertexNormals();
         var mat=new THREE.MeshPhongMaterial({color:color,transparent:true,opacity:opacity,side:THREE.DoubleSide});
         scene.add(new THREE.Mesh(geom,mat));
       });
     }
-    addMeshes(bufMatch,0xff8c42,0.55);
-    addMeshes(bufCur,0x3b82f6,0.72);
+    addMeshes(mMatch,0xff8c42,0.55);
+    addMeshes(mCur,0x3b82f6,0.72);
     var box=new THREE.Box3().setFromObject(scene);
+    if(box.isEmpty()){
+      var note='';
+      if((mCur&&mCur.format==='easm')||(mMatch&&mMatch.format==='easm')) note=' EASM is not readable in-browser — need per-component .igs from macro.';
+      host.innerHTML='<div class="muted" style="padding:18px">Could not mesh <b>'+esc(kind)+'</b>.'+note+' ISO JPG may still show above.</div>';
+      return;
+    }
     var center=box.getCenter(new THREE.Vector3());
     var size=box.getSize(new THREE.Vector3());
     var maxDim=Math.max(size.x,size.y,size.z,1);
     camera.position.copy(center).add(new THREE.Vector3(maxDim*1.4,maxDim,maxDim*1.4));
     controls.target.copy(center);
-  var leg=document.createElement('div');leg.className='ms3d-legend';
-  leg.innerHTML='<span><i class="dot" style="background:#3b82f6"></i>'+esc(curJob)+' current</span><span><i class="dot" style="background:#ff8c42"></i>'+esc(matchJob)+' match</span>';
-  host.appendChild(leg);
+    var leg=document.createElement('div');leg.className='ms3d-legend';
+    leg.innerHTML='<span><i class="dot" style="background:#3b82f6"></i>'+esc(curJob)+' current (IGS)</span><span><i class="dot" style="background:#ff8c42"></i>'+esc(matchJob)+' match (IGS)</span>';
+    host.appendChild(leg);
     function anim(){requestAnimationFrame(anim);controls.update();renderer.render(scene,camera);}
     anim();
-    var ph=document.getElementById('ovPh'); if(ph) ph.style.display='none';
   }catch(err){
-    host.innerHTML='<div class="muted" style="padding:18px">3D overlay unavailable: '+esc(err.message||err)+'. ISO JPG previews may still appear above when the macro exports them.</div>';
+    host.innerHTML='<div class="muted" style="padding:18px">3D IGS overlay unavailable: '+esc(err.message||err)+'. ISO JPG previews still load above when exported.</div>';
   }
 }
 
