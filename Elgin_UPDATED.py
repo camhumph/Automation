@@ -11780,15 +11780,22 @@ ELGIN_STEEL_VENDOR_EMAIL = os.environ.get("ELGIN_STEEL_VENDOR_EMAIL", "steel-ven
 ELGIN_STEEL_PRICE_PER_LB = float(os.environ.get("ELGIN_STEEL_PRICE_PER_LB", "1.50"))
 ELGIN_STEEL_DENSITY_LB_IN3 = float(os.environ.get("ELGIN_STEEL_DENSITY_LB_IN3", "0.283"))
 ELGIN_PULLCORE_RATE = float(os.environ.get("ELGIN_PULLCORE_RATE", "77.98"))
+ELGIN_LOCAL_WORKSPACE_ROOT = os.environ.get("ELGIN_LOCAL_WORKSPACE_ROOT", r"C:\CMS_Local_Workspace")
+_default_img_dirs = ";".join(
+    p for p in [ELGIN_MATCHING_SOFTWARE_DIR, ELGIN_LOCAL_WORKSPACE_ROOT, ELGIN_PRIVATE_DATA_ROOT] if p
+)
 ELGIN_JOB_IMAGE_DIRS = [
-    p.strip() for p in os.environ.get("ELGIN_JOB_IMAGE_DIRS", ELGIN_MATCHING_SOFTWARE_DIR).split(";") if p.strip()
+    p.strip() for p in os.environ.get("ELGIN_JOB_IMAGE_DIRS", _default_img_dirs).split(";") if p.strip()
 ]
 ELGIN_QUOTE_SHEET_DIRS = [
-    p.strip() for p in os.environ.get("ELGIN_QUOTE_SHEET_DIRS", ELGIN_MATCHING_SOFTWARE_DIR).split(";") if p.strip()
+    p.strip() for p in os.environ.get("ELGIN_QUOTE_SHEET_DIRS", _default_img_dirs).split(";") if p.strip()
 ]
 _MS_IMG_EXTS = (".jpg", ".jpeg", ".png", ".gif", ".webp")
+_MS_MODEL_EXTS = (".igs", ".iges", ".easm", ".x_t", ".xt", ".step", ".stp")
 _MS_SHEET_EXTS = (".xls", ".xlsx", ".xlsm", ".pdf")
 _ms_img_cache = {}
+_ms_model_cache = {}
+_MS_COMPONENT_KINDS = ("TCP", "BCP", "ID HOLDER", "OD HOLDER", "ID POT", "OD POT")
 
 
 def ms_fmt_num(v) -> str:
@@ -11801,27 +11808,78 @@ def ms_fmt_num(v) -> str:
     return ("%.3f" % f).rstrip("0").rstrip(".")
 
 
-def ms_classify_image(fn: str) -> str:
-    u = fn.upper()
-    if "HOLDER" in u and ("OD" in u or "BOT" in u):
-        return "OD HOLDER"
-    if "HOLDER" in u and ("ID" in u or "TOP" in u):
+def ms_classify_component_filename(fn: str) -> str:
+    """Map a job artifact filename to TCP/BCP/holder/pot kind."""
+    u = fn.upper().replace("_", " ")
+    compact = re.sub(r"[^A-Z0-9]", "", u)
+    if "IDHOLDER" in compact or ("HOLDER" in u and "ID" in u and "OD" not in u):
         return "ID HOLDER"
+    if "ODHOLDER" in compact or ("HOLDER" in u and ("OD" in u or "BOT" in u)):
+        return "OD HOLDER"
     if "HOLDER" in u:
         return "ID HOLDER"
-    if "POT" in u and ("OD" in u or "BOT" in u):
-        return "OD POT"
-    if "POT" in u and ("ID" in u or "TOP" in u):
+    if "IDPOT" in compact or ("POT" in u and "ID" in u and "OD" not in u):
         return "ID POT"
-    if "TCP" in u or "TOP CLAMP" in u:
+    if "ODPOT" in compact or ("POT" in u and ("OD" in u or "BOT" in u)):
+        return "OD POT"
+    if "TCP" in u or "TOPSMED" in compact or "TOP CLAMP" in u:
         return "TCP"
-    if "BCP" in u or "BOTTOM CLAMP" in u:
+    if "BCP" in u or "BOTTOMSMED" in compact or "BOTTOM CLAMP" in u or "BOT CLAMP" in u:
         return "BCP"
     if "BACK" in u and "ISO" in u:
         return "BACK ISO"
     if "ISO" in u:
         return "ISO"
     return "OTHER"
+
+
+def ms_classify_image(fn: str) -> str:
+    return ms_classify_component_filename(fn)
+
+
+def _ms_job_search_roots(job_num: str) -> list[str]:
+    j = normalize_job_num(job_num) or (job_num or "")
+    roots = []
+    seen = set()
+    for base in ELGIN_JOB_IMAGE_DIRS:
+        if not base:
+            continue
+        for cand in (base, os.path.join(base, j), os.path.join(base, "J" + j)):
+            cand = os.path.normpath(cand)
+            if cand in seen:
+                continue
+            seen.add(cand)
+            if os.path.isdir(cand):
+                roots.append(cand)
+    local_job = os.path.join(ELGIN_LOCAL_WORKSPACE_ROOT, j)
+    if os.path.isdir(local_job) and local_job not in seen:
+        roots.append(local_job)
+    return roots
+
+
+def _ms_walk_job_files(job_num: str, allowed_exts: tuple[str, ...], limit: int = 12000):
+    jnorm = re.sub(r"[^A-Z0-9]", "", (normalize_job_num(job_num) or job_num or "").upper())
+    if not jnorm:
+        return
+    scanned = 0
+    for base in _ms_job_search_roots(job_num):
+        for root, dirs, files in os.walk(base):
+            depth = root[len(base):].count(os.sep) if root.startswith(base) else root.count(os.sep)
+            if depth > 5:
+                dirs[:] = []
+                continue
+            for fn in files:
+                ext = os.path.splitext(fn)[1].lower()
+                if ext not in allowed_exts:
+                    continue
+                fnnorm = re.sub(r"[^A-Z0-9]", "", fn.upper())
+                # Accept files named with the job number OR anything inside the job folder.
+                in_job_folder = jnorm in re.sub(r"[^A-Z0-9]", "", root.upper())
+                if jnorm in fnnorm or in_job_folder:
+                    yield os.path.join(root, fn), fn
+                scanned += 1
+                if scanned >= limit:
+                    return
 
 
 def ms_find_job_images(job_num: str):
@@ -11832,41 +11890,58 @@ def ms_find_job_images(job_num: str):
     if cached and (now - cached[0]) < 30:
         return cached[1]
 
-    jnorm = re.sub(r"[^A-Z0-9]", "", key)
     found = []
     seen = set()
-    if jnorm:
-        for base in ELGIN_JOB_IMAGE_DIRS:
-            if not base or not os.path.isdir(base):
-                continue
-            scanned = 0
-            for root, dirs, files in os.walk(base):
-                depth = root[len(base):].count(os.sep)
-                if depth > 4:
-                    dirs[:] = []
-                    continue
-                for fn in files:
-                    ext = os.path.splitext(fn)[1].lower()
-                    if ext not in _MS_IMG_EXTS:
-                        continue
-                    fnnorm = re.sub(r"[^A-Z0-9]", "", fn.upper())
-                    if jnorm in fnnorm:
-                        full = os.path.join(root, fn)
-                        if full in seen:
-                            continue
-                        seen.add(full)
-                        found.append({"kind": ms_classify_image(fn), "label": fn, "path": full})
-                    scanned += 1
-                    if scanned > 8000:
-                        break
-                if scanned > 8000:
-                    break
+    for full, fn in _ms_walk_job_files(job_num, _MS_IMG_EXTS):
+        if full in seen:
+            continue
+        seen.add(full)
+        kind = ms_classify_image(fn)
+        found.append({"kind": kind, "label": fn, "path": full})
 
     order = {"ID HOLDER": 0, "OD HOLDER": 1, "ID POT": 2, "OD POT": 3,
              "TCP": 4, "BCP": 5, "ISO": 6, "BACK ISO": 7, "OTHER": 9}
     found.sort(key=lambda x: (order.get(x["kind"], 8), x["label"]))
     _ms_img_cache[key] = (now, found)
     return found
+
+
+def ms_find_job_models(job_num: str, kind: str = "") -> list[dict]:
+    j = normalize_job_num(job_num) or (job_num or "")
+    cache_key = (j.upper(), (kind or "").upper())
+    now = time.time()
+    cached = _ms_model_cache.get(cache_key)
+    if cached and (now - cached[0]) < 30:
+        return cached[1]
+
+    want = (kind or "").strip().upper()
+    found = []
+    seen = set()
+    for full, fn in _ms_walk_job_files(job_num, _MS_MODEL_EXTS):
+        if full in seen:
+            continue
+        seen.add(full)
+        ck = ms_classify_component_filename(fn)
+        if want and ck != want:
+            continue
+        ext = os.path.splitext(fn)[1].lower()
+        found.append({
+            "kind": ck,
+            "label": fn,
+            "path": full,
+            "format": ext.lstrip("."),
+        })
+
+    # Prefer IGS for browser overlay, then EASM, then XT.
+    fmt_rank = {".igs": 0, ".iges": 0, ".easm": 1, ".x_t": 2, ".xt": 2, ".step": 3, ".stp": 3}
+    found.sort(key=lambda x: (fmt_rank.get("." + x["format"], 9), x["label"]))
+    _ms_model_cache[cache_key] = (now, found)
+    return found
+
+
+def ms_pick_best_model(job_num: str, kind: str) -> str:
+    models = ms_find_job_models(job_num, kind)
+    return models[0]["path"] if models else ""
 
 
 def ms_locate_sheet(j: str, kind: str) -> str:
@@ -12102,6 +12177,30 @@ async def ms_image(job: str, kind: str = "", i: int = 0):
     return FileResponse(path)
 
 
+@app.get("/api/match/models/{job_num}")
+async def ms_models_list(job_num: str, kind: str = ""):
+    models = ms_find_job_models(job_num, kind)
+    return {
+        "job_num": normalize_job_num(job_num),
+        "kind": kind,
+        "models": [{"kind": m["kind"], "label": m["label"], "format": m["format"]} for m in models],
+        "count": len(models),
+    }
+
+
+@app.get("/api/match/model")
+async def ms_model_file(job: str, kind: str = "", i: int = 0):
+    from fastapi.responses import FileResponse
+    models = ms_find_job_models(job, kind)
+    if not models:
+        raise HTTPException(404, "No 3D model found for this job/component")
+    idx = max(0, min(int(i), len(models) - 1))
+    path = models[idx]["path"]
+    if not os.path.isfile(path):
+        raise HTTPException(404, "Model file missing")
+    return FileResponse(path, filename=os.path.basename(path))
+
+
 @app.get("/api/match/file")
 async def ms_file(job: str, kind: str = "steel"):
     from fastapi.responses import FileResponse
@@ -12210,6 +12309,10 @@ select.dd{background:var(--panel2);border:1px solid var(--line);color:var(--ink)
 .ovstage{display:grid;grid-template-columns:1fr;gap:14px}
 .ovwrap{position:relative;width:100%;max-width:680px;margin:0 auto;border:1px solid var(--line);border-radius:12px;background:#0a101e;min-height:240px;display:flex;align-items:center;justify-content:center;overflow:hidden}
 .ovimg{max-width:100%;display:block}
+.ms3d{width:100%;max-width:900px;margin:14px auto 0;border:1px solid var(--line);border-radius:12px;background:#070d18;min-height:320px;position:relative;overflow:hidden}
+.ms3d canvas{display:block;width:100%!important;height:320px!important}
+.ms3d .ms3d-legend{position:absolute;left:10px;bottom:10px;display:flex;gap:10px;font-size:11px;color:var(--muted);background:rgba(0,0,0,.45);padding:6px 10px;border-radius:8px}
+.ms3d .dot{width:10px;height:10px;border-radius:50%;display:inline-block;margin-right:4px}
 .ovtop{position:absolute;inset:0;margin:auto;max-width:100%;max-height:100%;mix-blend-mode:normal}
 .sbs{display:grid;grid-template-columns:1fr 1fr;gap:14px}
 .imgbox{border:1px solid var(--line);border-radius:12px;background:#0a101e;min-height:220px;display:flex;flex-direction:column}
@@ -12261,6 +12364,7 @@ function money(v){var n=Number(v||0);return '$'+n.toLocaleString(undefined,{mini
 function money2(v){var n=Number(v||0);return '$'+n.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});}
 function scoreColor(s){var h=Math.max(0,Math.min(120,(Number(s)||0)*1.2));return 'hsl('+h+',75%,52%)';}
 function imgURL(job,kind){return '/api/match/image?job='+encodeURIComponent(job)+'&kind='+encodeURIComponent(kind)+'&i=0';}
+function modelURL(job,kind){return '/api/match/model?job='+encodeURIComponent(job)+'&kind='+encodeURIComponent(kind)+'&i=0';}
 
 function loadOverview(){
   api('/api/match/overview?limit=120').then(function(d){
@@ -12404,13 +12508,85 @@ function renderOverlay(m){
       +'<div class="ovwrap">'
         +'<img class="ovimg" src="'+imgURL(m.job_num,k)+'" onerror="this.style.visibility=\'hidden\'">'
         +'<img class="ovimg ovtop" id="ovTop" src="'+imgURL(STATE.job,k)+'" style="opacity:.5" onerror="this.style.visibility=\'hidden\'">'
-        +'<div class="ph" id="ovPh" style="position:absolute">'+esc(k)+' images load here when present</div>'
+        +'<div class="ph" id="ovPh" style="position:absolute">'+esc(k)+' preview loading…</div>'
       +'</div>'
-      +'<div class="slider"><span class="muted">'+esc(m.job_num)+'</span>'
+      +'<div class="slider"><span class="muted">'+esc(m.job_num)+' (orange 3D)</span>'
         +'<input type="range" min="0" max="100" value="50" oninput="document.getElementById(\'ovTop\').style.opacity=this.value/100">'
-        +'<span class="muted">'+esc(STATE.job)+'</span></div>'
-      +'<div class="legend">Slide to fade between the matched holder (left) and the current holder (right) to judge similarity.</div>'
+        +'<span class="muted">'+esc(STATE.job)+' (blue 3D)</span></div>'
+      +'<div class="legend">JPG overlay when ISO previews exist. Otherwise use the color-coded IGS/EASM viewer below (drag to orbit).</div>'
+      +'<div class="ms3d" id="ms3dHost"><div class="muted" style="padding:18px">Loading 3D overlay…</div></div>'
     +'</div>';
+    loadMs3dOverlay(STATE.job, m.job_num, k, 'ms3dHost');
+  }
+}
+
+async function loadMs3dOverlay(curJob, matchJob, kind, containerId){
+  var host=document.getElementById(containerId);
+  if(!host) return;
+  try{
+    var occMod=await import('https://cdn.jsdelivr.net/npm/occt-import-js@0.0.22/dist/occt-import-js.js');
+    var occt=await occMod.default();
+    var THREE=await import('https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js');
+    var OrbitControls=(await import('https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js')).OrbitControls;
+    async function fetchBuf(job){
+      var r=await fetch(modelURL(job,kind));
+      if(!r.ok) return null;
+      return r.arrayBuffer();
+    }
+    var bufCur=await fetchBuf(curJob);
+    var bufMatch=await fetchBuf(matchJob);
+    if(!bufCur && !bufMatch){
+      host.innerHTML='<div class="muted" style="padding:18px">No IGS/EASM for <b>'+esc(kind)+'</b>. The macro saves these in the job folder (e.g. J'+esc(curJob)+'_ID HOLDER_….igs). Re-run export or open the EASM from the job folder.</div>';
+      return;
+    }
+    host.innerHTML='';
+    var renderer=new THREE.WebGLRenderer({antialias:true,alpha:true});
+    renderer.setPixelRatio(window.devicePixelRatio||1);
+    renderer.setSize(host.clientWidth||860,320);
+    host.appendChild(renderer.domElement);
+    var scene=new THREE.Scene();
+    scene.background=new THREE.Color(0x070d18);
+    var camera=new THREE.PerspectiveCamera(45,renderer.domElement.width/renderer.domElement.height,0.1,10000);
+    camera.position.set(120,90,120);
+    var controls=new OrbitControls(camera,renderer.domElement);
+    controls.enableDamping=true;
+    var light1=new THREE.DirectionalLight(0xffffff,1.1);light1.position.set(1,2,1);scene.add(light1);
+    scene.add(new THREE.AmbientLight(0xffffff,0.45));
+    function addMeshes(buf,color,opacity){
+      if(!buf) return;
+      var ext=(kind||'').toLowerCase();
+      var parsed=null;
+      try{ parsed=occt.ReadIgesFile(new Uint8Array(buf)); }catch(e){parsed=null;}
+      if(!parsed || !parsed.meshes || !parsed.meshes.length){
+        try{ parsed=occt.ReadStepFile(new Uint8Array(buf)); }catch(e2){parsed=null;}
+      }
+      if(!parsed || !parsed.meshes) return;
+      parsed.meshes.forEach(function(mh){
+        var geom=new THREE.BufferGeometry();
+        geom.setAttribute('position',new THREE.Float32BufferAttribute(mh.attributes.position.array,3));
+        if(mh.attributes.normal) geom.setAttribute('normal',new THREE.Float32BufferAttribute(mh.attributes.normal.array,3));
+        if(mh.index) geom.setIndex(mh.index.array);
+        geom.computeBoundingSphere();
+        var mat=new THREE.MeshPhongMaterial({color:color,transparent:true,opacity:opacity,side:THREE.DoubleSide});
+        scene.add(new THREE.Mesh(geom,mat));
+      });
+    }
+    addMeshes(bufMatch,0xff8c42,0.55);
+    addMeshes(bufCur,0x3b82f6,0.72);
+    var box=new THREE.Box3().setFromObject(scene);
+    var center=box.getCenter(new THREE.Vector3());
+    var size=box.getSize(new THREE.Vector3());
+    var maxDim=Math.max(size.x,size.y,size.z,1);
+    camera.position.copy(center).add(new THREE.Vector3(maxDim*1.4,maxDim,maxDim*1.4));
+    controls.target.copy(center);
+  var leg=document.createElement('div');leg.className='ms3d-legend';
+  leg.innerHTML='<span><i class="dot" style="background:#3b82f6"></i>'+esc(curJob)+' current</span><span><i class="dot" style="background:#ff8c42"></i>'+esc(matchJob)+' match</span>';
+  host.appendChild(leg);
+    function anim(){requestAnimationFrame(anim);controls.update();renderer.render(scene,camera);}
+    anim();
+    var ph=document.getElementById('ovPh'); if(ph) ph.style.display='none';
+  }catch(err){
+    host.innerHTML='<div class="muted" style="padding:18px">3D overlay unavailable: '+esc(err.message||err)+'. ISO JPG previews may still appear above when the macro exports them.</div>';
   }
 }
 

@@ -118,6 +118,17 @@ Private Const INSERT_LENGTH_MATCH_TOL_LOOSE As Double = 1.5
 Private Const CREATE_INDIVIDUAL_DXFS As Boolean = False
 Private Const CREATE_DXFS_DURING_XT_SAVE As Boolean = True
 
+' Speed: skip slow per-part PRINTS DXFs and heavy BASE/HOLDERS DXF packages.
+Private Const FAST_BATCH_EXPORT As Boolean = True
+Private Const FAST_SKIP_PRINTS_DXF As Boolean = True
+Private Const FAST_SKIP_BASE_PACKAGE_DXF As Boolean = True
+Private Const FAST_SKIP_HOLDERS_PACKAGE_DXF As Boolean = True
+
+' Match Studio previews (ISO JPG + per-component IGS/EASM for Elgin overlay).
+Private Const CREATE_COMPONENT_ISO_JPEGS As Boolean = True
+Private Const CREATE_COMPONENT_IGS_WITH_XT As Boolean = True
+Private Const CREATE_COMPONENT_EASM_WITH_XT As Boolean = True
+
 ' UPDATED: this is now honored for BASE/HOLDERS too in later DXF code.
 Private Const FORCE_ALL_DXF_VIEWS_1_TO_1 As Boolean = True
 
@@ -3376,6 +3387,7 @@ On Error GoTo ErrHandler
 
     Dim makeDxf As Boolean
     makeDxf = ShouldCreateStandardPrintDxf(q.quoteName)
+    If FAST_BATCH_EXPORT And FAST_SKIP_PRINTS_DXF Then makeDxf = False
 
     If isPyropel Then
         makeDxf = True
@@ -3441,6 +3453,99 @@ Private Function ShouldCreateStandardPrintDxf(ByVal quoteName As String) As Bool
     If k = "BCP" Then ShouldCreateStandardPrintDxf = True: Exit Function
 
 End Function
+
+Private Function ShouldExportComponentArtifacts(ByVal quoteName As String) As Boolean
+    Dim k As String
+    k = NormalizeKey(quoteName)
+    If k = "IDHOLDER" Or k = "ODHOLDER" Or k = "IDPOTBLOCK" Or k = "ODPOTBLOCK" Then
+        ShouldExportComponentArtifacts = True
+    ElseIf k = "TCP" Or k = "BCP" Then
+        ShouldExportComponentArtifacts = True
+    ElseIf InStr(k, "POT") > 0 Then
+        ShouldExportComponentArtifacts = True
+    End If
+End Function
+
+Private Sub ExportComponentMatchStudioArtifacts(ByVal assyModel As Object, _
+                                                ByVal quoteName As String, _
+                                                ByVal xtPath As String)
+On Error GoTo ErrHandler
+    If assyModel Is Nothing Then Exit Sub
+    If xtPath = "" Then Exit Sub
+
+    Dim folder As String
+    folder = GetParentFolderPath(xtPath)
+    EnsureFolderDeep folder
+
+    If CREATE_COMPONENT_IGS_WITH_XT Then
+        Dim igsPath As String
+        igsPath = ReplaceExtension(xtPath, "igs")
+        SaveModelAs assyModel, igsPath
+    End If
+
+    If CREATE_COMPONENT_EASM_WITH_XT Then
+        If assyModel.GetType = swDocASSEMBLY Then
+            Dim easmPath As String
+            easmPath = ReplaceExtension(xtPath, "easm")
+            SaveModelAs assyModel, easmPath
+        End If
+    End If
+
+    If CREATE_COMPONENT_ISO_JPEGS Then
+        ExportComponentIsoJpeg assyModel, quoteName, folder
+    End If
+    Exit Sub
+ErrHandler:
+    LogLine "ExportComponentMatchStudioArtifacts error: " & Err.Description
+End Sub
+
+Private Function ReplaceExtension(ByVal path As String, ByVal newExt As String) As String
+    Dim dot As Long
+    dot = InStrRev(path, ".")
+    If dot > 0 Then
+        ReplaceExtension = Left(path, dot - 1) & "." & newExt
+    Else
+        ReplaceExtension = path & "." & newExt
+    End If
+End Function
+
+Private Function GetParentFolderPath(ByVal path As String) As String
+    On Error Resume Next
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    GetParentFolderPath = fso.GetParentFolderName(path)
+End Function
+
+Private Sub ExportComponentIsoJpeg(ByVal assyModel As Object, _
+                                   ByVal quoteName As String, _
+                                   ByVal outputFolder As String)
+On Error GoTo ErrHandler
+    If assyModel Is Nothing Then Exit Sub
+    If outputFolder = "" Then Exit Sub
+
+    EnsureFolderDeep outputFolder
+    assyModel.ShowNamedView2 "*Isometric", 7
+    assyModel.ViewZoomtofit2
+    assyModel.GraphicsRedraw2
+
+    Dim jpgPath As String
+    jpgPath = GetUniqueFilePath(outputFolder & "\" & CurrentJobNumber & "_" & quoteName & " ISO.jpg")
+    SaveViewAsImage assyModel, jpgPath
+    LogLine "Saved component ISO preview: " & jpgPath
+    Exit Sub
+ErrHandler:
+    LogLine "ExportComponentIsoJpeg error: " & Err.Description
+End Sub
+
+Private Sub SaveViewAsImage(ByVal model As Object, ByVal imagePath As String)
+On Error GoTo ErrHandler
+    Dim errs As Long
+    Dim warns As Long
+    model.Extension.SaveAs3 imagePath, swSaveAsCurrentVersion, swSaveAsOptions_Silent, Nothing, Nothing, errs, warns
+    Exit Sub
+ErrHandler:
+    LogLine "SaveViewAsImage error: " & Err.Description
+End Sub
 
 ' ============================================================
 ' SUPPRESS-ISOLATE EXPORT ROUTINES
@@ -3573,6 +3678,10 @@ On Error GoTo ErrHandler
     If fso.FileExists(xtPath) = False Then
         LogLine "Suppress-isolate failed: XT was not created."
         GoTo CleanExit
+    End If
+
+    If ShouldExportComponentArtifacts(quoteName) Then
+        ExportComponentMatchStudioArtifacts assyModel, quoteName, xtPath
     End If
 
     If makeDxf And CREATE_DXFS_DURING_XT_SAVE Then
@@ -4118,6 +4227,10 @@ On Error GoTo ErrHandler
     SaveModelAs swModel, mainXtPath
     SaveModelAs swModel, mainIgsPath
 
+    If CREATE_COMPONENT_ISO_JPEGS Then
+        ExportComponentIsoJpeg swModel, "BASE ISO", outputFolder
+    End If
+
     CreateBaseDxfFromSelectedComponents mainXtPath, mainDxfPath
 
     Dim idHolderIdx As Long
@@ -4149,6 +4262,11 @@ End Sub
 Private Sub CreateBaseDxfFromSelectedComponents(ByVal fullBaseXtPath As String, _
                                                 ByVal mainDxfPath As String)
 On Error GoTo ErrHandler
+
+    If FAST_BATCH_EXPORT And FAST_SKIP_BASE_PACKAGE_DXF Then
+        LogLine "FAST: skipping MAIN ASSEMBLY BASE DXF."
+        Exit Sub
+    End If
 
     If swModel Is Nothing Then Exit Sub
 
@@ -4431,14 +4549,18 @@ On Error GoTo ErrHandler
 
     SaveModelAs swModel, holdersIgsPath
 
-    LogLine "HOLDERS DXF: saving native temp SLDASM:"
-    LogLine "  " & holdersTempNativePath
+    If FAST_BATCH_EXPORT And FAST_SKIP_HOLDERS_PACKAGE_DXF Then
+        LogLine "FAST: skipping HOLDERS DXF (IGS still saved)."
+    Else
+        LogLine "HOLDERS DXF: saving native temp SLDASM:"
+        LogLine "  " & holdersTempNativePath
 
-    If SaveModelCopyAs(swModel, holdersTempNativePath) = False Then GoTo CleanExit
+        If SaveModelCopyAs(swModel, holdersTempNativePath) = False Then GoTo CleanExit
 
-    CreateProjectedDxfFromNativePath holdersTempNativePath, holdersDxfPath, "HOLDERS", _
-                                     CMS_TOP_VIEW_NAME, "*Top", _
-                                     False, False, False, True
+        CreateProjectedDxfFromNativePath holdersTempNativePath, holdersDxfPath, "HOLDERS", _
+                                         CMS_TOP_VIEW_NAME, "*Top", _
+                                         False, False, False, True
+    End If
 
     If hiddenNames.count > 0 Then
         ShowNamedComponentsOnce swModel, hiddenNames
@@ -11800,22 +11922,29 @@ End Sub
 
 Private Sub CopyMatchingArtifacts(ByVal srcFolder As String, ByVal dstFolder As String)
     On Error Resume Next
+    CopyMatchingArtifactsRecursive srcFolder, dstFolder, 0
+End Sub
+
+Private Sub CopyMatchingArtifactsRecursive(ByVal srcFolder As String, ByVal dstFolder As String, ByVal depth As Long)
+    On Error Resume Next
+    If depth > 3 Then Exit Sub
     Dim fso As Object
     Set fso = CreateObject("Scripting.FileSystemObject")
     If Not fso.FolderExists(srcFolder) Then Exit Sub
-    Dim f As Object, nm As String, up As String, ext As String, take As Boolean
+    Dim f As Object, sub_ As Object, nm As String, ext As String, take As Boolean
     For Each f In fso.GetFolder(srcFolder).Files
         nm = f.Name
-        up = UCase$(nm)
         ext = UCase$(GetFileExtension(nm))
         take = False
         If ext = "JPG" Or ext = "JPEG" Or ext = "PNG" Then take = True
-        If ext = "CSV" Then take = True
-        If ext = "TXT" Then take = True
-        If ext = "PDF" Then take = True
-        If (ext = "XLS" Or ext = "XLSX" Or ext = "XLSM") Then take = True
+        If ext = "CSV" Or ext = "TXT" Or ext = "PDF" Then take = True
+        If ext = "XLS" Or ext = "XLSX" Or ext = "XLSM" Then take = True
+        If ext = "IGS" Or ext = "IGES" Or ext = "EASM" Or ext = "X_T" Or ext = "XT" Then take = True
         If take Then fso.CopyFile f.Path, dstFolder & "\" & nm, True
     Next f
+    For Each sub_ In fso.GetFolder(srcFolder).SubFolders
+        CopyMatchingArtifactsRecursive sub_.Path, dstFolder, depth + 1
+    Next sub_
 End Sub
 
 Private Sub UploadJobSignatureToElgin(ByVal csvPath As String)
@@ -11894,6 +12023,9 @@ Private Sub OrganizeJobFiles()
         names.Add f.Name
     Next f
     Dim idx As Long, nm As String, ext As String, dest As String, src As String, target As String
+    Dim movedBase As Long, movedPdf As Long
+    movedBase = 0
+    movedPdf = 0
     For idx = 1 To names.Count
         nm = names(idx)
         ext = UCase$(GetFileExtension(nm))
@@ -11912,9 +12044,10 @@ Private Sub OrganizeJobFiles()
             If fso.FileExists(target) Then target = GetUniqueFilePath(target)
             fso.MoveFile src, target
             On Error GoTo eh
-            LogLine "Organized: " & nm & " -> " & dest
+            If dest = baseDir Then movedBase = movedBase + 1 Else movedPdf = movedPdf + 1
         End If
     Next idx
+    LogLine "OrganizeJobFiles: moved " & movedBase & " CAD file(s) -> base, " & movedPdf & " report(s) -> pdf"
     Exit Sub
 eh:
     LogLine "OrganizeJobFiles error: " & Err.Description
