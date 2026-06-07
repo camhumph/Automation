@@ -124,10 +124,10 @@ Private Const FAST_SKIP_PRINTS_DXF As Boolean = True
 Private Const FAST_SKIP_BASE_PACKAGE_DXF As Boolean = True
 Private Const FAST_SKIP_HOLDERS_PACKAGE_DXF As Boolean = True
 
-' Match Studio previews (ISO JPG + per-component IGS/EASM for Elgin overlay).
+' Match Studio: holders only (ID/OD HOLDER IGS + ISO JPG). Skips TCP/BCP/POT to save export time.
 Private Const CREATE_COMPONENT_ISO_JPEGS As Boolean = True
 Private Const CREATE_COMPONENT_IGS_WITH_XT As Boolean = True
-Private Const CREATE_COMPONENT_EASM_WITH_XT As Boolean = True
+Private Const CREATE_COMPONENT_EASM_WITH_XT As Boolean = False
 
 ' UPDATED: this is now honored for BASE/HOLDERS too in later DXF code.
 Private Const FORCE_ALL_DXF_VIEWS_1_TO_1 As Boolean = True
@@ -3459,16 +3459,14 @@ Private Function ShouldCreateStandardPrintDxf(ByVal quoteName As String) As Bool
 
 End Function
 
-Private Function ShouldExportComponentArtifacts(ByVal quoteName As String) As Boolean
+Private Function IsHolderQuoteForMatchStudio(ByVal quoteName As String) As Boolean
     Dim k As String
     k = NormalizeKey(quoteName)
-    If k = "IDHOLDER" Or k = "ODHOLDER" Or k = "IDPOTBLOCK" Or k = "ODPOTBLOCK" Then
-        ShouldExportComponentArtifacts = True
-    ElseIf k = "TCP" Or k = "BCP" Then
-        ShouldExportComponentArtifacts = True
-    ElseIf InStr(k, "POT") > 0 Then
-        ShouldExportComponentArtifacts = True
-    End If
+    IsHolderQuoteForMatchStudio = (k = "IDHOLDER" Or k = "ODHOLDER")
+End Function
+
+Private Function ShouldExportComponentArtifacts(ByVal quoteName As String) As Boolean
+    ShouldExportComponentArtifacts = IsHolderQuoteForMatchStudio(quoteName)
 End Function
 
 Private Sub ExportComponentMatchStudioArtifacts(ByVal assyModel As Object, _
@@ -3477,6 +3475,7 @@ Private Sub ExportComponentMatchStudioArtifacts(ByVal assyModel As Object, _
 On Error GoTo ErrHandler
     If assyModel Is Nothing Then Exit Sub
     If xtPath = "" Then Exit Sub
+    If IsHolderQuoteForMatchStudio(quoteName) = False Then Exit Sub
 
     Dim folder As String
     folder = GetParentFolderPath(xtPath)
@@ -3486,6 +3485,7 @@ On Error GoTo ErrHandler
         Dim igsPath As String
         igsPath = ReplaceExtension(xtPath, "igs")
         SaveModelAs assyModel, igsPath
+        LogLine "Match Studio holder IGS: " & igsPath
     End If
 
     If CREATE_COMPONENT_EASM_WITH_XT Then

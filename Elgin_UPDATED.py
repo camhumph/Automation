@@ -12338,9 +12338,11 @@ select.dd{background:var(--panel2);border:1px solid var(--line);color:var(--ink)
 .ovstage{display:grid;grid-template-columns:1fr;gap:14px}
 .ovwrap{position:relative;width:100%;max-width:680px;margin:0 auto;border:1px solid var(--line);border-radius:12px;background:#0a101e;min-height:240px;display:flex;align-items:center;justify-content:center;overflow:hidden}
 .ovimg{max-width:100%;display:block}
-.ms3d{width:100%;max-width:900px;margin:14px auto 0;border:1px solid var(--line);border-radius:12px;background:#070d18;min-height:320px;position:relative;overflow:hidden}
-.ms3d canvas{display:block;width:100%!important;height:320px!important}
-.ms3d .ms3d-legend{position:absolute;left:10px;bottom:10px;display:flex;gap:10px;font-size:11px;color:var(--muted);background:rgba(0,0,0,.45);padding:6px 10px;border-radius:8px}
+.ms3d{width:100%;max-width:900px;margin:14px auto 0;border:1px solid var(--line);border-radius:12px;background:#070d18;min-height:400px;position:relative;overflow:hidden;touch-action:none;cursor:grab}
+.ms3d:active{cursor:grabbing}
+.ms3d canvas{display:block;width:100%!important;height:400px!important}
+.ms3d .ms3d-legend{position:absolute;left:10px;bottom:10px;display:flex;flex-wrap:wrap;gap:10px;font-size:11px;color:var(--muted);background:rgba(0,0,0,.55);padding:6px 10px;border-radius:8px;pointer-events:none}
+.ms3d .ms3d-hint{position:absolute;right:10px;top:10px;font-size:11px;color:var(--muted);background:rgba(0,0,0,.45);padding:5px 9px;border-radius:8px;pointer-events:none}
 .ms3d .dot{width:10px;height:10px;border-radius:50%;display:inline-block;margin-right:4px}
 .ovtop{position:absolute;inset:0;margin:auto;max-width:100%;max-height:100%;mix-blend-mode:normal}
 .sbs{display:grid;grid-template-columns:1fr 1fr;gap:14px}
@@ -12386,6 +12388,8 @@ code{background:#0a101e;border:1px solid var(--line);padding:1px 6px;border-radi
 <script>
 var STATE={jobs:[],job:null,data:null,match:null,cmpKind:'ID HOLDER',cmpMode:'overlay',imgCur:{},imgMatch:{}};
 var COMPONENTS=['TCP','BCP','ID HOLDER','OD HOLDER','ID POT','OD POT'];
+var HOLDER_IGS_KINDS=['ID HOLDER','OD HOLDER'];
+function isHolderIgsKind(k){ return HOLDER_IGS_KINDS.indexOf(k)>=0; }
 
 function api(p){return fetch(p).then(function(r){if(!r.ok)throw new Error(r.status);return r.json();});}
 function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
@@ -12429,7 +12433,12 @@ function bindOverlayJpegs(curJob, matchJob, kind){
     if(pending>0) return;
     if(ph){
       if(anyOk){ ph.style.display='none'; }
-      else { ph.textContent=kind+' — no ISO JPG yet. Re-run CMS export (macro saves '+curJob+'_'+kind+' ISO.jpg). Using IGS viewer below.'; ph.style.display='block'; }
+      else {
+        ph.textContent=isHolderIgsKind(kind)
+          ? (kind+' — no ISO JPG yet. Re-run export (macro saves '+curJob+'_'+kind+' ISO.jpg + .igs).')
+          : (kind+' — ISO/JPG previews are exported for ID HOLDER and OD HOLDER only.');
+        ph.style.display='block';
+      }
     }
   }
   function wire(img,isTop){
@@ -12588,11 +12597,21 @@ function renderOverlay(m){
       +'<div class="slider"><span class="muted">'+esc(m.job_num)+' (match)</span>'
         +'<input type="range" min="0" max="100" value="50" oninput="document.getElementById(\'ovTop\').style.opacity=this.value/100">'
         +'<span class="muted">'+esc(STATE.job)+' (current)</span></div>'
-      +'<div class="legend">ISO <b>JPG</b> fade on top when the macro exports <code>J'+esc(STATE.job)+'_'+esc(k)+' ISO.jpg</code>. Color-coded <b>IGS</b> 3D overlay below (orange=match, blue=current).</div>'
-      +'<div class="ms3d" id="ms3dHost"><div class="muted" style="padding:18px">Loading IGS 3D overlay…</div></div>'
+      +'<div class="legend">'+(
+        isHolderIgsKind(k)
+          ? 'Holder compare: ISO <b>JPG</b> fade above. Spin the color-coded <b>IGS</b> models below (drag=orbit, scroll=zoom).'
+          : 'ISO <b>JPG</b> fade when <code>J'+esc(STATE.job)+'_'+esc(k)+' ISO.jpg</code> exists. IGS 3D is holders only (ID/OD HOLDER tabs).'
+      )+'</div>'
+      +(isHolderIgsKind(k)
+        ? '<div class="ms3d" id="ms3dHost"><div class="muted" style="padding:18px">Loading holder IGS…</div></div>'
+        : '')
     +'</div>';
-    bindOverlayJpegs(STATE.job, m.job_num, k);
-    loadMs3dOverlay(STATE.job, m.job_num, k, 'ms3dHost');
+    if(isHolderIgsKind(k)){
+      bindOverlayJpegs(STATE.job, m.job_num, k);
+      loadMs3dOverlay(STATE.job, m.job_num, k, 'ms3dHost');
+    } else {
+      bindOverlayJpegs(STATE.job, m.job_num, k);
+    }
   }
 }
 
@@ -12617,19 +12636,36 @@ async function loadMs3dOverlay(curJob, matchJob, kind, containerId){
       host.innerHTML='<div class="muted" style="padding:18px">No <b>IGS</b> for <b>'+esc(kind)+'</b>. Re-run CMS export — the macro saves <code>'+esc(curJob)+'_'+esc(kind)+'_….igs</code> next to the XT in PRINTS.</div>';
       return;
     }
+    if(!isHolderIgsKind(kind)){
+      host.innerHTML='<div class="muted" style="padding:18px">IGS 3D compare is for <b>ID HOLDER</b> and <b>OD HOLDER</b> only.</div>';
+      return;
+    }
     host.innerHTML='';
+    var viewH=400;
     var renderer=new THREE.WebGLRenderer({antialias:true,alpha:true});
     renderer.setPixelRatio(window.devicePixelRatio||1);
-    renderer.setSize(host.clientWidth||860,320);
+    function resizeRenderer(){
+      var w=host.clientWidth||860;
+      renderer.setSize(w,viewH);
+      camera.aspect=w/viewH;
+      camera.updateProjectionMatrix();
+    }
     host.appendChild(renderer.domElement);
     var scene=new THREE.Scene();
     scene.background=new THREE.Color(0x070d18);
-    var camera=new THREE.PerspectiveCamera(45,renderer.domElement.width/renderer.domElement.height,0.1,10000);
+    var camera=new THREE.PerspectiveCamera(45,(host.clientWidth||860)/viewH,0.1,10000);
     camera.position.set(120,90,120);
     var controls=new OrbitControls(camera,renderer.domElement);
     controls.enableDamping=true;
-    var light1=new THREE.DirectionalLight(0xffffff,1.1);light1.position.set(1,2,1);scene.add(light1);
-    scene.add(new THREE.AmbientLight(0xffffff,0.45));
+    controls.dampingFactor=0.08;
+    controls.rotateSpeed=0.9;
+    controls.enablePan=true;
+    controls.enableZoom=true;
+    controls.minDistance=1;
+    controls.maxDistance=5000;
+    var light1=new THREE.DirectionalLight(0xffffff,1.15);light1.position.set(1,2,1);scene.add(light1);
+    var light2=new THREE.DirectionalLight(0xffffff,0.55);light2.position.set(-1,-1,-2);scene.add(light2);
+    scene.add(new THREE.AmbientLight(0xffffff,0.4));
     function parseCad(buf, fmt){
       if(!buf) return null;
       var u8=new Uint8Array(buf);
@@ -12679,9 +12715,13 @@ async function loadMs3dOverlay(curJob, matchJob, kind, containerId){
     var maxDim=Math.max(size.x,size.y,size.z,1);
     camera.position.copy(center).add(new THREE.Vector3(maxDim*1.4,maxDim,maxDim*1.4));
     controls.target.copy(center);
+    resizeRenderer();
+    window.addEventListener('resize',resizeRenderer);
     var leg=document.createElement('div');leg.className='ms3d-legend';
-    leg.innerHTML='<span><i class="dot" style="background:#3b82f6"></i>'+esc(curJob)+' current (IGS)</span><span><i class="dot" style="background:#ff8c42"></i>'+esc(matchJob)+' match (IGS)</span>';
+    leg.innerHTML='<span><i class="dot" style="background:#3b82f6"></i>'+esc(curJob)+' current</span><span><i class="dot" style="background:#ff8c42"></i>'+esc(matchJob)+' match</span>';
     host.appendChild(leg);
+    var hint=document.createElement('div');hint.className='ms3d-hint';hint.textContent='Drag to spin · scroll to zoom';
+    host.appendChild(hint);
     function anim(){requestAnimationFrame(anim);controls.update();renderer.render(scene,camera);}
     anim();
   }catch(err){
