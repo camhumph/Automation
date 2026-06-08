@@ -134,6 +134,9 @@ Private Const FAST_SKIP_HOLDERS_PACKAGE_DXF As Boolean = False
 ' Match Studio: no JPEG previews.
 Private Const CREATE_COMPONENT_ISO_JPEGS As Boolean = False
 Private Const CREATE_MATCH_STUDIO_HOLDERS_STL As Boolean = True
+Private Const CREATE_MATCH_STUDIO_STL_PACKAGE As Boolean = True
+Private Const MATCH_STUDIO_STL_FOLDER_SUFFIX As String = " STL"
+Private Const MATCH_STUDIO_STL_COMBINED_TOKEN As String = "MATCH SET"
 Private Const CREATE_COMPONENT_IGS_WITH_XT As Boolean = False
 Private Const CREATE_COMPONENT_EASM_WITH_XT As Boolean = False
 
@@ -1207,6 +1210,7 @@ On Error GoTo ErrHandler
     DeleteFolderSafe jobFolder & "\" & jobNumber & " " & PULLCORE_CAM_KEY_FOLDER_NAME
     DeleteFolderSafe jobFolder & "\" & jobNumber & " " & PULLCORE_STOP_FOLDER_NAME
     DeleteFolderSafe jobFolder & "\" & jobNumber & " MISC DETAILS"
+    DeleteFolderSafe jobFolder & "\" & jobNumber & MATCH_STUDIO_STL_FOLDER_SUFFIX
 
     DeleteOldBaseHolderRootFiles jobFolder, jobNumber
 
@@ -1444,6 +1448,9 @@ On Error GoTo ErrHandler
 
     CopyFolderIfExists CurrentJobFolder & "\" & CurrentJobNumber & " " & PULLCORE_STOP_FOLDER_NAME, _
                        NetworkJobFolder & "\" & CurrentJobNumber & " " & PULLCORE_STOP_FOLDER_NAME
+
+    CopyFolderIfExists CurrentJobFolder & "\" & CurrentJobNumber & MATCH_STUDIO_STL_FOLDER_SUFFIX, _
+                       NetworkJobFolder & "\" & CurrentJobNumber & MATCH_STUDIO_STL_FOLDER_SUFFIX
 
     CopyFolderIfExists LOCAL_WORKSPACE_ROOT & "\" & CleanFileName(CurrentJobNumber) & "\" & CurrentJobNumber & " Base", _
                        NetworkJobFolder & "\" & CurrentJobNumber & " Base"
@@ -3434,6 +3441,12 @@ On Error GoTo ErrHandler
         LogDone "Create MAIN ASSEMBLY / HOLDERS package"
     End If
 
+    If CREATE_MATCH_STUDIO_STL_PACKAGE Then
+        LogStart "Create MATCH STUDIO STL package"
+        ExportMatchStudioStlPackage CurrentJobFolder
+        LogDone "Create MATCH STUDIO STL package"
+    End If
+
     If CREATE_J_BLOCK_PACKAGE Then
         LogStart "Create J BLOCK package"
         ExportJBlockPackage CurrentJobFolder
@@ -4743,6 +4756,290 @@ ErrHandler:
     On Error Resume Next
     ShowAllAssemblyComponents swModel
     Resume CleanExit
+End Sub
+
+' ============================================================
+' MATCH STUDIO STL PACKAGE
+' Exports individual STL files and one combined six-component STL:
+'   ID POT, OD POT, BCP, TCP, ID HOLDER, OD HOLDER
+' ============================================================
+
+Private Sub ExportMatchStudioStlPackage(ByVal outputFolder As String)
+On Error GoTo ErrHandler
+
+    If swModel Is Nothing Then Exit Sub
+
+    If swModel.GetType <> swDocASSEMBLY Then
+        LogLine "MATCH STUDIO STL package skipped: active model is not an assembly."
+        Exit Sub
+    End If
+
+    Dim stlFolder As String
+    stlFolder = outputFolder & "\" & CurrentJobNumber & MATCH_STUDIO_STL_FOLDER_SUFFIX
+
+    EnsureFolderDeep stlFolder
+
+    Dim custToken As String
+    Dim dateToken As String
+
+    custToken = CleanFileName(CustomerNumber)
+    dateToken = CleanFileName(DateCode)
+
+    If custToken = "" Then custToken = "UNKNOWN"
+    If dateToken = "" Then dateToken = Format(Date, "mm-dd-yyyy")
+
+    LogLine "Creating Match Studio STL folder:"
+    LogLine "  " & stlFolder
+
+    UnsuppressAllAssemblyComponents swModel
+    ShowAllAssemblyComponents swModel
+    ApplyCmsTopView swModel
+
+    ExportMatchStudioOneComponentStl stlFolder, "ID POT", "ID POT BLOCK", _
+        "ID POT BLOCK|ID POT|TOP POT BLOCK|TOP POT|TCP POT BLOCK|TCP POT", _
+        custToken, dateToken
+
+    ExportMatchStudioOneComponentStl stlFolder, "OD POT", "OD POT BLOCK", _
+        "OD POT BLOCK|OD POT|BOTTOM POT BLOCK|BOT POT BLOCK|BOTTOM POT|BOT POT|BCP POT BLOCK|BCP POT", _
+        custToken, dateToken
+
+    ExportMatchStudioOneComponentStl stlFolder, "BCP", "BCP", _
+        "BCP|BOTTOM SMED|BOT SMED|BOTTOM SMED PLATE|BOT SMED PLATE|BOTTOM CLAMPING PLATE|BOT CLAMPING PLATE|BOTTOM CLAMPING|BOT CLAMPING|OD SMED", _
+        custToken, dateToken
+
+    ExportMatchStudioOneComponentStl stlFolder, "TCP", "TCP", _
+        "TCP|TOP SMED|TOP SMED PLATE|TOP CLAMPING PLATE|TOP CLAMPING|ID SMED", _
+        custToken, dateToken
+
+    ExportMatchStudioOneComponentStl stlFolder, "ID HOLDER", "ID HOLDER", _
+        ID_HOLDER_KEYS, _
+        custToken, dateToken
+
+    ExportMatchStudioOneComponentStl stlFolder, "OD HOLDER", "OD HOLDER", _
+        OD_HOLDER_KEYS, _
+        custToken, dateToken
+
+    ExportMatchStudioCombinedSixStl stlFolder, custToken, dateToken
+
+    UnsuppressAllAssemblyComponents swModel
+    ShowAllAssemblyComponents swModel
+    ApplyCmsTopView swModel
+
+    LogLine "Match Studio STL package complete."
+
+    Exit Sub
+
+ErrHandler:
+    LogLine "ExportMatchStudioStlPackage error: " & Err.Description
+    On Error Resume Next
+    UnsuppressAllAssemblyComponents swModel
+    ShowAllAssemblyComponents swModel
+End Sub
+
+Private Sub ExportMatchStudioOneComponentStl(ByVal stlFolder As String, _
+                                             ByVal label As String, _
+                                             ByVal quoteName As String, _
+                                             ByVal fallbackKeys As String, _
+                                             ByVal custToken As String, _
+                                             ByVal dateToken As String)
+On Error GoTo ErrHandler
+
+    If swModel Is Nothing Then Exit Sub
+    If swModel.GetType <> swDocASSEMBLY Then Exit Sub
+
+    Dim cadIdx As Long
+    cadIdx = FindCadIndexFromExportQuote(quoteName)
+
+    If cadIdx <= 0 Then
+        cadIdx = FindCadPartIndexByQuoteOrKeys(quoteName, fallbackKeys)
+    End If
+
+    If cadIdx <= 0 Or cadIdx > PartCount Then
+        LogLine "MATCH STUDIO STL skipped missing component: " & label
+        Exit Sub
+    End If
+
+    Dim keepNames As Collection
+    Set keepNames = New Collection
+
+    AddUniqueComponentName keepNames, parts(cadIdx).componentName
+
+    Dim hiddenNames As Collection
+    Set hiddenNames = New Collection
+
+    UnsuppressAllAssemblyComponents swModel
+    ShowAllAssemblyComponents swModel
+
+    If HideAllExceptComponentNamesOnce(swModel, keepNames, hiddenNames) = False Then
+        LogLine "MATCH STUDIO STL failed to isolate: " & label
+        GoTo CleanExit
+    End If
+
+    ApplyCmsTopView swModel
+    StabilizeActiveView swModel, 50
+
+    Dim token As String
+    token = CleanQuoteTokenForFile(label)
+    If token = "" Then token = "ITEM"
+
+    Dim stlPath As String
+    stlPath = stlFolder & "\" & _
+              CurrentJobNumber & "_" & token & "_" & custToken & "_" & dateToken & ".stl"
+
+    stlPath = GetUniqueFilePath(stlPath)
+
+    LogLine "Saving Match Studio component STL:"
+    LogLine "  " & label & " -> " & stlPath
+
+    SaveModelAs swModel, stlPath
+
+CleanExit:
+    On Error Resume Next
+
+    If Not hiddenNames Is Nothing Then
+        If hiddenNames.count > 0 Then
+            ShowNamedComponentsOnce swModel, hiddenNames
+        Else
+            ShowAllAssemblyComponents swModel
+        End If
+    Else
+        ShowAllAssemblyComponents swModel
+    End If
+
+    ApplyCmsTopView swModel
+    Exit Sub
+
+ErrHandler:
+    LogLine "ExportMatchStudioOneComponentStl error (" & label & "): " & Err.Description
+    Resume CleanExit
+End Sub
+
+Private Sub ExportMatchStudioCombinedSixStl(ByVal stlFolder As String, _
+                                            ByVal custToken As String, _
+                                            ByVal dateToken As String)
+On Error GoTo ErrHandler
+
+    If swModel Is Nothing Then Exit Sub
+    If swModel.GetType <> swDocASSEMBLY Then Exit Sub
+
+    Dim keepNames As Collection
+    Set keepNames = BuildMatchStudioSixComponentNames()
+
+    If keepNames Is Nothing Or keepNames.count = 0 Then
+        LogLine "MATCH STUDIO combined STL skipped: no six-pack components found."
+        Exit Sub
+    End If
+
+    Dim hiddenNames As Collection
+    Set hiddenNames = New Collection
+
+    UnsuppressAllAssemblyComponents swModel
+    ShowAllAssemblyComponents swModel
+
+    If HideAllExceptComponentNamesOnce(swModel, keepNames, hiddenNames) = False Then
+        LogLine "MATCH STUDIO combined STL failed: could not isolate six components."
+        GoTo CleanExit
+    End If
+
+    ApplyCmsTopView swModel
+    StabilizeActiveView swModel, 50
+
+    Dim token As String
+    token = CleanQuoteTokenForFile(MATCH_STUDIO_STL_COMBINED_TOKEN)
+    If token = "" Then token = "MATCH SET"
+
+    Dim stlPath As String
+    stlPath = stlFolder & "\" & _
+              CurrentJobNumber & "_" & token & "_" & custToken & "_" & dateToken & ".stl"
+
+    stlPath = GetUniqueFilePath(stlPath)
+
+    LogLine "Saving Match Studio combined six-component STL:"
+    LogLine "  Components kept=" & CStr(keepNames.count)
+    LogLine "  " & stlPath
+
+    SaveModelAs swModel, stlPath
+
+CleanExit:
+    On Error Resume Next
+
+    If Not hiddenNames Is Nothing Then
+        If hiddenNames.count > 0 Then
+            ShowNamedComponentsOnce swModel, hiddenNames
+        Else
+            ShowAllAssemblyComponents swModel
+        End If
+    Else
+        ShowAllAssemblyComponents swModel
+    End If
+
+    ApplyCmsTopView swModel
+    Exit Sub
+
+ErrHandler:
+    LogLine "ExportMatchStudioCombinedSixStl error: " & Err.Description
+    Resume CleanExit
+End Sub
+
+Private Function BuildMatchStudioSixComponentNames() As Collection
+On Error GoTo ErrHandler
+
+    Dim keepNames As New Collection
+
+    AddMatchStudioStlKeepComponent keepNames, "TCP", "TCP", _
+        "TCP|TOP SMED|TOP SMED PLATE|TOP CLAMPING PLATE|TOP CLAMPING|ID SMED"
+
+    AddMatchStudioStlKeepComponent keepNames, "BCP", "BCP", _
+        "BCP|BOTTOM SMED|BOT SMED|BOTTOM SMED PLATE|BOT SMED PLATE|BOTTOM CLAMPING PLATE|BOT CLAMPING PLATE|BOTTOM CLAMPING|BOT CLAMPING|OD SMED"
+
+    AddMatchStudioStlKeepComponent keepNames, "ID HOLDER", "ID HOLDER", _
+        ID_HOLDER_KEYS
+
+    AddMatchStudioStlKeepComponent keepNames, "OD HOLDER", "OD HOLDER", _
+        OD_HOLDER_KEYS
+
+    AddMatchStudioStlKeepComponent keepNames, "ID POT", "ID POT BLOCK", _
+        "ID POT BLOCK|ID POT|TOP POT BLOCK|TOP POT|TCP POT BLOCK|TCP POT"
+
+    AddMatchStudioStlKeepComponent keepNames, "OD POT", "OD POT BLOCK", _
+        "OD POT BLOCK|OD POT|BOTTOM POT BLOCK|BOT POT BLOCK|BOTTOM POT|BOT POT|BCP POT BLOCK|BCP POT"
+
+    Set BuildMatchStudioSixComponentNames = keepNames
+    Exit Function
+
+ErrHandler:
+    LogLine "BuildMatchStudioSixComponentNames error: " & Err.Description
+    Set BuildMatchStudioSixComponentNames = New Collection
+End Function
+
+Private Sub AddMatchStudioStlKeepComponent(ByVal keepNames As Collection, _
+                                           ByVal label As String, _
+                                           ByVal quoteName As String, _
+                                           ByVal fallbackKeys As String)
+On Error GoTo ErrHandler
+
+    If keepNames Is Nothing Then Exit Sub
+
+    Dim cadIdx As Long
+    cadIdx = FindCadIndexFromExportQuote(quoteName)
+
+    If cadIdx <= 0 Then
+        cadIdx = FindCadPartIndexByQuoteOrKeys(quoteName, fallbackKeys)
+    End If
+
+    If cadIdx > 0 And cadIdx <= PartCount Then
+        AddUniqueComponentName keepNames, parts(cadIdx).componentName
+
+        LogLine "MATCH STUDIO combined STL include " & label & ": " & _
+                parts(cadIdx).componentName
+    Else
+        LogLine "WARNING: MATCH STUDIO combined STL missing " & label
+    End If
+
+    Exit Sub
+
+ErrHandler:
+    LogLine "AddMatchStudioStlKeepComponent error (" & label & "): " & Err.Description
 End Sub
 
 Private Function FindHolderCadIndexForMainPackage(ByVal holderQuoteName As String) As Long
@@ -12729,6 +13026,26 @@ Private Sub PublishJobOutputs()
 
     EnsureFolderDeep jobOut
     CopyMatchingArtifacts CurrentJobFolder, jobOut
+
+    ' Preserve the dedicated Match Studio STL folder too.
+    Dim stlFolder As String
+    Dim stlPublishFolder As String
+
+    stlFolder = CurrentJobFolder & "\" & CurrentJobNumber & MATCH_STUDIO_STL_FOLDER_SUFFIX
+    stlPublishFolder = jobOut & "\" & CurrentJobNumber & MATCH_STUDIO_STL_FOLDER_SUFFIX
+
+    If fso.FolderExists(stlFolder) Then
+        If fso.FolderExists(stlPublishFolder) Then
+            fso.DeleteFolder stlPublishFolder, True
+        End If
+
+        EnsureFolderDeep stlPublishFolder
+        CopyFolderContents stlFolder, stlPublishFolder
+
+        LogLine "Published Match Studio STL folder:"
+        LogLine "  " & stlPublishFolder
+    End If
+
     LogLine "Published job outputs to: " & jobOut
     Exit Sub
 eh:

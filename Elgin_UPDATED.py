@@ -11819,32 +11819,42 @@ def ms_fmt_num(v) -> str:
 
 
 def ms_classify_component_filename(fn: str) -> str:
-    """Map a job artifact filename to TCP/BCP/holder/pot kind."""
+    """Map a job artifact filename to Match Studio component kind."""
     fnu = fn.upper()
     u = fnu.replace("_", " ")
     compact = re.sub(r"[^A-Z0-9]", "", u)
-    # Combined ID+OD holder assembly: J8455_HOLDERS_861000210_05-20-2026.igs
-    if "_HOLDERS_" in fnu or compact.startswith("J") and "HOLDERS" in compact and "HOLDER" in compact:
-        if "IDHOLDER" not in compact and "ODHOLDER" not in compact:
-            return "HOLDERS"
-    if "IDHOLDER" in compact or ("HOLDER" in u and "ID" in u and "OD" not in u):
-        return "ID HOLDER"
-    if "ODHOLDER" in compact or ("HOLDER" in u and ("OD" in u or "BOT" in u)):
-        return "OD HOLDER"
-    if "HOLDER" in u:
-        return "ID HOLDER"
+
+    if "MATCHSET" in compact or "ALLCOMPONENTS" in compact or "SIXCOMPONENTS" in compact:
+        return "MATCH SET"
+
+    # Combined ID+OD holders.
+    if "_HOLDERS_" in fnu or ("HOLDERS" in compact and "IDHOLDER" not in compact and "ODHOLDER" not in compact):
+        return "HOLDERS"
+
     if "IDPOT" in compact or ("POT" in u and "ID" in u and "OD" not in u):
         return "ID POT"
+
     if "ODPOT" in compact or ("POT" in u and ("OD" in u or "BOT" in u)):
         return "OD POT"
+
     if "TCP" in u or "TOPSMED" in compact or "TOP CLAMP" in u:
         return "TCP"
+
     if "BCP" in u or "BOTTOMSMED" in compact or "BOTTOM CLAMP" in u or "BOT CLAMP" in u:
         return "BCP"
-    if "BACK" in u and "ISO" in u:
-        return "BACK ISO"
+
+    if "IDHOLDER" in compact or ("HOLDER" in u and "ID" in u and "OD" not in u):
+        return "ID HOLDER"
+
+    if "ODHOLDER" in compact or ("HOLDER" in u and ("OD" in u or "BOT" in u)):
+        return "OD HOLDER"
+
+    if "HOLDER" in u:
+        return "HOLDER"
+
     if "ISO" in u:
         return "ISO"
+
     return "OTHER"
 
 
@@ -11869,7 +11879,7 @@ def _ms_job_search_roots(job_num: str) -> list[str]:
     local_job = os.path.join(ELGIN_LOCAL_WORKSPACE_ROOT, j)
     if os.path.isdir(local_job) and local_job not in seen:
         roots.append(local_job)
-    for sub in (f"{j} HOLDERS", f"J{j} HOLDERS", f"{j} Base", f"J{j} Base", f"{j} PRINTS"):
+    for sub in (f"{j} STL", f"J{j} STL", f"{j} HOLDERS", f"J{j} HOLDERS", f"{j} Base", f"J{j} Base", f"{j} PRINTS"):
         cand = os.path.join(local_job, sub)
         cand = os.path.normpath(cand)
         if cand in seen:
@@ -11939,21 +11949,17 @@ def ms_find_job_models(job_num: str, kind: str = "") -> list[dict]:
     """
     Match Studio model finder.
 
-    Important holder behavior:
-    - ID HOLDER / OD HOLDER compare should NOT require individual holder files.
-    - Both use the combined file:
-        J####_HOLDERS_customer_date.igs
-    - Combined HOLDER IGS is always preferred.
+    Priority:
+    1. New J#### STL folder files.
+    2. STL/OBJ display meshes.
+    3. IGS/IGES/STEP fallback.
+    4. For ID/OD holder, fallback to combined HOLDERS if individual holder STL is missing.
     """
     j = normalize_job_num(job_num) or (job_num or "")
-
     requested_kind = (kind or "").strip().upper()
 
-    # Force holder comparison to the combined HOLDERS package.
-    # This makes both ID HOLDER and OD HOLDER buttons use:
-    #   J####_HOLDERS_....igs
-    if requested_kind in ("ID HOLDER", "OD HOLDER", "HOLDERS", "HOLDER"):
-        want = "HOLDERS"
+    if requested_kind in ("ALL SIX", "ALL COMPONENTS", "SIX COMPONENTS", "MATCH SET"):
+        want = "MATCH SET"
     else:
         want = requested_kind
 
@@ -11975,13 +11981,11 @@ def ms_find_job_models(job_num: str, kind: str = "") -> list[dict]:
 
         ck = ms_classify_component_filename(fn)
 
-        # Holder comparison: ONLY use combined HOLDERS files.
-        if want == "HOLDERS":
-            if ck != "HOLDERS":
-                continue
-        elif want:
+        if want:
             if ck != want:
-                continue
+                # Holder fallback: if individual holder STL is missing, allow combined HOLDERS.
+                if not (want in ("ID HOLDER", "OD HOLDER") and ck == "HOLDERS"):
+                    continue
 
         ext = os.path.splitext(fn)[1].lower()
 
@@ -12006,20 +12010,28 @@ def ms_find_job_models(job_num: str, kind: str = "") -> list[dict]:
 
     def _model_sort_key(x: dict) -> tuple:
         fnu = x["label"].upper()
+        pth = x["path"].upper()
         ext = "." + x["format"].lower()
 
-        # Strong preference for exact combined holders file:
-        # J8449_HOLDERS_861000172_06-03-2026.stl / .igs
-        combined_holders_bonus = 0 if "_HOLDERS_" in fnu else 5
+        stl_folder_token = f"{j} STL".upper()
+        in_stl_folder_bonus = 0 if stl_folder_token in pth else 3
 
-        # Prefer STL for browser overlay; keep IGS as source/archive fallback.
         format_rank = fmt_rank.get(ext, 8)
 
-        # Avoid BASE assemblies for holder overlay.
+        # Exact component STL beats combined HOLDERS fallback.
+        exact_kind_bonus = 0 if x["kind"] == want else 5
+
+        # Prefer MATCH SET exact combined file for all-six compare.
+        match_set_bonus = 0
+        if want == "MATCH SET":
+            match_set_bonus = 0 if x["kind"] == "MATCH SET" else 10
+
         base_penalty = 10 if "_BASE_" in fnu else 0
 
         return (
-            combined_holders_bonus,
+            in_stl_folder_bonus,
+            exact_kind_bonus,
+            match_set_bonus,
             format_rank,
             base_penalty,
             x["label"].lower(),
@@ -12284,20 +12296,12 @@ async def ms_models_list(job_num: str, kind: str = ""):
 async def ms_model_file(job: str, kind: str = "", i: int = 0):
     from fastapi.responses import FileResponse
 
-    requested_kind = (kind or "").strip().upper()
-
-    # Force ID/OD holder requests to combined HOLDERS IGS.
-    if requested_kind in ("ID HOLDER", "OD HOLDER", "HOLDER"):
-        lookup_kind = "HOLDERS"
-    else:
-        lookup_kind = requested_kind
-
-    models = ms_find_job_models(job, lookup_kind)
+    models = ms_find_job_models(job, kind)
 
     if not models:
         raise HTTPException(
             404,
-            f"No 3D model found for job {job}, requested kind {kind}, lookup kind {lookup_kind}",
+            f"No 3D model found for job {job}, kind {kind}",
         )
 
     idx = max(0, min(int(i), len(models) - 1))
@@ -12315,24 +12319,19 @@ async def ms_model_file(job: str, kind: str = "", i: int = 0):
 
 @app.get("/api/match/model-meta")
 async def ms_model_meta(job: str, kind: str = "", i: int = 0):
-    requested_kind = (kind or "").strip().upper()
-
-    # Force ID/OD holder requests to combined HOLDERS IGS.
-    if requested_kind in ("ID HOLDER", "OD HOLDER", "HOLDER"):
-        lookup_kind = "HOLDERS"
-    else:
-        lookup_kind = requested_kind
-
-    models = ms_find_job_models(job, lookup_kind)
+    models = ms_find_job_models(job, kind)
 
     if not models:
         raise HTTPException(
             404,
-            f"No model found for job {job}, requested kind {kind}, lookup kind {lookup_kind}",
+            f"No model found for job {job}, kind {kind}",
         )
 
     idx = max(0, min(int(i), len(models) - 1))
     m = models[idx]
+    lookup_kind = (kind or "").strip().upper()
+    if lookup_kind in ("ALL SIX", "ALL COMPONENTS", "SIX COMPONENTS"):
+        lookup_kind = "MATCH SET"
 
     return {
         "job": normalize_job_num(job),
@@ -12512,33 +12511,43 @@ code{background:#0a101e;border:1px solid var(--line);padding:1px 6px;border-radi
 <script>
 var STATE={jobs:[],job:null,data:null,match:null,cmpKind:'ID HOLDER',cmpMode:'igs'};
 var COMPONENTS=['TCP','BCP','ID HOLDER','OD HOLDER','ID POT','OD POT'];
-var HOLDER_IGS_KINDS=['ID HOLDER','OD HOLDER'];
-function isHolderIgsKind(k){ return HOLDER_IGS_KINDS.indexOf(k)>=0; }
+
+var COMPONENT_MODEL_KINDS=[
+  'ID POT',
+  'OD POT',
+  'BCP',
+  'TCP',
+  'ID HOLDER',
+  'OD HOLDER',
+  'MATCH SET'
+];
+
+function isModelCompareKind(k){
+  return COMPONENT_MODEL_KINDS.indexOf(k)>=0;
+}
 
 function api(p){return fetch(p).then(function(r){if(!r.ok)throw new Error(r.status);return r.json();});}
 function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
 function money(v){var n=Number(v||0);return '$'+n.toLocaleString(undefined,{minimumFractionDigits:0,maximumFractionDigits:0});}
 function money2(v){var n=Number(v||0);return '$'+n.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});}
 function scoreColor(s){var h=Math.max(0,Math.min(120,(Number(s)||0)*1.2));return 'hsl('+h+',75%,52%)';}
-function holderLookupKind(kind){
+function modelLookupKind(kind){
   kind=String(kind||'').toUpperCase().trim();
 
-  // ID HOLDER and OD HOLDER tabs both load the combined holder IGS:
-  // J####_HOLDERS_....igs
-  if(kind==='ID HOLDER' || kind==='OD HOLDER' || kind==='HOLDER'){
-    return 'HOLDERS';
+  if(kind==='ALL SIX' || kind==='ALL COMPONENTS' || kind==='SIX COMPONENTS'){
+    return 'MATCH SET';
   }
 
   return kind;
 }
 
 function modelURL(job,kind){
-  var lookupKind=holderLookupKind(kind);
+  var lookupKind=modelLookupKind(kind);
   return '/api/match/model?job='+encodeURIComponent(job)+'&kind='+encodeURIComponent(lookupKind)+'&i=0';
 }
 
 function modelMetaURL(job,kind){
-  var lookupKind=holderLookupKind(kind);
+  var lookupKind=modelLookupKind(kind);
   return '/api/match/model-meta?job='+encodeURIComponent(job)+'&kind='+encodeURIComponent(lookupKind)+'&i=0';
 }
 
@@ -12703,20 +12712,20 @@ function renderCompare(m){
 
   tbl+='</tbody></table>';
 
-  var chips=HOLDER_IGS_KINDS.map(function(k){
+  var chips=COMPONENT_MODEL_KINDS.map(function(k){
     return '<button class="chipbtn'+(STATE.cmpKind===k?' active':'')+'" onclick="setCmpKind(\''+k+'\')">'+k+'</button>';
   }).join('');
 
   var html=
     '<div class="card">' +
       '<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">' +
-        '<h2>Compare Holder IGS: '+esc(STATE.job)+' vs '+esc(m.job_num)+'</h2>' +
-        '<span class="pill">IGS / IGES ONLY</span>' +
+        '<h2>Compare STL: '+esc(STATE.job)+' vs '+esc(m.job_num)+'</h2>' +
+        '<span class="pill">STL / IGS</span>' +
       '</div>' +
       tbl +
       '<div style="margin-top:16px">' +
         '<div class="muted" style="font-size:12px;text-transform:uppercase;letter-spacing:.6px;margin-bottom:8px">' +
-          'Holder IGS overlay — no JPEG comparison' +
+          'STL overlay — no JPEG comparison' +
         '</div>' +
         '<div class="cmpbar">'+chips+'</div>' +
         '<div id="ovStage"></div>' +
@@ -12734,10 +12743,10 @@ function renderOverlay(m){
   var k=STATE.cmpKind;
   var stage=document.getElementById('ovStage');
 
-  if(!isHolderIgsKind(k)){
+  if(!isModelCompareKind(k)){
     stage.innerHTML =
       '<div class="note">' +
-      'IGS overlay comparison is enabled only for ID HOLDER and OD HOLDER.' +
+      'STL overlay comparison is enabled for the six Match Studio components and MATCH SET.' +
       '</div>';
     return;
   }
@@ -12745,13 +12754,12 @@ function renderOverlay(m){
   stage.innerHTML =
     '<div class="ovstage">' +
       '<div class="legend">' +
-        '<b>'+esc(k)+'</b> compare uses the combined <b>HOLDERS</b> package for each job. ' +
-        'IGS is kept as source CAD; <b>STL</b> is used for browser overlay when available. ' +
-        'Example: <code>J8449_HOLDERS_861000172_06-03-2026.stl</code>. ' +
-        'Current job is blue/cyan. Matched job is orange/yellow. No JPEGs are used.' +
+        '<b>'+esc(k)+'</b> compare uses the exported STL package in <b>J#### STL</b>. ' +
+        'Current job is blue/cyan. Matched job is orange/yellow. ' +
+        'Drag to spin, scroll to zoom. No JPEGs are used.' +
       '</div>' +
       '<div class="ms3d" id="ms3dHost">' +
-        '<div class="muted" style="padding:18px">Loading combined HOLDERS overlay…</div>' +
+        '<div class="muted" style="padding:18px">Loading STL overlay…</div>' +
       '</div>' +
       '<div id="ms3dFileInfo" class="note"></div>' +
     '</div>';
@@ -12765,8 +12773,7 @@ async function loadMs3dOverlay(curJob, matchJob, kind, containerId){
 
   if(!host) return;
 
-  // ID HOLDER and OD HOLDER both use the combined HOLDERS package.
-  var modelKind='HOLDERS';
+  var modelKind=modelLookupKind(kind);
 
   try{
     var THREE=await import('https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js');
@@ -12780,7 +12787,7 @@ async function loadMs3dOverlay(curJob, matchJob, kind, containerId){
         return {
           ok:false,
           job:job,
-          error:'No combined HOLDERS model found for '+job,
+          error:'No model found for '+job+' ('+modelKind+')',
           meta:null,
           buf:null
         };
@@ -12822,14 +12829,13 @@ async function loadMs3dOverlay(curJob, matchJob, kind, containerId){
         '<div><b>Matched job display mesh:</b> ' +
           (mMatch.ok ? esc(mMatch.label) : '<span style="color:var(--bad)">'+esc(mMatch.error)+'</span>') +
         '</div>' +
-        '<div class="muted">The STL is the browser-display mesh exported from the combined HOLDERS package. IGS is kept as source CAD. No JPEGs are used.</div>';
+        '<div class="muted">STL package compare. No JPEGs are used.</div>';
     }
 
     if(!mCur.ok && !mMatch.ok){
       host.innerHTML =
         '<div class="muted" style="padding:18px">' +
-        'No combined holder STL/IGS/IGES found for either job. Re-run the SolidWorks export and make sure it publishes files like: ' +
-        '<code>J'+esc(curJob)+'_HOLDERS_….igs</code> and <code>J'+esc(curJob)+'_HOLDERS_….stl</code>.' +
+        'No STL/model found for <b>'+esc(modelKind)+'</b> on either job. Re-run the SolidWorks export and make sure it publishes files into the <code>J#### STL</code> folder.' +
         '</div>';
       return;
     }
@@ -13039,11 +13045,11 @@ async function loadMs3dOverlay(curJob, matchJob, kind, containerId){
     if(box.isEmpty()){
       host.innerHTML =
         '<div class="muted" style="padding:18px">' +
-          '<b>Could not mesh the combined holders.</b><br><br>' +
+          '<b>Could not mesh '+esc(modelKind)+'.</b><br><br>' +
           'The files were found, but no browser-readable mesh was produced.<br>' +
           'Current file: <code>'+(mCur.ok ? esc(mCur.label) : 'not found')+'</code><br>' +
           'Matched file: <code>'+(mMatch.ok ? esc(mMatch.label) : 'not found')+'</code><br><br>' +
-          'Fix: export same-name <code>.stl</code> files beside the combined holder IGS files, then refresh Match Studio.' +
+          'Fix: re-run the SolidWorks export to publish STL files into the <code>J#### STL</code> folder, then refresh Match Studio.' +
         '</div>';
       return;
     }
@@ -13061,14 +13067,14 @@ async function loadMs3dOverlay(curJob, matchJob, kind, containerId){
     var leg=document.createElement('div');
     leg.className='ms3d-legend';
     leg.innerHTML =
-      '<span><i class="dot" style="background:#3b82f6"></i>'+esc(curJob)+' current holders</span>' +
-      '<span><i class="dot" style="background:#ff8c42"></i>'+esc(matchJob)+' matched holders</span>' +
+      '<span><i class="dot" style="background:#3b82f6"></i>'+esc(curJob)+' current '+esc(modelKind)+'</span>' +
+      '<span><i class="dot" style="background:#ff8c42"></i>'+esc(matchJob)+' matched '+esc(modelKind)+'</span>' +
       '<span style="color:#8aa0c6">transparent solids + bright wireframe edges</span>';
     host.appendChild(leg);
 
     var hint=document.createElement('div');
     hint.className='ms3d-hint';
-    hint.textContent='Drag to spin · scroll to zoom · combined HOLDERS only';
+    hint.textContent='Drag to spin · scroll to zoom · '+modelKind;
     host.appendChild(hint);
 
     function anim(){
@@ -13082,7 +13088,7 @@ async function loadMs3dOverlay(curJob, matchJob, kind, containerId){
   }catch(err){
     host.innerHTML =
       '<div class="muted" style="padding:18px">' +
-      '3D combined holder overlay unavailable: '+esc(err.message||err)+
+      '3D STL overlay unavailable: '+esc(err.message||err)+
       '</div>';
   }
 }
