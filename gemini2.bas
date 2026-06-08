@@ -945,7 +945,15 @@ On Error GoTo ErrHandler
 
     LogDone "Restore visibility/state"
 
-    OrganizeJobFiles
+    ' Do not create a pdf folder.
+    ' Move loose imported SLDPRT files into Base folder.
+    ' Keep BASE and HOLDERS package files in main job folder.
+    CloseAllDocumentsSafely
+    Set swModel = Nothing
+    Set swAssy = Nothing
+
+    MoveLooseSolidWorksPartsToBaseFolder
+    KeepBaseAndHoldersPackageFilesInMainFolder
 
     If PUSH_OUTPUTS_TO_NETWORK Then
         LogStart "Push finished outputs back to network"
@@ -2801,7 +2809,9 @@ Private Sub AddCadPart(ByVal componentName As String, _
     parts(PartCount).isBodyOnly = isBodyOnly
 End Sub
 
-Private Function FindExistingPart(ByVal filePath As String, ByVal configName As String, ByVal compName As String, _
+Private Function FindExistingPart(ByVal filePath As String, _
+                                  ByVal configName As String, _
+                                  ByVal compName As String, _
                                   Optional ByVal newCenterY As Double = 0#, _
                                   Optional ByVal newHasCenter As Boolean = False) As Long
 
@@ -2814,12 +2824,13 @@ Private Function FindExistingPart(ByVal filePath As String, ByVal configName As 
             If LCase(parts(i).filePath) = LCase(filePath) And _
                LCase(parts(i).configName) = LCase(configName) Then
 
-                ' Different assembly instances (Part-6-1 vs Part-6-2) must stay separate.
+                ' Different assembly instances must stay separate.
+                ' Part-1 and Part-2 may use the same file but be different physical parts.
                 If compName <> "" Then
                     If LCase(parts(i).componentName) <> LCase(compName) Then GoTo NextPart
                 End If
 
-                ' Same file/config at a different Y center = separate pullcore instance (ID vs OD).
+                ' Same file/config at a different Y center should stay separate.
                 If newHasCenter And parts(i).hasAsmCenter Then
                     If Abs(parts(i).AsmCenterY - newCenterY) > 0.05 Then GoTo NextPart
                 End If
@@ -3452,10 +3463,28 @@ Private Function ShouldCreateStandardPrintDxf(ByVal quoteName As String) As Bool
     Dim k As String
     k = NormalizeKey(quoteName)
 
-    If k = "IDHOLDER" Then ShouldCreateStandardPrintDxf = True: Exit Function
-    If k = "ODHOLDER" Then ShouldCreateStandardPrintDxf = True: Exit Function
-    If k = "TCP" Then ShouldCreateStandardPrintDxf = True: Exit Function
-    If k = "BCP" Then ShouldCreateStandardPrintDxf = True: Exit Function
+    Select Case k
+
+        Case "IDHOLDER", _
+             "ODHOLDER", _
+             "TCP", _
+             "BCP", _
+             "TOPSMED", _
+             "BOTTOMSMED", _
+             "BOTSMED", _
+             "TOPSMEDPLATE", _
+             "BOTTOMSMEDPLATE", _
+             "BOTSMEDPLATE", _
+             "TOPCLAMPINGPLATE", _
+             "BOTTOMCLAMPINGPLATE", _
+             "BOTCLAMPINGPLATE"
+
+            ShouldCreateStandardPrintDxf = True
+            Exit Function
+
+    End Select
+
+    ShouldCreateStandardPrintDxf = False
 
 End Function
 
@@ -4494,10 +4523,6 @@ On Error GoTo ErrHandler
     If idHolderIdx <= 0 Or idHolderIdx > PartCount Then Exit Sub
     If odHolderIdx <= 0 Or odHolderIdx > PartCount Then Exit Sub
 
-    Dim holdersFolder As String
-    holdersFolder = outputFolder & "\" & CurrentJobNumber & " HOLDERS"
-    EnsureFolderDeep holdersFolder
-
     Dim idPart As PartInfo
     Dim odPart As PartInfo
 
@@ -4519,8 +4544,8 @@ On Error GoTo ErrHandler
     Dim holdersIgsPath As String
     Dim holdersDxfPath As String
 
-    holdersIgsPath = holdersFolder & "\" & CurrentJobNumber & "_" & holderToken & "_" & custToken & "_" & dateToken & ".igs"
-    holdersDxfPath = holdersFolder & "\" & CurrentJobNumber & "_" & holderToken & "_" & custToken & "_" & dateToken & ".dxf"
+    holdersIgsPath = outputFolder & "\" & CurrentJobNumber & "_" & holderToken & "_" & custToken & "_" & dateToken & ".igs"
+    holdersDxfPath = outputFolder & "\" & CurrentJobNumber & "_" & holderToken & "_" & custToken & "_" & dateToken & ".dxf"
 
     holdersIgsPath = GetUniqueFilePath(holdersIgsPath)
     holdersDxfPath = GetUniqueFilePath(holdersDxfPath)
@@ -12838,6 +12863,281 @@ On Error GoTo ErrHandler
 ErrHandler:
     MoveFileRobust = False
 End Function
+
+Private Sub KeepBaseAndHoldersPackageFilesInMainFolder()
+On Error GoTo ErrHandler
+
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    If CurrentJobFolder = "" Then Exit Sub
+    If fso.FolderExists(CurrentJobFolder) = False Then Exit Sub
+
+    ' If an old HOLDERS folder exists, move its IGS/DXF files back to main.
+    MoveBaseHolderPackageFilesFromFolderToMain CurrentJobFolder & "\" & CurrentJobNumber & " HOLDERS"
+
+    ' If an old Base folder exists, move only BASE/HOLDERS package files back to main.
+    MoveBaseHolderPackageFilesFromFolderToMain CurrentJobFolder & "\" & CurrentJobNumber & " Base"
+
+    ' If old lowercase base folder exists, move only BASE/HOLDERS package files back to main.
+    MoveBaseHolderPackageFilesFromFolderToMain CurrentJobFolder & "\base"
+
+    ' If old pdf folders exist, only delete them if empty. Do not create/use them.
+    DeleteFolderIfEmptyOnly CurrentJobFolder & "\pdf"
+    DeleteFolderIfEmptyOnly CurrentJobFolder & "\" & CurrentJobNumber & " pdfs"
+
+    ' Delete empty old holders/base folders only.
+    DeleteFolderIfEmptyOnly CurrentJobFolder & "\" & CurrentJobNumber & " HOLDERS"
+    DeleteFolderIfEmptyOnly CurrentJobFolder & "\" & CurrentJobNumber & " Base"
+    DeleteFolderIfEmptyOnly CurrentJobFolder & "\base"
+
+    LogLine "Verified BASE/HOLDERS package files are in main job folder."
+
+    Exit Sub
+
+ErrHandler:
+    LogLine "KeepBaseAndHoldersPackageFilesInMainFolder error: " & Err.Description
+End Sub
+
+Private Sub MoveBaseHolderPackageFilesFromFolderToMain(ByVal sourceFolder As String)
+On Error GoTo ErrHandler
+
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    If sourceFolder = "" Then Exit Sub
+    If fso.FolderExists(sourceFolder) = False Then Exit Sub
+    If LCase(sourceFolder) = LCase(CurrentJobFolder) Then Exit Sub
+
+    Dim fileList As Collection
+    Set fileList = New Collection
+
+    Dim f As Object
+
+    For Each f In fso.GetFolder(sourceFolder).Files
+        If IsBaseOrHoldersPackageFile(f.Name) Then
+            fileList.Add f.Path
+        End If
+    Next f
+
+    Dim i As Long
+    Dim srcPath As String
+    Dim destPath As String
+
+    For i = 1 To fileList.Count
+
+        srcPath = CStr(fileList(i))
+
+        If fso.FileExists(srcPath) Then
+
+            destPath = GetUniqueFilePath(CurrentJobFolder & "\" & fso.GetFileName(srcPath))
+
+            If MoveFileAndDeleteOriginal(srcPath, destPath) Then
+                LogLine "Moved BASE/HOLDERS package file to main folder: " & fso.GetFileName(destPath)
+            Else
+                LogLine "WARNING: Could not move BASE/HOLDERS package file to main folder: " & srcPath
+            End If
+
+        End If
+
+    Next i
+
+    Exit Sub
+
+ErrHandler:
+    LogLine "MoveBaseHolderPackageFilesFromFolderToMain error: " & Err.Description
+End Sub
+
+Private Function IsBaseOrHoldersPackageFile(ByVal fileName As String) As Boolean
+On Error GoTo ErrHandler
+
+    IsBaseOrHoldersPackageFile = False
+
+    Dim n As String
+    Dim ext As String
+
+    n = UCase(fileName)
+    ext = LCase(GetFileExtension(fileName))
+
+    If InStr(n, UCase(CurrentJobNumber & "_BASE_")) > 0 Then
+        Select Case ext
+            Case "dxf", "easm", "x_t", "igs", "iges"
+                IsBaseOrHoldersPackageFile = True
+                Exit Function
+        End Select
+    End If
+
+    If InStr(n, UCase(CurrentJobNumber & "_HOLDERS_")) > 0 Then
+        Select Case ext
+            Case "dxf", "igs", "iges"
+                IsBaseOrHoldersPackageFile = True
+                Exit Function
+        End Select
+    End If
+
+    Exit Function
+
+ErrHandler:
+    IsBaseOrHoldersPackageFile = False
+End Function
+
+Private Sub MoveLooseSolidWorksPartsToBaseFolder()
+On Error GoTo ErrHandler
+
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    If CurrentJobFolder = "" Then Exit Sub
+    If fso.FolderExists(CurrentJobFolder) = False Then Exit Sub
+
+    Dim baseDir As String
+    baseDir = CurrentJobFolder & "\" & CurrentJobNumber & " Base"
+
+    EnsureFolderDeep baseDir
+
+    Dim fileList As Collection
+    Set fileList = New Collection
+
+    Dim f As Object
+
+    For Each f In fso.GetFolder(CurrentJobFolder).Files
+        If IsLooseGeneratedSolidWorksPartFile(f.Name) Then
+            fileList.Add f.Path
+        End If
+    Next f
+
+    Dim i As Long
+    Dim srcPath As String
+    Dim destPath As String
+
+    For i = 1 To fileList.Count
+
+        srcPath = CStr(fileList(i))
+
+        If fso.FileExists(srcPath) Then
+
+            destPath = GetUniqueFilePath(baseDir & "\" & fso.GetFileName(srcPath))
+
+            If MoveFileAndDeleteOriginal(srcPath, destPath) Then
+                LogLine "Moved loose generated SolidWorks part to Base folder: " & fso.GetFileName(destPath)
+            Else
+                LogLine "WARNING: Could not move loose generated SolidWorks part: " & srcPath
+            End If
+
+        End If
+
+    Next i
+
+    Exit Sub
+
+ErrHandler:
+    LogLine "MoveLooseSolidWorksPartsToBaseFolder error: " & Err.Description
+End Sub
+
+Private Function IsLooseGeneratedSolidWorksPartFile(ByVal fileName As String) As Boolean
+On Error GoTo ErrHandler
+
+    IsLooseGeneratedSolidWorksPartFile = False
+
+    Dim n As String
+    Dim ext As String
+
+    n = UCase(fileName)
+    ext = UCase(GetFileExtension(fileName))
+
+    If ext = "SLDPRT" Then
+        IsLooseGeneratedSolidWorksPartFile = True
+        Exit Function
+    End If
+
+    If InStr(n, ".SLDASM-PART-") > 0 Then
+        IsLooseGeneratedSolidWorksPartFile = True
+        Exit Function
+    End If
+
+    If InStr(n, ".SLDASM-") > 0 And InStr(n, "PART") > 0 Then
+        IsLooseGeneratedSolidWorksPartFile = True
+        Exit Function
+    End If
+
+    Exit Function
+
+ErrHandler:
+    IsLooseGeneratedSolidWorksPartFile = False
+End Function
+
+Private Function MoveFileAndDeleteOriginal(ByVal srcPath As String, _
+                                           ByVal destPath As String) As Boolean
+On Error GoTo ErrHandler
+
+    MoveFileAndDeleteOriginal = False
+
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    If srcPath = "" Then Exit Function
+    If destPath = "" Then Exit Function
+    If fso.FileExists(srcPath) = False Then Exit Function
+
+    EnsureFolderDeep fso.GetParentFolderName(destPath)
+
+    On Error Resume Next
+    Err.Clear
+    fso.MoveFile srcPath, destPath
+
+    If Err.Number = 0 Then
+        If fso.FileExists(destPath) And fso.FileExists(srcPath) = False Then
+            MoveFileAndDeleteOriginal = True
+            Exit Function
+        End If
+    End If
+
+    Err.Clear
+    fso.CopyFile srcPath, destPath, True
+
+    If Err.Number <> 0 Or fso.FileExists(destPath) = False Then
+        LogLine "WARNING: Copy failed while moving file: " & srcPath
+        Exit Function
+    End If
+
+    Err.Clear
+    fso.DeleteFile srcPath, True
+
+    If Err.Number = 0 And fso.FileExists(srcPath) = False Then
+        MoveFileAndDeleteOriginal = True
+    Else
+        LogLine "WARNING: File copied but original could not be deleted: " & srcPath
+        MoveFileAndDeleteOriginal = False
+    End If
+
+    Exit Function
+
+ErrHandler:
+    MoveFileAndDeleteOriginal = False
+End Function
+
+Private Sub DeleteFolderIfEmptyOnly(ByVal folderPath As String)
+On Error GoTo ErrHandler
+
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    If folderPath = "" Then Exit Sub
+    If fso.FolderExists(folderPath) = False Then Exit Sub
+
+    If fso.GetFolder(folderPath).Files.Count = 0 And _
+       fso.GetFolder(folderPath).SubFolders.Count = 0 Then
+
+        fso.DeleteFolder folderPath, True
+        LogLine "Deleted empty folder: " & folderPath
+
+    End If
+
+    Exit Sub
+
+ErrHandler:
+    LogLine "DeleteFolderIfEmptyOnly error: " & Err.Description
+End Sub
 
 Private Sub WriteExportLogBomSummary()
 On Error GoTo ErrHandler

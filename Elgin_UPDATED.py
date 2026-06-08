@@ -12481,7 +12481,7 @@ function bindOverlayJpegs(curJob, matchJob, kind){
       if(anyOk){ ph.style.display='none'; }
       else {
         ph.textContent=isHolderIgsKind(kind)
-          ? (kind+' — re-run export for '+curJob+' HOLDERS\\'+curJob+'_HOLDERS_….igs (both holders) and ISO JPG.')
+          ? (kind+' — re-run export for '+curJob+'\\'+curJob+'_HOLDERS_….igs (both holders in main folder) and ISO JPG.')
           : (kind+' — holder ISO/JPG on ID/OD HOLDER tabs only.');
         ph.style.display='block';
       }
