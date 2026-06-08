@@ -690,6 +690,8 @@ On Error GoTo ErrHandler
         GoTo CleanExit
     End If
 
+    CleanPreviousGeneratedOutputs LocalJobFolder, CurrentJobNumber
+
     CurrentJobFolder = LocalJobFolder
     RunLogPath = CurrentJobFolder & "\CMS_XT_Export_Log.txt"
 
@@ -1167,6 +1169,83 @@ On Error Resume Next
         fso.DeleteFolder folderPath, True
         LogLine "Deleted folder: " & folderPath
     End If
+End Sub
+
+Private Sub CleanPreviousGeneratedOutputs(ByVal jobFolder As String, ByVal jobNumber As String)
+On Error GoTo ErrHandler
+
+    If jobFolder = "" Then Exit Sub
+
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    If fso.FolderExists(jobFolder) = False Then Exit Sub
+
+    LogLine "Cleaning previous generated outputs for rerun: " & jobFolder
+
+    DeleteFolderSafe jobFolder & "\" & jobNumber & OUTPUT_FOLDER_SUFFIX
+    DeleteFolderSafe jobFolder & "\" & jobNumber & " " & J_BLOCK_FOLDER_NAME
+    DeleteFolderSafe jobFolder & "\" & jobNumber & " " & PULLCORE_CAM_KEY_FOLDER_NAME
+    DeleteFolderSafe jobFolder & "\" & jobNumber & " " & PULLCORE_STOP_FOLDER_NAME
+    DeleteFolderSafe jobFolder & "\" & jobNumber & " MISC DETAILS"
+
+    DeleteOldBaseHolderRootFiles jobFolder, jobNumber
+
+    Exit Sub
+
+ErrHandler:
+    LogLine "CleanPreviousGeneratedOutputs error: " & Err.Description
+End Sub
+
+Private Sub DeleteOldBaseHolderRootFiles(ByVal jobFolder As String, ByVal jobNumber As String)
+On Error GoTo ErrHandler
+
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    If fso.FolderExists(jobFolder) = False Then Exit Sub
+
+    Dim folder As Object
+    Set folder = fso.GetFolder(jobFolder)
+
+    Dim fileList As Collection
+    Set fileList = New Collection
+
+    Dim f As Object
+    Dim n As String
+    Dim ext As String
+
+    For Each f In folder.Files
+
+        n = UCase(f.Name)
+        ext = LCase(fso.GetExtensionName(f.Path))
+
+        If Left(n, Len(UCase(jobNumber))) = UCase(jobNumber) Then
+
+            If InStr(n, "_BASE_") > 0 Or InStr(n, "_HOLDERS_") > 0 Then
+
+                Select Case ext
+                    Case "x_t", "igs", "iges", "easm", "dxf"
+                        fileList.Add f.Path
+                End Select
+
+            End If
+
+        End If
+
+    Next f
+
+    Dim i As Long
+
+    For i = 1 To fileList.Count
+        fso.DeleteFile CStr(fileList(i)), True
+        LogLine "Deleted old generated root package file: " & CStr(fileList(i))
+    Next i
+
+    Exit Sub
+
+ErrHandler:
+    LogLine "DeleteOldBaseHolderRootFiles error: " & Err.Description
 End Sub
 
 ' ============================================================
@@ -12292,6 +12371,90 @@ End Sub
 ' FINDERS: JOB FOLDER + CAD
 ' ============================================================
 
+Private Function TryParseJobFolderDate(ByVal folderName As String, ByRef outDate As Date) As Boolean
+On Error GoTo ErrHandler
+
+    TryParseJobFolderDate = False
+
+    Dim re As Object
+    Set re = CreateObject("VBScript.RegExp")
+
+    re.Global = True
+    re.IgnoreCase = True
+    re.Pattern = "(\d{1,2})[-\/](\d{1,2})[-\/](\d{2,4})"
+
+    Dim matches As Object
+    Set matches = re.Execute(folderName)
+
+    If matches.Count = 0 Then Exit Function
+
+    Dim m As Object
+    Set m = matches(matches.Count - 1)
+
+    Dim mo As Long
+    Dim dy As Long
+    Dim yr As Long
+
+    mo = CLng(Val(m.SubMatches(0)))
+    dy = CLng(Val(m.SubMatches(1)))
+    yr = CLng(Val(m.SubMatches(2)))
+
+    If yr > 0 And yr < 100 Then yr = 2000 + yr
+
+    If mo >= 1 And mo <= 12 And dy >= 1 And dy <= 31 And yr >= 1990 And yr <= 2100 Then
+        outDate = DateSerial(yr, mo, dy)
+        TryParseJobFolderDate = True
+    End If
+
+    Exit Function
+
+ErrHandler:
+    TryParseJobFolderDate = False
+End Function
+
+Private Function GetJobFolderMatchScore(ByVal folderName As String, _
+                                        ByVal wantUpper As String, _
+                                        ByVal depth As Long) As Long
+On Error GoTo ErrHandler
+
+    GetJobFolderMatchScore = -1
+
+    Dim nameUpper As String
+    nameUpper = UCase(Trim(folderName))
+
+    Dim score As Long
+    score = -1
+
+    If nameUpper = wantUpper Then
+        score = 1000 - depth
+    ElseIf InStr(nameUpper, wantUpper) > 0 Then
+        score = 500 - (depth * 20) - Abs(Len(nameUpper) - Len(wantUpper))
+    End If
+
+    If score < 0 Then Exit Function
+
+    If InStr(nameUpper, "CHANGE") > 0 Or _
+       InStr(nameUpper, "CHANGES") > 0 Or _
+       InStr(nameUpper, "UPDATED") > 0 Or _
+       InStr(nameUpper, "UPDATE") > 0 Then
+
+        score = score + 5000
+
+    End If
+
+    Dim folderDate As Date
+
+    If TryParseJobFolderDate(folderName, folderDate) Then
+        score = score + CLng(CDbl(folderDate))
+    End If
+
+    GetJobFolderMatchScore = score
+    Exit Function
+
+ErrHandler:
+    GetJobFolderMatchScore = -1
+End Function
+
 Private Function FindJobFolderByText(ByVal rootPath As String, ByVal searchText As String) As String
 On Error GoTo ErrHandler
 
@@ -12330,13 +12493,7 @@ On Error GoTo ErrHandler
         If InStr(nameUpper, "PYROPEL") > 0 Then GoTo NextTop
         If InStr(nameUpper, "J BLOCK") > 0 Then GoTo NextTop
 
-        score = -1
-
-        If nameUpper = wantUpper Then
-            score = 1000
-        ElseIf InStr(nameUpper, wantUpper) > 0 Then
-            score = 500 - Abs(Len(nameUpper) - Len(wantUpper))
-        End If
+        score = GetJobFolderMatchScore(subFolder.Name, wantUpper, 0)
 
         If score > bestScore Then
             bestScore = score
@@ -12347,6 +12504,7 @@ NextTop:
     Next subFolder
 
     If bestPath <> "" Then
+        LogLine "Selected job folder (score=" & CStr(bestScore) & "): " & bestPath
         FindJobFolderByText = bestPath
         Exit Function
     End If
@@ -12361,7 +12519,11 @@ NextTop:
     Next subFolder
 
     If bestPath = "" Then
-        If InStr(UCase(root.name), wantUpper) > 0 Then bestPath = rootPath
+        If InStr(UCase(root.Name), wantUpper) > 0 Then bestPath = rootPath
+    End If
+
+    If bestPath <> "" Then
+        LogLine "Selected job folder (score=" & CStr(bestScore) & "): " & bestPath
     End If
 
     FindJobFolderByText = bestPath
@@ -12479,6 +12641,15 @@ Private Sub PublishJobOutputs()
 
     Dim jobOut As String
     jobOut = root & "\" & CleanFileName(CurrentJobNumber)
+
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    If fso.FolderExists(jobOut) Then
+        LogLine "Publish: replacing existing job output folder: " & jobOut
+        fso.DeleteFolder jobOut, True
+    End If
+
     EnsureFolderDeep jobOut
     CopyMatchingArtifacts CurrentJobFolder, jobOut
     LogLine "Published job outputs to: " & jobOut
@@ -13376,13 +13547,7 @@ On Error Resume Next
         If InStr(nameUpper, "PYROPEL") > 0 Then GoTo NextSub
         If InStr(nameUpper, "J BLOCK") > 0 Then GoTo NextSub
 
-        score = -1
-
-        If nameUpper = wantUpper Then
-            score = 1000 - depth
-        ElseIf InStr(nameUpper, wantUpper) > 0 Then
-            score = 500 - (depth * 20) - Abs(Len(nameUpper) - Len(wantUpper))
-        End If
+        score = GetJobFolderMatchScore(subFolder.Name, wantUpper, depth)
 
         If score > bestScore Then
             bestScore = score
