@@ -118,14 +118,14 @@ Private Const INSERT_LENGTH_MATCH_TOL_LOOSE As Double = 1.5
 Private Const CREATE_INDIVIDUAL_DXFS As Boolean = False
 Private Const CREATE_DXFS_DURING_XT_SAVE As Boolean = True
 
-' Speed: skip slow per-part PRINTS DXFs and heavy BASE/HOLDERS DXF packages.
+' Keep fast batch behavior, but DO NOT skip DXFs.
 Private Const FAST_BATCH_EXPORT As Boolean = True
-Private Const FAST_SKIP_PRINTS_DXF As Boolean = True
-Private Const FAST_SKIP_BASE_PACKAGE_DXF As Boolean = True
-Private Const FAST_SKIP_HOLDERS_PACKAGE_DXF As Boolean = True
+Private Const FAST_SKIP_PRINTS_DXF As Boolean = False
+Private Const FAST_SKIP_BASE_PACKAGE_DXF As Boolean = False
+Private Const FAST_SKIP_HOLDERS_PACKAGE_DXF As Boolean = False
 
-' Match Studio: ISO JPG for holders only. Combined holder IGS comes from HOLDERS package (both together).
-Private Const CREATE_COMPONENT_ISO_JPEGS As Boolean = True
+' Match Studio: no JPEG previews.
+Private Const CREATE_COMPONENT_ISO_JPEGS As Boolean = False
 Private Const CREATE_COMPONENT_IGS_WITH_XT As Boolean = False
 Private Const CREATE_COMPONENT_EASM_WITH_XT As Boolean = False
 
@@ -894,7 +894,6 @@ On Error GoTo ErrHandler
 
     WriteJobSignatureCsv jobSignaturePath
     UploadJobSignatureToElgin jobSignaturePath
-    PublishJobOutputs
 
     WriteExportLogBomSummary
 
@@ -945,15 +944,18 @@ On Error GoTo ErrHandler
 
     LogDone "Restore visibility/state"
 
-    ' Do not create a pdf folder.
     ' Move loose imported SLDPRT files into Base folder.
     ' Keep BASE and HOLDERS package files in main job folder.
+    ' Collect PDFs/Excel into J#### pdfs; publish after DXFs exist.
     CloseAllDocumentsSafely
     Set swModel = Nothing
     Set swAssy = Nothing
 
     MoveLooseSolidWorksPartsToBaseFolder
     KeepBaseAndHoldersPackageFilesInMainFolder
+    CollectPdfExcelFilesToJobPdfsFolder
+    DeletePreviewImageFilesFromJob
+    PublishJobOutputs
 
     If PUSH_OUTPUTS_TO_NETWORK Then
         LogStart "Push finished outputs back to network"
@@ -12501,10 +12503,10 @@ Private Sub CopyMatchingArtifactsRecursive(ByVal srcFolder As String, ByVal dstF
         nm = f.Name
         ext = UCase$(GetFileExtension(nm))
         take = False
-        If ext = "JPG" Or ext = "JPEG" Or ext = "PNG" Then take = True
+        ' Do not publish JPEG/PNG preview images.
         If ext = "CSV" Or ext = "TXT" Or ext = "PDF" Then take = True
         If ext = "XLS" Or ext = "XLSX" Or ext = "XLSM" Then take = True
-        If ext = "IGS" Or ext = "IGES" Or ext = "EASM" Or ext = "X_T" Or ext = "XT" Then take = True
+        If ext = "IGS" Or ext = "IGES" Or ext = "EASM" Or ext = "X_T" Or ext = "XT" Or ext = "DXF" Then take = True
         If take Then fso.CopyFile f.Path, dstFolder & "\" & nm, True
     Next f
     For Each sub_ In fso.GetFolder(srcFolder).SubFolders
@@ -12586,7 +12588,7 @@ On Error GoTo eh
 
     baseDir = CurrentJobFolder & "\" & CurrentJobNumber & " Base"
     legacyBase = CurrentJobFolder & "\base"
-    pdfDir = CurrentJobFolder & "\pdf"
+    pdfDir = CurrentJobFolder & "\" & CurrentJobNumber & " pdfs"
 
     EnsureFolderDeep baseDir
     EnsureFolderDeep pdfDir
@@ -12616,7 +12618,7 @@ On Error GoTo eh
 
     LogLine "OrganizeJobFiles: moved " & movedBase & _
             " SolidWorks native file(s) -> " & CurrentJobNumber & _
-            " Base, " & movedPdf & " report/BOM file(s) -> pdf"
+            " Base, " & movedPdf & " report/BOM file(s) -> " & CurrentJobNumber & " pdfs"
 
     Exit Sub
 
@@ -12791,7 +12793,11 @@ On Error GoTo ErrHandler
 
     Select Case ext
 
-        Case "PDF", "XLS", "XLSX", "XLSM"
+        Case "PDF"
+            ShouldMoveFileToPdfFolder = True
+            Exit Function
+
+        Case "XLS", "XLSX", "XLSM", "XLSB", "XLTX", "XLTM"
             ShouldMoveFileToPdfFolder = True
             Exit Function
 
@@ -12799,7 +12805,8 @@ On Error GoTo ErrHandler
             If InStr(n, "EXPORT") > 0 Or _
                InStr(n, "SIGNATURE") > 0 Or _
                InStr(n, "PULL") > 0 Or _
-               InStr(n, "BOM") > 0 Then
+               InStr(n, "BOM") > 0 Or _
+               InStr(n, "DIMENSION") > 0 Then
 
                 ShouldMoveFileToPdfFolder = True
                 Exit Function
@@ -12808,7 +12815,8 @@ On Error GoTo ErrHandler
 
         Case "TXT"
             If InStr(n, "BOM") > 0 Or _
-               InStr(n, "EXPORT") > 0 Then
+               InStr(n, "EXPORT") > 0 Or _
+               InStr(n, "LOG") > 0 Then
 
                 ShouldMoveFileToPdfFolder = True
                 Exit Function
@@ -12882,9 +12890,8 @@ On Error GoTo ErrHandler
     ' If old lowercase base folder exists, move only BASE/HOLDERS package files back to main.
     MoveBaseHolderPackageFilesFromFolderToMain CurrentJobFolder & "\base"
 
-    ' If old pdf folders exist, only delete them if empty. Do not create/use them.
+    ' Remove old wrong lowercase pdf folder if empty.
     DeleteFolderIfEmptyOnly CurrentJobFolder & "\pdf"
-    DeleteFolderIfEmptyOnly CurrentJobFolder & "\" & CurrentJobNumber & " pdfs"
 
     ' Delete empty old holders/base folders only.
     DeleteFolderIfEmptyOnly CurrentJobFolder & "\" & CurrentJobNumber & " HOLDERS"
@@ -13137,6 +13144,162 @@ On Error GoTo ErrHandler
 
 ErrHandler:
     LogLine "DeleteFolderIfEmptyOnly error: " & Err.Description
+End Sub
+
+Private Sub CollectPdfExcelFilesToJobPdfsFolder()
+On Error GoTo ErrHandler
+
+    If CurrentJobFolder = "" Then Exit Sub
+
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    If fso.FolderExists(CurrentJobFolder) = False Then Exit Sub
+
+    Dim destFolder As String
+    destFolder = CurrentJobFolder & "\" & CurrentJobNumber & " pdfs"
+
+    EnsureFolderDeep destFolder
+
+    Dim movedCount As Long
+    movedCount = 0
+
+    MovePdfExcelFilesRecursive CurrentJobFolder, destFolder, movedCount
+
+    DeleteFolderIfEmptyOnly CurrentJobFolder & "\pdf"
+
+    LogLine "Collected " & CStr(movedCount) & _
+            " PDF/Excel/report file(s) into: " & destFolder
+
+    Exit Sub
+
+ErrHandler:
+    LogLine "CollectPdfExcelFilesToJobPdfsFolder error: " & Err.Description
+End Sub
+
+Private Sub MovePdfExcelFilesRecursive(ByVal sourceFolder As String, _
+                                       ByVal destFolder As String, _
+                                       ByRef movedCount As Long)
+On Error GoTo ErrHandler
+
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    If sourceFolder = "" Then Exit Sub
+    If destFolder = "" Then Exit Sub
+    If fso.FolderExists(sourceFolder) = False Then Exit Sub
+
+    If LCase(sourceFolder) = LCase(destFolder) Then Exit Sub
+
+    Dim fileList As Collection
+    Set fileList = New Collection
+
+    Dim f As Object
+
+    For Each f In fso.GetFolder(sourceFolder).Files
+        If ShouldMoveFileToPdfFolder(f.Name) Then
+            fileList.Add f.Path
+        End If
+    Next f
+
+    Dim i As Long
+    Dim srcPath As String
+    Dim destPath As String
+
+    For i = 1 To fileList.Count
+
+        srcPath = CStr(fileList(i))
+
+        If fso.FileExists(srcPath) Then
+
+            destPath = GetUniqueFilePath(destFolder & "\" & fso.GetFileName(srcPath))
+
+            If MoveFileAndDeleteOriginal(srcPath, destPath) Then
+                movedCount = movedCount + 1
+                LogLine "Moved PDF/Excel/report file to " & CurrentJobNumber & " pdfs: " & _
+                        fso.GetFileName(destPath)
+            Else
+                LogLine "WARNING: Could not move PDF/Excel/report file: " & srcPath
+            End If
+
+        End If
+
+    Next i
+
+    Dim subFolder As Object
+    Dim subPath As String
+
+    For Each subFolder In fso.GetFolder(sourceFolder).SubFolders
+
+        subPath = subFolder.Path
+
+        If LCase(subPath) <> LCase(destFolder) Then
+            MovePdfExcelFilesRecursive subPath, destFolder, movedCount
+        End If
+
+    Next subFolder
+
+    Exit Sub
+
+ErrHandler:
+    LogLine "MovePdfExcelFilesRecursive error: " & Err.Description
+End Sub
+
+Private Sub DeletePreviewImageFilesFromJob()
+On Error GoTo ErrHandler
+
+    If CurrentJobFolder = "" Then Exit Sub
+
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    If fso.FolderExists(CurrentJobFolder) = False Then Exit Sub
+
+    DeletePreviewImageFilesRecursive CurrentJobFolder
+
+    Exit Sub
+
+ErrHandler:
+    LogLine "DeletePreviewImageFilesFromJob error: " & Err.Description
+End Sub
+
+Private Sub DeletePreviewImageFilesRecursive(ByVal folderPath As String)
+On Error GoTo ErrHandler
+
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    If fso.FolderExists(folderPath) = False Then Exit Sub
+
+    Dim fileList As Collection
+    Set fileList = New Collection
+
+    Dim f As Object
+    Dim ext As String
+
+    For Each f In fso.GetFolder(folderPath).Files
+        ext = UCase(GetFileExtension(f.Name))
+
+        If ext = "JPG" Or ext = "JPEG" Or ext = "PNG" Then
+            fileList.Add f.Path
+        End If
+    Next f
+
+    Dim i As Long
+    For i = 1 To fileList.Count
+        fso.DeleteFile CStr(fileList(i)), True
+        LogLine "Deleted preview image: " & CStr(fileList(i))
+    Next i
+
+    Dim subFolder As Object
+    For Each subFolder In fso.GetFolder(folderPath).SubFolders
+        DeletePreviewImageFilesRecursive subFolder.Path
+    Next subFolder
+
+    Exit Sub
+
+ErrHandler:
+    LogLine "DeletePreviewImageFilesRecursive error: " & Err.Description
 End Sub
 
 Private Sub WriteExportLogBomSummary()
