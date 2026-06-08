@@ -11936,26 +11936,55 @@ def ms_find_job_images(job_num: str):
 
 
 def ms_find_job_models(job_num: str, kind: str = "") -> list[dict]:
+    """
+    Match Studio model finder.
+
+    Important holder behavior:
+    - ID HOLDER / OD HOLDER compare should NOT require individual holder files.
+    - Both use the combined file:
+        J####_HOLDERS_customer_date.igs
+    - Combined HOLDER IGS is always preferred.
+    """
     j = normalize_job_num(job_num) or (job_num or "")
-    cache_key = (j.upper(), (kind or "").upper())
+
+    requested_kind = (kind or "").strip().upper()
+
+    # Force holder comparison to the combined HOLDERS package.
+    # This makes both ID HOLDER and OD HOLDER buttons use:
+    #   J####_HOLDERS_....igs
+    if requested_kind in ("ID HOLDER", "OD HOLDER", "HOLDERS", "HOLDER"):
+        want = "HOLDERS"
+    else:
+        want = requested_kind
+
+    cache_key = (j.upper(), want)
     now = time.time()
+
     cached = _ms_model_cache.get(cache_key)
     if cached and (now - cached[0]) < 30:
         return cached[1]
 
-    want = (kind or "").strip().upper()
-    holder_compare = want in ("ID HOLDER", "OD HOLDER", "HOLDERS")
     found = []
     seen = set()
+
     for full, fn in _ms_walk_job_files(job_num, _MS_MODEL_EXTS):
         if full in seen:
             continue
+
         seen.add(full)
+
         ck = ms_classify_component_filename(fn)
-        if want and ck != want:
-            if not (holder_compare and ck == "HOLDERS"):
+
+        # Holder comparison: ONLY use combined HOLDERS files.
+        if want == "HOLDERS":
+            if ck != "HOLDERS":
                 continue
+        elif want:
+            if ck != want:
+                continue
+
         ext = os.path.splitext(fn)[1].lower()
+
         found.append({
             "kind": ck,
             "label": fn,
@@ -11963,18 +11992,39 @@ def ms_find_job_models(job_num: str, kind: str = "") -> list[dict]:
             "format": ext.lstrip("."),
         })
 
-    fmt_rank = {".igs": 0, ".iges": 0, ".easm": 1, ".x_t": 2, ".xt": 2, ".step": 3, ".stp": 3}
+    fmt_rank = {
+        ".igs": 0,
+        ".iges": 0,
+        ".step": 1,
+        ".stp": 1,
+        ".easm": 9,
+        ".x_t": 9,
+        ".xt": 9,
+    }
 
     def _model_sort_key(x: dict) -> tuple:
         fnu = x["label"].upper()
-        base_penalty = 1 if ("_BASE_" in fnu or fnu.endswith("_BASE.IGS")) else 0
-        holders_bonus = 0 if "_HOLDERS_" in fnu else 1
-        if holder_compare:
-            return (holders_bonus, fmt_rank.get("." + x["format"], 9), base_penalty, x["label"].lower())
-        per_holder_penalty = 1 if ("_HOLDERS_" in fnu and want in ("TCP", "BCP")) else 0
-        return (fmt_rank.get("." + x["format"], 9), base_penalty, per_holder_penalty, x["label"].lower())
+        ext = "." + x["format"].lower()
+
+        # Strong preference for exact combined holders file:
+        # J8449_HOLDERS_861000172_06-03-2026.igs
+        combined_holders_bonus = 0 if "_HOLDERS_" in fnu else 5
+
+        # Prefer IGS/IGES over everything else.
+        format_rank = fmt_rank.get(ext, 8)
+
+        # Avoid BASE assemblies for holder overlay.
+        base_penalty = 10 if "_BASE_" in fnu else 0
+
+        return (
+            combined_holders_bonus,
+            format_rank,
+            base_penalty,
+            x["label"].lower(),
+        )
 
     found.sort(key=_model_sort_key)
+
     _ms_model_cache[cache_key] = (now, found)
     return found
 
@@ -12231,29 +12281,66 @@ async def ms_models_list(job_num: str, kind: str = ""):
 @app.get("/api/match/model")
 async def ms_model_file(job: str, kind: str = "", i: int = 0):
     from fastapi.responses import FileResponse
-    models = ms_find_job_models(job, kind)
+
+    requested_kind = (kind or "").strip().upper()
+
+    # Force ID/OD holder requests to combined HOLDERS IGS.
+    if requested_kind in ("ID HOLDER", "OD HOLDER", "HOLDER"):
+        lookup_kind = "HOLDERS"
+    else:
+        lookup_kind = requested_kind
+
+    models = ms_find_job_models(job, lookup_kind)
+
     if not models:
-        raise HTTPException(404, "No 3D model found for this job/component")
+        raise HTTPException(
+            404,
+            f"No 3D model found for job {job}, requested kind {kind}, lookup kind {lookup_kind}",
+        )
+
     idx = max(0, min(int(i), len(models) - 1))
     path = models[idx]["path"]
+
     if not os.path.isfile(path):
         raise HTTPException(404, "Model file missing")
-    return FileResponse(path, filename=os.path.basename(path), media_type="application/octet-stream")
+
+    return FileResponse(
+        path,
+        filename=os.path.basename(path),
+        media_type="application/octet-stream",
+    )
 
 
 @app.get("/api/match/model-meta")
 async def ms_model_meta(job: str, kind: str = "", i: int = 0):
-    models = ms_find_job_models(job, kind)
+    requested_kind = (kind or "").strip().upper()
+
+    # Force ID/OD holder requests to combined HOLDERS IGS.
+    if requested_kind in ("ID HOLDER", "OD HOLDER", "HOLDER"):
+        lookup_kind = "HOLDERS"
+    else:
+        lookup_kind = requested_kind
+
+    models = ms_find_job_models(job, lookup_kind)
+
     if not models:
-        raise HTTPException(404, "No 3D model found for this job/component")
+        raise HTTPException(
+            404,
+            f"No model found for job {job}, requested kind {kind}, lookup kind {lookup_kind}",
+        )
+
     idx = max(0, min(int(i), len(models) - 1))
     m = models[idx]
+
     return {
         "job": normalize_job_num(job),
-        "kind": kind,
+        "requested_kind": kind,
+        "lookup_kind": lookup_kind,
+        "kind": m["kind"],
         "label": m["label"],
         "format": m["format"],
-        "url": f"/api/match/model?job={normalize_job_num(job)}&kind={kind}&i={idx}",
+        "path": m["path"],
+        "url": f"/api/match/model?job={normalize_job_num(job)}&kind={lookup_kind}&i={idx}",
     }
 
 
@@ -12431,8 +12518,27 @@ function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return
 function money(v){var n=Number(v||0);return '$'+n.toLocaleString(undefined,{minimumFractionDigits:0,maximumFractionDigits:0});}
 function money2(v){var n=Number(v||0);return '$'+n.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});}
 function scoreColor(s){var h=Math.max(0,Math.min(120,(Number(s)||0)*1.2));return 'hsl('+h+',75%,52%)';}
-function modelURL(job,kind){return '/api/match/model?job='+encodeURIComponent(job)+'&kind='+encodeURIComponent(kind)+'&i=0';}
-function modelMetaURL(job,kind){return '/api/match/model-meta?job='+encodeURIComponent(job)+'&kind='+encodeURIComponent(kind)+'&i=0';}
+function holderLookupKind(kind){
+  kind=String(kind||'').toUpperCase().trim();
+
+  // ID HOLDER and OD HOLDER tabs both load the combined holder IGS:
+  // J####_HOLDERS_....igs
+  if(kind==='ID HOLDER' || kind==='OD HOLDER' || kind==='HOLDER'){
+    return 'HOLDERS';
+  }
+
+  return kind;
+}
+
+function modelURL(job,kind){
+  var lookupKind=holderLookupKind(kind);
+  return '/api/match/model?job='+encodeURIComponent(job)+'&kind='+encodeURIComponent(lookupKind)+'&i=0';
+}
+
+function modelMetaURL(job,kind){
+  var lookupKind=holderLookupKind(kind);
+  return '/api/match/model-meta?job='+encodeURIComponent(job)+'&kind='+encodeURIComponent(lookupKind)+'&i=0';
+}
 
 async function loadThreeDeps(){
   var bases=[
@@ -12637,13 +12743,15 @@ function renderOverlay(m){
   stage.innerHTML =
     '<div class="ovstage">' +
       '<div class="legend">' +
-        'Holder compare uses the combined <b>J'+esc(STATE.job)+'_HOLDERS_….igs</b> file. ' +
+        '<b>'+esc(k)+'</b> compare uses the combined <b>HOLDERS</b> IGS file for each job, not individual holder files. ' +
+        'Example: <code>J8449_HOLDERS_861000172_06-03-2026.igs</code>. ' +
         'Current job is blue/cyan. Matched job is orange/yellow. ' +
         'Drag to spin, scroll to zoom. No JPEGs are used.' +
       '</div>' +
       '<div class="ms3d" id="ms3dHost">' +
-        '<div class="muted" style="padding:18px">Loading holder IGS overlay…</div>' +
+        '<div class="muted" style="padding:18px">Loading combined HOLDERS IGS overlay…</div>' +
       '</div>' +
+      '<div id="ms3dFileInfo" class="note"></div>' +
     '</div>';
 
   loadMs3dOverlay(STATE.job, m.job_num, k, 'ms3dHost');
@@ -12651,7 +12759,12 @@ function renderOverlay(m){
 
 async function loadMs3dOverlay(curJob, matchJob, kind, containerId){
   var host=document.getElementById(containerId);
+  var fileInfo=document.getElementById('ms3dFileInfo');
+
   if(!host) return;
+
+  // ID HOLDER and OD HOLDER both use the combined HOLDERS IGS.
+  var modelKind='HOLDERS';
 
   try{
     var occt=await initOcctImportJs();
@@ -12660,29 +12773,61 @@ async function loadMs3dOverlay(curJob, matchJob, kind, containerId){
     var OrbitControls=threeDeps.OrbitControls;
 
     async function fetchModel(job){
-      var metaR=await fetch(modelMetaURL(job,kind));
-      if(!metaR.ok) return null;
+      var metaR=await fetch(modelMetaURL(job,modelKind));
+
+      if(!metaR.ok){
+        return {
+          ok:false,
+          job:job,
+          error:'No combined HOLDERS model found for '+job,
+          meta:null,
+          buf:null
+        };
+      }
 
       var meta=await metaR.json();
 
-      var bufR=await fetch(meta.url||modelURL(job,kind));
-      if(!bufR.ok) return null;
+      var bufR=await fetch(meta.url||modelURL(job,modelKind));
+
+      if(!bufR.ok){
+        return {
+          ok:false,
+          job:job,
+          error:'Could not download '+(meta.label||'model'),
+          meta:meta,
+          buf:null
+        };
+      }
 
       return {
-        buf: await bufR.arrayBuffer(),
-        format: (meta.format||'').toLowerCase(),
-        label: meta.label||''
+        ok:true,
+        job:job,
+        buf:await bufR.arrayBuffer(),
+        format:(meta.format||'').toLowerCase(),
+        label:meta.label||'',
+        path:meta.path||'',
+        meta:meta
       };
     }
 
     var mCur=await fetchModel(curJob);
     var mMatch=await fetchModel(matchJob);
 
-    if(!mCur && !mMatch){
+    if(fileInfo){
+      fileInfo.innerHTML =
+        '<div><b>Current job model:</b> ' +
+          (mCur.ok ? esc(mCur.label) : '<span style="color:var(--bad)">'+esc(mCur.error)+'</span>') +
+        '</div>' +
+        '<div><b>Matched job model:</b> ' +
+          (mMatch.ok ? esc(mMatch.label) : '<span style="color:var(--bad)">'+esc(mMatch.error)+'</span>') +
+        '</div>';
+    }
+
+    if(!mCur.ok && !mMatch.ok){
       host.innerHTML =
         '<div class="muted" style="padding:18px">' +
-        'No holder IGS/IGES found. Re-run the SolidWorks export and make sure it publishes ' +
-        '<code>J'+esc(curJob)+'_HOLDERS_….igs</code> and the matched job holder IGS into the Matching software folder.' +
+        'No combined holder IGS/IGES found for either job. Re-run the SolidWorks export and make sure it publishes files like: ' +
+        '<code>J'+esc(curJob)+'_HOLDERS_….igs</code> and <code>J'+esc(matchJob)+'_HOLDERS_….igs</code>.' +
         '</div>';
       return;
     }
@@ -12727,21 +12872,43 @@ async function loadMs3dOverlay(curJob, matchJob, kind, containerId){
 
     scene.add(new THREE.AmbientLight(0xffffff,0.45));
 
-    function parseCad(buf, fmt){
-      if(!buf) return null;
+    function parseCad(model){
+      if(!model || !model.ok || !model.buf) return null;
 
-      var u8=new Uint8Array(buf);
+      var fmt=String(model.format||'').toLowerCase();
+      var u8=new Uint8Array(model.buf);
       var parsed=null;
 
+      // IGS/IGES preferred.
       if(fmt==='igs' || fmt==='iges'){
-        try{ parsed=occt.ReadIgesFile(u8); }catch(e1){ parsed=null; }
-      }else if(fmt==='stp' || fmt==='step'){
-        try{ parsed=occt.ReadStepFile(u8); }catch(e2){ parsed=null; }
-      }else{
-        try{ parsed=occt.ReadIgesFile(u8); }catch(e3){ parsed=null; }
+        try{
+          parsed=occt.ReadIgesFile(u8);
+        }catch(e1){
+          parsed=null;
+        }
+      }
+
+      // STEP fallback.
+      if(!parsed || !parsed.meshes || !parsed.meshes.length){
+        if(fmt==='stp' || fmt==='step'){
+          try{
+            parsed=occt.ReadStepFile(u8);
+          }catch(e2){
+            parsed=null;
+          }
+        }
+      }
+
+      // Last-resort auto try.
+      if(!parsed || !parsed.meshes || !parsed.meshes.length){
+        try{
+          parsed=occt.ReadIgesFile(u8);
+        }catch(e3){}
 
         if(!parsed || !parsed.meshes || !parsed.meshes.length){
-          try{ parsed=occt.ReadStepFile(u8); }catch(e4){ parsed=null; }
+          try{
+            parsed=occt.ReadStepFile(u8);
+          }catch(e4){}
         }
       }
 
@@ -12749,20 +12916,25 @@ async function loadMs3dOverlay(curJob, matchJob, kind, containerId){
     }
 
     function addMeshes(model, solidColor, edgeColor, opacity, label){
-      if(!model || !model.buf) return null;
+      if(!model || !model.ok || !model.buf) return null;
 
+      // No JPEG/EASM/X_T compare. Combined HOLDERS IGS/IGES/STEP only.
       if(model.format==='easm' || model.format==='x_t' || model.format==='xt'){
         return null;
       }
 
-      var parsed=parseCad(model.buf, model.format);
-      if(!parsed || !parsed.meshes || !parsed.meshes.length) return null;
+      var parsed=parseCad(model);
+
+      if(!parsed || !parsed.meshes || !parsed.meshes.length){
+        return null;
+      }
 
       var group=new THREE.Group();
       group.name=label||'';
 
       parsed.meshes.forEach(function(mh){
         var pos=mh.attributes && mh.attributes.position ? mh.attributes.position.array : null;
+
         if(!pos || !pos.length) return;
 
         var geom=new THREE.BufferGeometry();
@@ -12780,31 +12952,38 @@ async function loadMs3dOverlay(curJob, matchJob, kind, containerId){
           geom.computeVertexNormals();
         }
 
+        // Transparent solid body.
         var mat=new THREE.MeshPhongMaterial({
-          color: solidColor,
-          transparent: true,
-          opacity: opacity,
-          side: THREE.DoubleSide,
-          depthWrite: false,
-          polygonOffset: true,
-          polygonOffsetFactor: 1,
-          polygonOffsetUnits: 1
+          color:solidColor,
+          transparent:true,
+          opacity:opacity,
+          side:THREE.DoubleSide,
+          depthWrite:false,
+          polygonOffset:true,
+          polygonOffsetFactor:1,
+          polygonOffsetUnits:1
         });
 
-        var mesh=new THREE.Mesh(geom, mat);
+        var mesh=new THREE.Mesh(geom,mat);
         group.add(mesh);
 
+        // Bright edge wireframe.
         try{
           var edges=new THREE.EdgesGeometry(geom,20);
           var edgeMat=new THREE.LineBasicMaterial({
-            color: edgeColor,
-            transparent: true,
-            opacity: 0.98
+            color:edgeColor,
+            transparent:true,
+            opacity:0.98
           });
-          var edgeLines=new THREE.LineSegments(edges, edgeMat);
+
+          var edgeLines=new THREE.LineSegments(edges,edgeMat);
           group.add(edgeLines);
         }catch(e){}
       });
+
+      if(group.children.length<=0){
+        return null;
+      }
 
       scene.add(group);
       return group;
@@ -12817,11 +12996,14 @@ async function loadMs3dOverlay(curJob, matchJob, kind, containerId){
       if(b.isEmpty()) return;
 
       var c=b.getCenter(new THREE.Vector3());
+
       group.position.x-=c.x;
       group.position.y-=c.y;
       group.position.z-=c.z;
     }
 
+    // Orange/yellow = matched/old job.
+    // Blue/cyan = current/new job.
     var gMatch=addMeshes(mMatch,0xff8c42,0xffd199,0.32,'MATCHED_OLD_JOB');
     var gCur=addMeshes(mCur,0x3b82f6,0x7dd3fc,0.42,'CURRENT_JOB');
 
@@ -12833,7 +13015,11 @@ async function loadMs3dOverlay(curJob, matchJob, kind, containerId){
     if(box.isEmpty()){
       host.innerHTML =
         '<div class="muted" style="padding:18px">' +
-        'Could not mesh holder IGS. Make sure the files are IGS/IGES or STEP, not EASM/JPEG/X_T.' +
+          '<b>Could not mesh the combined holder IGS.</b><br><br>' +
+          'The file was found, but the browser mesher could not convert it into triangles.<br>' +
+          'Current file: <code>'+(mCur.ok ? esc(mCur.label) : 'not found')+'</code><br>' +
+          'Matched file: <code>'+(mMatch.ok ? esc(mMatch.label) : 'not found')+'</code><br><br>' +
+          'Make sure these are real exported IGES solid/surface files, not EASM, X_T, empty exports, or shortcut/reference files.' +
         '</div>';
       return;
     }
@@ -12851,14 +13037,14 @@ async function loadMs3dOverlay(curJob, matchJob, kind, containerId){
     var leg=document.createElement('div');
     leg.className='ms3d-legend';
     leg.innerHTML =
-      '<span><i class="dot" style="background:#3b82f6"></i>'+esc(curJob)+' current holder IGS</span>' +
-      '<span><i class="dot" style="background:#ff8c42"></i>'+esc(matchJob)+' matched holder IGS</span>' +
-      '<span style="color:#8aa0c6">solid transparent bodies + bright wireframe edges</span>';
+      '<span><i class="dot" style="background:#3b82f6"></i>'+esc(curJob)+' current combined HOLDERS IGS</span>' +
+      '<span><i class="dot" style="background:#ff8c42"></i>'+esc(matchJob)+' matched combined HOLDERS IGS</span>' +
+      '<span style="color:#8aa0c6">transparent solid bodies + bright wireframe edges</span>';
     host.appendChild(leg);
 
     var hint=document.createElement('div');
     hint.className='ms3d-hint';
-    hint.textContent='Drag to spin · scroll to zoom · no JPEG comparison';
+    hint.textContent='Drag to spin · scroll to zoom · combined HOLDERS IGS only';
     host.appendChild(hint);
 
     function anim(){
@@ -12872,7 +13058,7 @@ async function loadMs3dOverlay(curJob, matchJob, kind, containerId){
   }catch(err){
     host.innerHTML =
       '<div class="muted" style="padding:18px">' +
-      '3D holder IGS overlay unavailable: '+esc(err.message||err)+
+      '3D combined holder IGS overlay unavailable: '+esc(err.message||err)+
       '</div>';
   }
 }
