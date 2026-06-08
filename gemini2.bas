@@ -38,8 +38,8 @@ Private Const PRIVATE_DATA_ROOT As String = "C:\CMS_Local_Workspace\Matching"
 ' --- Match Studio publish/material/signature settings ---
 Private Const ALWAYS_PUBLISH_TO_PUBLIC_MATCHING_SHARE As Boolean = True
 Private Const MATCH_STUDIO_FORCE_CARBON_STEEL As Boolean = True
-Private Const MATCH_STUDIO_APPLY_PHYSICAL_MATERIAL_TO_ALL_PARTS As Boolean = False
-Private Const MATCH_STUDIO_USE_CARBON_STEEL_DENSITY_FOR_MASS As Boolean = True
+Private Const MATCH_STUDIO_APPLY_PHYSICAL_MATERIAL_TO_ALL_PARTS As Boolean = True
+Private Const MATCH_STUDIO_USE_CARBON_STEEL_DENSITY_FOR_MASS As Boolean = False
 Private Const MATCH_STUDIO_CARBON_STEEL_DENSITY_LB_PER_CUIN As Double = 0.283
 Private Const MATCH_STUDIO_TURBO_ONLY As Boolean = False
 Private Const MATCH_STUDIO_MATERIAL_DATABASE As String = "solidworks materials.sldmat"
@@ -141,7 +141,6 @@ Private Const CREATE_MATCH_STUDIO_HOLDERS_STL As Boolean = False
 Private Const CREATE_MATCH_STUDIO_STL_PACKAGE As Boolean = False
 Private Const CREATE_MATCH_STUDIO_STLS_DURING_EXISTING_EXPORTS As Boolean = True
 Private Const MATCH_STUDIO_STL_FOLDER_SUFFIX As String = " STL"
-Private Const MATCH_STUDIO_STL_COMBINED_TOKEN As String = "MATCH SET"
 Private Const CREATE_COMPONENT_IGS_WITH_XT As Boolean = False
 Private Const CREATE_COMPONENT_EASM_WITH_XT As Boolean = False
 
@@ -475,7 +474,6 @@ Private SpecialBomCadMatches As Object
 Private SpecialBomCadQuoteNames As Object
 Private PullcoreBestFitDimCache As Object
 Private MatchStudioStlExported As Object
-Private MatchStudioCombinedStlSaved As Boolean
 
 Private MacroStartTime As Date
 Private StepStartTime As Date
@@ -587,7 +585,6 @@ On Error GoTo ErrHandler
             Set SpecialBomCadQuoteNames = Nothing
             Set PullcoreBestFitDimCache = Nothing
             Set MatchStudioStlExported = Nothing
-            MatchStudioCombinedStlSaved = False
             ReleaseSolidWorksMemory "after batch job"
 
             Erase parts
@@ -679,7 +676,6 @@ On Error GoTo ErrHandler
     Set SpecialBomCadQuoteNames = CreateObject("Scripting.Dictionary")
     Set PullcoreBestFitDimCache = CreateObject("Scripting.Dictionary")
     Set MatchStudioStlExported = CreateObject("Scripting.Dictionary")
-    MatchStudioCombinedStlSaved = False
 
     CurrentJobNumber = UCase(Trim(jobSearchText))
     CurrentJobFolder = ""
@@ -833,10 +829,6 @@ On Error GoTo ErrHandler
         LogStart "Apply Match Studio carbon steel material"
         ApplyMatchStudioCarbonSteelToDocument swModel
         LogDone "Apply Match Studio carbon steel material"
-    ElseIf MATCH_STUDIO_FORCE_CARBON_STEEL And MATCH_STUDIO_USE_CARBON_STEEL_DENSITY_FOR_MASS Then
-        LogLine "Fast Match Studio material mode: physical material assignment skipped."
-        LogLine "Mass/signature uses true CAD volume x carbon steel density = " & _
-                CStr(MATCH_STUDIO_CARBON_STEEL_DENSITY_LB_PER_CUIN) & " lb/in^3."
     End If
 
     If HIDE_QUARTER_INCH_THICKNESS And PHYSICALLY_HIDE_250_BEFORE_SCAN Then
@@ -1033,7 +1025,6 @@ CleanExit:
     Set SpecialBomCadQuoteNames = Nothing
     Set PullcoreBestFitDimCache = Nothing
     Set MatchStudioStlExported = Nothing
-    MatchStudioCombinedStlSaved = False
 
     CurrentPullcoreStraightenCadIndex = 0
     PullcoreIdOdHeightAxisUsed = ""
@@ -4542,12 +4533,8 @@ On Error GoTo ErrHandler
     ApplyCmsTopView swModel
     StabilizeActiveView swModel, 100
 
-    If CREATE_MATCH_STUDIO_STLS_DURING_EXISTING_EXPORTS Then
-        SaveMatchStudioMatchSetStlIfNeeded swModel
-    End If
-
     If MATCH_STUDIO_TURBO_ONLY Then
-        LogLine "MATCH STUDIO TURBO: MATCH SET STL saved; skipping BASE DXF creation."
+        LogLine "MATCH STUDIO TURBO: skipping BASE DXF creation."
         GoTo CleanExit
     End If
 
@@ -4943,32 +4930,6 @@ ErrHandler:
     LogLine "SaveMatchStudioVisibleComponentStl error (" & label & "): " & Err.Description
 End Sub
 
-Private Sub SaveMatchStudioMatchSetStlIfNeeded(ByVal model As Object)
-On Error GoTo ErrHandler
-
-    If CREATE_MATCH_STUDIO_STLS_DURING_EXISTING_EXPORTS = False Then Exit Sub
-    If model Is Nothing Then Exit Sub
-
-    If MatchStudioCombinedStlSaved Then Exit Sub
-
-    Dim stlPath As String
-    stlPath = BuildMatchStudioStlPath(MATCH_STUDIO_STL_COMBINED_TOKEN)
-
-    If stlPath = "" Then Exit Sub
-
-    LogLine "Fast Match Studio MATCH SET STL save while six components are already isolated:"
-    LogLine "  " & stlPath
-
-    SaveModelAs model, stlPath
-
-    MatchStudioCombinedStlSaved = True
-
-    Exit Sub
-
-ErrHandler:
-    LogLine "SaveMatchStudioMatchSetStlIfNeeded error: " & Err.Description
-End Sub
-
 ' ============================================================
 ' MATCH STUDIO STL PACKAGE (slow fallback — not used by default)
 ' Exports individual STL files and one combined six-component STL:
@@ -5156,7 +5117,7 @@ On Error GoTo ErrHandler
     StabilizeActiveView swModel, 50
 
     Dim token As String
-    token = CleanQuoteTokenForFile(MATCH_STUDIO_STL_COMBINED_TOKEN)
+    token = CleanQuoteTokenForFile("MATCH SET")
     If token = "" Then token = "MATCH SET"
 
     Dim stlPath As String

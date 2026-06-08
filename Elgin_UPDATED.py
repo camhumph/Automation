@@ -264,6 +264,11 @@ JOB_SIGNATURE_COMPONENT_ALIASES = {
 
 JOB_SIGNATURE_DEFAULT_LIMIT = int(os.environ.get("ELGIN_JOB_SIGNATURE_MATCH_LIMIT", "10"))
 
+# Tolerance bands for signature matching — differences within these bands are forgiven.
+SIGNATURE_MATCH_SIZE_TOLERANCE = float(os.environ.get("ELGIN_SIGNATURE_SIZE_TOLERANCE", "0.08"))
+SIGNATURE_MATCH_MASS_TOLERANCE = float(os.environ.get("ELGIN_SIGNATURE_MASS_TOLERANCE", "0.15"))
+SIGNATURE_MATCH_CENTER_TOLERANCE = float(os.environ.get("ELGIN_SIGNATURE_CENTER_TOLERANCE", "0.15"))
+
 
 # ============================================================
 # ADMIN / SECURITY
@@ -4702,10 +4707,27 @@ def _relative_diff(a: float, b: float, floor: float = 0.001) -> float:
     return abs(a - b) / denom
 
 
+def _tolerant_diff(raw_diff: float, tolerance: float) -> float:
+    """Forgive differences within tolerance; scale remaining gap above the band."""
+    raw_diff = max(0.0, float(raw_diff or 0))
+    tolerance = max(0.0, float(tolerance or 0))
+    if tolerance <= 0:
+        return raw_diff
+    if raw_diff <= tolerance:
+        return 0.0
+    return (raw_diff - tolerance) / max(1.0 - tolerance, 0.001)
+
+
 def compare_signature_component(current: dict, candidate: dict) -> dict:
     dims = ["length", "width", "thickness"]
-    size_diff = sum(_relative_diff(current.get(k), candidate.get(k), 0.25) for k in dims) / 3.0
-    mass_diff = _relative_diff(current.get("mass"), candidate.get("mass"), 0.1)
+    size_diff = sum(
+        _tolerant_diff(_relative_diff(current.get(k), candidate.get(k), 0.25), SIGNATURE_MATCH_SIZE_TOLERANCE)
+        for k in dims
+    ) / 3.0
+    mass_diff = _tolerant_diff(
+        _relative_diff(current.get("mass"), candidate.get("mass"), 0.1),
+        SIGNATURE_MATCH_MASS_TOLERANCE,
+    )
 
     center_distance = math.sqrt(
         (float(current.get("center_x") or 0) - float(candidate.get("center_x") or 0)) ** 2 +
@@ -4714,10 +4736,13 @@ def compare_signature_component(current: dict, candidate: dict) -> dict:
     )
     cur_diag = math.sqrt(sum(float(current.get(k) or 0) ** 2 for k in dims))
     cand_diag = math.sqrt(sum(float(candidate.get(k) or 0) ** 2 for k in dims))
-    center_diff = center_distance / max((cur_diag + cand_diag) / 2.0, 1.0)
+    center_diff = _tolerant_diff(
+        center_distance / max((cur_diag + cand_diag) / 2.0, 1.0),
+        SIGNATURE_MATCH_CENTER_TOLERANCE,
+    )
 
     # Lower score is better. Size and mass dominate; center/COG separates same-size stacks.
-    diff_score = (0.45 * size_diff) + (0.35 * mass_diff) + (0.20 * center_diff)
+    diff_score = (0.40 * size_diff) + (0.25 * mass_diff) + (0.35 * center_diff)
     similarity = max(0.0, min(100.0, 100.0 * (1.0 - diff_score)))
 
     return {
@@ -11824,9 +11849,6 @@ def ms_classify_component_filename(fn: str) -> str:
     u = fnu.replace("_", " ")
     compact = re.sub(r"[^A-Z0-9]", "", u)
 
-    if "MATCHSET" in compact or "ALLCOMPONENTS" in compact or "SIXCOMPONENTS" in compact:
-        return "MATCH SET"
-
     # Combined ID+OD holders.
     if "_HOLDERS_" in fnu or ("HOLDERS" in compact and "IDHOLDER" not in compact and "ODHOLDER" not in compact):
         return "HOLDERS"
@@ -11958,10 +11980,7 @@ def ms_find_job_models(job_num: str, kind: str = "") -> list[dict]:
     j = normalize_job_num(job_num) or (job_num or "")
     requested_kind = (kind or "").strip().upper()
 
-    if requested_kind in ("ALL SIX", "ALL COMPONENTS", "SIX COMPONENTS", "MATCH SET"):
-        want = "MATCH SET"
-    else:
-        want = requested_kind
+    want = requested_kind
 
     cache_key = (j.upper(), want)
     now = time.time()
@@ -12021,17 +12040,11 @@ def ms_find_job_models(job_num: str, kind: str = "") -> list[dict]:
         # Exact component STL beats combined HOLDERS fallback.
         exact_kind_bonus = 0 if x["kind"] == want else 5
 
-        # Prefer MATCH SET exact combined file for all-six compare.
-        match_set_bonus = 0
-        if want == "MATCH SET":
-            match_set_bonus = 0 if x["kind"] == "MATCH SET" else 10
-
         base_penalty = 10 if "_BASE_" in fnu else 0
 
         return (
             in_stl_folder_bonus,
             exact_kind_bonus,
-            match_set_bonus,
             format_rank,
             base_penalty,
             x["label"].lower(),
@@ -12330,8 +12343,6 @@ async def ms_model_meta(job: str, kind: str = "", i: int = 0):
     idx = max(0, min(int(i), len(models) - 1))
     m = models[idx]
     lookup_kind = (kind or "").strip().upper()
-    if lookup_kind in ("ALL SIX", "ALL COMPONENTS", "SIX COMPONENTS"):
-        lookup_kind = "MATCH SET"
 
     return {
         "job": normalize_job_num(job),
@@ -12518,8 +12529,7 @@ var COMPONENT_MODEL_KINDS=[
   'BCP',
   'TCP',
   'ID HOLDER',
-  'OD HOLDER',
-  'MATCH SET'
+  'OD HOLDER'
 ];
 
 function isModelCompareKind(k){
@@ -12532,13 +12542,7 @@ function money(v){var n=Number(v||0);return '$'+n.toLocaleString(undefined,{mini
 function money2(v){var n=Number(v||0);return '$'+n.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});}
 function scoreColor(s){var h=Math.max(0,Math.min(120,(Number(s)||0)*1.2));return 'hsl('+h+',75%,52%)';}
 function modelLookupKind(kind){
-  kind=String(kind||'').toUpperCase().trim();
-
-  if(kind==='ALL SIX' || kind==='ALL COMPONENTS' || kind==='SIX COMPONENTS'){
-    return 'MATCH SET';
-  }
-
-  return kind;
+  return String(kind||'').toUpperCase().trim();
 }
 
 function modelURL(job,kind){
@@ -12746,7 +12750,7 @@ function renderOverlay(m){
   if(!isModelCompareKind(k)){
     stage.innerHTML =
       '<div class="note">' +
-      'STL overlay comparison is enabled for the six Match Studio components and MATCH SET.' +
+      'STL overlay comparison is enabled for the six Match Studio components.' +
       '</div>';
     return;
   }
