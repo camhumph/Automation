@@ -34,6 +34,13 @@ Private Const LOCAL_WORKSPACE_ROOT As String = "C:\CMS_Local_Workspace"
 Private Const COMPANY_WIFI_SSID As String = "NETGEAR"
 Private Const PUBLIC_DATA_ROOT As String = "\\Mycloudex2ultra\mexico\Cameron's stuff\Matching software"
 Private Const PRIVATE_DATA_ROOT As String = "C:\CMS_Local_Workspace\Matching"
+
+' --- Match Studio publish/material/signature settings ---
+Private Const ALWAYS_PUBLISH_TO_PUBLIC_MATCHING_SHARE As Boolean = True
+Private Const MATCH_STUDIO_FORCE_CARBON_STEEL As Boolean = True
+Private Const MATCH_STUDIO_MATERIAL_DATABASE As String = "solidworks materials.sldmat"
+Private Const MATCH_STUDIO_CARBON_STEEL_MATERIAL As String = "Plain Carbon Steel"
+
 Private Const FORCE_LOCAL_PUBLISH As Boolean = False
 Private Const PUBLISH_OUTPUTS As Boolean = True
 Private Const AUTO_UPLOAD_JOB_SIGNATURE_TO_ELGIN As Boolean = True
@@ -344,6 +351,11 @@ Private Type PartInfo
     AsmCenterX As Double
     AsmCenterY As Double
     AsmCenterZ As Double
+
+    hasMassCenter As Boolean
+    MassCenterX As Double
+    MassCenterY As Double
+    MassCenterZ As Double
 
     hasTopRotation As Boolean
     topRotationRad As Double
@@ -801,6 +813,12 @@ On Error GoTo ErrHandler
     EnsureSwHidden
 
     DisableMainViewportGraphics
+
+    If MATCH_STUDIO_FORCE_CARBON_STEEL Then
+        LogStart "Apply Match Studio carbon steel material"
+        ApplyMatchStudioCarbonSteelToDocument swModel
+        LogDone "Apply Match Studio carbon steel material"
+    End If
 
     If HIDE_QUARTER_INCH_THICKNESS And PHYSICALLY_HIDE_250_BEFORE_SCAN Then
         LogStart "Physically hide .250 items"
@@ -2732,6 +2750,18 @@ On Error GoTo SafeExit
     Dim massValue As Double
     massValue = GetModelMassOrVolumeValue(swCompModel)
 
+    Dim massCx As Double
+    Dim massCy As Double
+    Dim massCz As Double
+    Dim massFromCom As Double
+    Dim hasMassCenter As Boolean
+
+    hasMassCenter = TryGetComponentMassCenterInches(swComp, massCx, massCy, massCz, massFromCom)
+
+    If hasMassCenter And massFromCom > 0# Then
+        massValue = massFromCom
+    End If
+
     Dim asmBoxL As Double
     Dim asmBoxW As Double
     Dim asmBoxT As Double
@@ -2758,7 +2788,8 @@ On Error GoTo SafeExit
                dx, dy, dz, massValue, False, _
                hasCenter, cx, cy, cz, _
                False, 0#, _
-               hasAsmBox, asmBoxL, asmBoxW, asmBoxT
+               hasAsmBox, asmBoxL, asmBoxW, asmBoxT, _
+               hasMassCenter, massCx, massCy, massCz
 
 SafeExit:
 End Sub
@@ -2831,7 +2862,11 @@ Private Sub AddCadPart(ByVal componentName As String, _
                        Optional ByVal hasOriginalAsmBBox As Boolean = False, _
                        Optional ByVal originalAsmL As Double = 0#, _
                        Optional ByVal originalAsmW As Double = 0#, _
-                       Optional ByVal originalAsmT As Double = 0#)
+                       Optional ByVal originalAsmT As Double = 0#, _
+                       Optional ByVal hasMassCenter As Boolean = False, _
+                       Optional ByVal massCx As Double = 0#, _
+                       Optional ByVal massCy As Double = 0#, _
+                       Optional ByVal massCz As Double = 0#)
 
     Dim L As Double
     Dim W As Double
@@ -2882,6 +2917,11 @@ Private Sub AddCadPart(ByVal componentName As String, _
     parts(PartCount).AsmCenterX = asmCx
     parts(PartCount).AsmCenterY = asmCy
     parts(PartCount).AsmCenterZ = asmCz
+
+    parts(PartCount).hasMassCenter = hasMassCenter
+    parts(PartCount).MassCenterX = massCx
+    parts(PartCount).MassCenterY = massCy
+    parts(PartCount).MassCenterZ = massCz
 
     parts(PartCount).hasTopRotation = hasTopRotation
     parts(PartCount).topRotationRad = topRotationRad
@@ -11915,7 +11955,7 @@ On Error GoTo ErrHandler
 
     Open csvPath For Output As #f
 
-    Print #f, "JobNumber,CustomerNumber,DateCode,ComponentRole,QuoteName,CadComponent,CleanName,Length,Width,Thickness,Mass,CenterX,CenterY,CenterZ,HasCenter,Status"
+    Print #f, "JobNumber,CustomerNumber,DateCode,ComponentRole,QuoteName,CadComponent,CleanName,Length,Width,Thickness,Mass,CenterX,CenterY,CenterZ,HasCenter,CenterSource,Status"
 
     WriteJobSignatureRow f, "TCP", "TCP", "TCP|TOP SMED|TOP CLAMPING|TOP CLAMPING PLATE|ID SMED"
     WriteJobSignatureRow f, "BCP", "BCP", "BCP|BOTTOM SMED|BOT SMED|BOTTOM CLAMPING|BOTTOM CLAMPING PLATE|OD SMED"
@@ -11959,6 +11999,7 @@ On Error Resume Next
     Dim centerY As Double
     Dim centerZ As Double
     Dim hasCenter As Boolean
+    Dim centerSource As String
 
     cadComponent = ""
     cleanName = ""
@@ -11967,6 +12008,7 @@ On Error Resume Next
     massVal = 0#
     centerX = 0#: centerY = 0#: centerZ = 0#
     hasCenter = False
+    centerSource = ""
 
     If cadIdx > 0 And cadIdx <= PartCount Then
         cadComponent = parts(cadIdx).componentName
@@ -11975,10 +12017,24 @@ On Error Resume Next
         W = parts(cadIdx).Width
         T = parts(cadIdx).Thickness
         massVal = parts(cadIdx).massValue
-        hasCenter = parts(cadIdx).hasAsmCenter
-        centerX = parts(cadIdx).AsmCenterX
-        centerY = parts(cadIdx).AsmCenterY
-        centerZ = parts(cadIdx).AsmCenterZ
+
+        If parts(cadIdx).hasMassCenter Then
+            hasCenter = True
+            centerX = parts(cadIdx).MassCenterX
+            centerY = parts(cadIdx).MassCenterY
+            centerZ = parts(cadIdx).MassCenterZ
+            centerSource = "CENTER_OF_MASS"
+        ElseIf parts(cadIdx).hasAsmCenter Then
+            hasCenter = True
+            centerX = parts(cadIdx).AsmCenterX
+            centerY = parts(cadIdx).AsmCenterY
+            centerZ = parts(cadIdx).AsmCenterZ
+            centerSource = "BBOX_CENTER_FALLBACK"
+        Else
+            hasCenter = False
+            centerSource = ""
+        End If
+
         statusText = "OK"
     End If
 
@@ -11997,6 +12053,7 @@ On Error Resume Next
               FormatNumberForCsv(centerY) & "," & _
               FormatNumberForCsv(centerZ) & "," & _
               CStr(hasCenter) & "," & _
+              CsvText(centerSource) & "," & _
               CsvText(statusText)
 End Sub
 
@@ -12619,8 +12676,19 @@ End Function
 
 Private Function ResolveMatchingRoot() As String
     Dim root As String
-    If IsOnCompanyWifi() Then root = PUBLIC_DATA_ROOT Else root = PRIVATE_DATA_ROOT
-    If root = "" Then root = PRIVATE_DATA_ROOT
+
+    If ALWAYS_PUBLISH_TO_PUBLIC_MATCHING_SHARE Then
+        root = PUBLIC_DATA_ROOT
+    Else
+        If IsOnCompanyWifi() Then
+            root = PUBLIC_DATA_ROOT
+        Else
+            root = PRIVATE_DATA_ROOT
+        End If
+    End If
+
+    If root = "" Then root = PUBLIC_DATA_ROOT
+
     EnsureFolderDeep root
     ResolveMatchingRoot = root
 End Function
@@ -15077,6 +15145,189 @@ On Error Resume Next
     End If
 
     RemoveLeadingItemNumber = s
+End Function
+
+' ============================================================
+' MATCH STUDIO MATERIAL + CENTER OF MASS HELPERS
+' ============================================================
+
+Private Sub ApplyMatchStudioCarbonSteelToDocument(ByVal model As Object)
+On Error GoTo ErrHandler
+
+    If model Is Nothing Then Exit Sub
+
+    If model.GetType = swDocPART Then
+        ApplyMatchStudioCarbonSteelToPart model, ""
+        Exit Sub
+    End If
+
+    If model.GetType <> swDocASSEMBLY Then Exit Sub
+
+    Dim vComps As Variant
+    vComps = model.GetComponents(False)
+
+    If IsEmpty(vComps) Then Exit Sub
+    If IsArray(vComps) = False Then Exit Sub
+
+    Dim i As Long
+    Dim comp As Object
+    Dim partDoc As Object
+    Dim cfg As String
+
+    For i = 0 To UBound(vComps)
+
+        Set comp = vComps(i)
+
+        If Not comp Is Nothing Then
+            If comp.IsSuppressed = False Then
+
+                Set partDoc = comp.GetModelDoc2
+                cfg = ""
+
+                On Error Resume Next
+                cfg = comp.ReferencedConfiguration
+                On Error GoTo ErrHandler
+
+                If Not partDoc Is Nothing Then
+                    If partDoc.GetType = swDocPART Then
+                        ApplyMatchStudioCarbonSteelToPart partDoc, cfg
+                    End If
+                End If
+
+            End If
+        End If
+
+    Next i
+
+    On Error Resume Next
+    model.ForceRebuild3 False
+    On Error GoTo 0
+
+    LogLine "Match Studio material applied: " & MATCH_STUDIO_CARBON_STEEL_MATERIAL
+    Exit Sub
+
+ErrHandler:
+    LogLine "ApplyMatchStudioCarbonSteelToDocument error: " & Err.Description
+End Sub
+
+Private Sub ApplyMatchStudioCarbonSteelToPart(ByVal partModel As Object, ByVal configName As String)
+On Error GoTo ErrHandler
+
+    If partModel Is Nothing Then Exit Sub
+    If partModel.GetType <> swDocPART Then Exit Sub
+
+    Dim cfg As String
+    cfg = Trim(configName)
+
+    If cfg = "" Then
+        On Error Resume Next
+        cfg = partModel.ConfigurationManager.ActiveConfiguration.Name
+        On Error GoTo ErrHandler
+    End If
+
+    If cfg = "" Then cfg = "Default"
+
+    On Error Resume Next
+    Err.Clear
+
+    partModel.SetMaterialPropertyName2 cfg, _
+                                       MATCH_STUDIO_MATERIAL_DATABASE, _
+                                       MATCH_STUDIO_CARBON_STEEL_MATERIAL
+
+    If Err.Number <> 0 Then
+        LogLine "WARNING: Could not apply carbon steel material to " & _
+                partModel.GetTitle & " config " & cfg & ": " & Err.Description
+        Err.Clear
+    End If
+
+    partModel.ForceRebuild3 False
+    On Error GoTo 0
+
+    Exit Sub
+
+ErrHandler:
+    LogLine "ApplyMatchStudioCarbonSteelToPart error: " & Err.Description
+End Sub
+
+Private Function TryGetComponentMassCenterInches(ByVal swComp As Object, _
+                                                 ByRef cx As Double, _
+                                                 ByRef cy As Double, _
+                                                 ByRef cz As Double, _
+                                                 ByRef massOut As Double) As Boolean
+On Error GoTo ErrHandler
+
+    TryGetComponentMassCenterInches = False
+
+    cx = 0#
+    cy = 0#
+    cz = 0#
+    massOut = 0#
+
+    If swComp Is Nothing Then Exit Function
+
+    Dim partModel As Object
+    Set partModel = swComp.GetModelDoc2
+
+    If partModel Is Nothing Then Exit Function
+    If partModel.GetType <> swDocPART Then Exit Function
+
+    Dim mp As Object
+    Set mp = partModel.Extension.CreateMassProperty
+
+    If mp Is Nothing Then Exit Function
+
+    Dim vCom As Variant
+    vCom = mp.CenterOfMass
+
+    If IsEmpty(vCom) Then Exit Function
+    If IsArray(vCom) = False Then Exit Function
+    If UBound(vCom) < 2 Then Exit Function
+
+    On Error Resume Next
+    massOut = CDbl(mp.Mass)
+    On Error GoTo ErrHandler
+
+    Dim xform As Object
+    Set xform = swComp.Transform2
+
+    If xform Is Nothing Then Exit Function
+
+    Dim m As Variant
+    m = xform.ArrayData
+
+    If IsEmpty(m) Then Exit Function
+    If IsArray(m) = False Then Exit Function
+    If UBound(m) < 12 Then Exit Function
+
+    Dim scaleVal As Double
+    scaleVal = CDbl(m(12))
+    If Abs(scaleVal) < 0.0000001 Then scaleVal = 1#
+
+    Dim px As Double
+    Dim py As Double
+    Dim pz As Double
+
+    px = CDbl(vCom(0))
+    py = CDbl(vCom(1))
+    pz = CDbl(vCom(2))
+
+    Dim tx As Double
+    Dim ty As Double
+    Dim tz As Double
+
+    tx = scaleVal * ((px * CDbl(m(0))) + (py * CDbl(m(3))) + (pz * CDbl(m(6)))) + CDbl(m(9))
+    ty = scaleVal * ((px * CDbl(m(1))) + (py * CDbl(m(4))) + (pz * CDbl(m(7)))) + CDbl(m(10))
+    tz = scaleVal * ((px * CDbl(m(2))) + (py * CDbl(m(5))) + (pz * CDbl(m(8)))) + CDbl(m(11))
+
+    cx = tx * INCHES_PER_METER
+    cy = ty * INCHES_PER_METER
+    cz = tz * INCHES_PER_METER
+
+    TryGetComponentMassCenterInches = True
+    Exit Function
+
+ErrHandler:
+    TryGetComponentMassCenterInches = False
 End Function
 
 ' ============================================================

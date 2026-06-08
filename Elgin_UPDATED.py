@@ -117,7 +117,7 @@ logger = logging.getLogger(APP_SLUG)
 # Force with ELGIN_NETWORK_MODE = auto | local | company
 # ============================================================
 ELGIN_COMPANY_SSID = os.environ.get("ELGIN_COMPANY_SSID", "NETGEAR")
-ELGIN_NETWORK_MODE = os.environ.get("ELGIN_NETWORK_MODE", "auto").strip().lower()
+ELGIN_NETWORK_MODE = os.environ.get("ELGIN_NETWORK_MODE", "company").strip().lower()
 ELGIN_PUBLIC_DATA_ROOT = os.environ.get(
     "ELGIN_PUBLIC_DATA_ROOT",
     r"\\Mycloudex2ultra\mexico\Cameron's stuff\Matching software",
@@ -173,11 +173,21 @@ logger.info(
     ELGIN_MATCHING_SOFTWARE_DIR, ELGIN_NETWORK_MODE, ELGIN_CMS_ON_COMPANY,
 )
 
+# Force Elgin CMS / Match Studio default storage to the shared Matching software folder.
+# Environment variables can still override if needed.
+if "ELGIN_DB_PATH" not in os.environ and "NEXUS_DB_PATH" not in os.environ:
+    DB_PATH = os.path.join(ELGIN_MATCHING_SOFTWARE_DIR, "shop_analytics_pro.db")
 
 HTTPS_CERT_FILE = os.environ.get("ELGIN_SSL_CERT", os.environ.get("NEXUS_SSL_CERT", ""))
 HTTPS_KEY_FILE = os.environ.get("ELGIN_SSL_KEY", os.environ.get("NEXUS_SSL_KEY", ""))
 
-UPLOAD_DIR = os.environ.get("ELGIN_UPLOAD_DIR", os.environ.get("NEXUS_UPLOAD_DIR", "uploads"))
+UPLOAD_DIR = os.environ.get(
+    "ELGIN_UPLOAD_DIR",
+    os.environ.get(
+        "NEXUS_UPLOAD_DIR",
+        os.path.join(ELGIN_MATCHING_SOFTWARE_DIR, "_uploads"),
+    ),
+)
 STEEL_UPLOAD_DIR = os.path.join(UPLOAD_DIR, "steel_sheets")
 os.makedirs(STEEL_UPLOAD_DIR, exist_ok=True)
 
@@ -11409,7 +11419,7 @@ function renderSignatureMatches(payload){
         <div><span style="color:var(--dim)">#${idx+1}</span> <span style="color:var(--blue);font-weight:900;font-size:1.15rem">J${esc(m.job_num||'')}</span> <span style="color:var(--dim)">components ${m.matched_components||0}/6, coverage ${coverage}%</span></div>
         <div style="font-size:1.35rem;color:${signatureScoreColor(m.score)};font-weight:900">${Number(m.score||0).toFixed(1)}%</div>
       </div>
-      <div style="overflow:auto;margin-top:10px"><table class="itable"><thead><tr><th>PART</th><th>MATCH</th><th>CURRENT DIMS / OLD DIMS</th><th>CURRENT MASS / OLD MASS</th><th>CURRENT CENTER / OLD CENTER</th><th>SIZE DIFF</th><th>MASS DIFF</th><th>CENTER DIST</th></tr></thead><tbody>${comps}</tbody></table></div>
+      <div style="overflow:auto;margin-top:10px"><table class="itable"><thead><tr><th>PART</th><th>MATCH</th><th>CURRENT DIMS / OLD DIMS</th><th>CURRENT MASS / OLD MASS</th><th>CURRENT COM / OLD COM</th><th>SIZE DIFF</th><th>MASS DIFF</th><th>COM DIST</th></tr></thead><tbody>${comps}</tbody></table></div>
       ${missing}
     </div>`;
   }).join('');
@@ -12411,7 +12421,7 @@ code{background:#0a101e;border:1px solid var(--line);padding:1px 6px;border-radi
 </div>
 
 <script>
-var STATE={jobs:[],job:null,data:null,match:null,cmpKind:'ID HOLDER',cmpMode:'overlay',imgCur:{},imgMatch:{}};
+var STATE={jobs:[],job:null,data:null,match:null,cmpKind:'ID HOLDER',cmpMode:'igs'};
 var COMPONENTS=['TCP','BCP','ID HOLDER','OD HOLDER','ID POT','OD POT'];
 var HOLDER_IGS_KINDS=['ID HOLDER','OD HOLDER'];
 function isHolderIgsKind(k){ return HOLDER_IGS_KINDS.indexOf(k)>=0; }
@@ -12421,7 +12431,6 @@ function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return
 function money(v){var n=Number(v||0);return '$'+n.toLocaleString(undefined,{minimumFractionDigits:0,maximumFractionDigits:0});}
 function money2(v){var n=Number(v||0);return '$'+n.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});}
 function scoreColor(s){var h=Math.max(0,Math.min(120,(Number(s)||0)*1.2));return 'hsl('+h+',75%,52%)';}
-function imgURL(job,kind){return '/api/match/image?job='+encodeURIComponent(job)+'&kind='+encodeURIComponent(kind)+'&i=0';}
 function modelURL(job,kind){return '/api/match/model?job='+encodeURIComponent(job)+'&kind='+encodeURIComponent(kind)+'&i=0';}
 function modelMetaURL(job,kind){return '/api/match/model-meta?job='+encodeURIComponent(job)+'&kind='+encodeURIComponent(kind)+'&i=0';}
 
@@ -12466,34 +12475,6 @@ async function initOcctImportJs(){
     }catch(e){ lastErr=e; }
   }
   throw lastErr||new Error('occt-import-js failed to load');
-}
-
-function bindOverlayJpegs(curJob, matchJob, kind){
-  var ph=document.getElementById('ovPh');
-  var base=document.querySelector('.ovwrap .ovimg:not(.ovtop)');
-  var top=document.getElementById('ovTop');
-  var pending=2, anyOk=false;
-  function done(ok){
-    if(ok) anyOk=true;
-    pending--;
-    if(pending>0) return;
-    if(ph){
-      if(anyOk){ ph.style.display='none'; }
-      else {
-        ph.textContent=isHolderIgsKind(kind)
-          ? (kind+' — re-run export for '+curJob+'\\'+curJob+'_HOLDERS_….igs (both holders in main folder) and ISO JPG.')
-          : (kind+' — holder ISO/JPG on ID/OD HOLDER tabs only.');
-        ph.style.display='block';
-      }
-    }
-  }
-  function wire(img,isTop){
-    if(!img){ done(false); return; }
-    img.onload=function(){ img.style.visibility='visible'; done(true); };
-    img.onerror=function(){ img.style.display='none'; done(false); };
-    img.src=imgURL(isTop?curJob:matchJob, kind)+'&_='+Date.now();
-  }
-  wire(base,false); wire(top,true);
 }
 
 function loadOverview(){
@@ -12592,116 +12573,141 @@ function selectMatch(mj){
 
 function renderCompare(m){
   var rows=(m.components||[]).slice().sort(function(a,b){return COMPONENTS.indexOf(a.component_role)-COMPONENTS.indexOf(b.component_role);});
-  var tbl='<table class="tbl"><thead><tr><th>Component</th><th>Similarity</th><th>Size &Delta;</th><th>Mass &Delta;</th><th>COG dist</th></tr></thead><tbody>';
+
+  var tbl='<table class="tbl"><thead><tr>' +
+    '<th>Component</th>' +
+    '<th>Similarity</th>' +
+    '<th>Size &Delta;</th>' +
+    '<th>Mass &Delta;</th>' +
+    '<th>COM dist</th>' +
+    '</tr></thead><tbody>';
+
   rows.forEach(function(c){
     var s=Number(c.similarity||0);
     tbl+='<tr><td><b>'+esc(c.component_role)+'</b></td>'
-      +'<td><div style="display:flex;align-items:center;gap:8px"><div class="simbar"><i style="width:'+s+'%;background:'+scoreColor(s)+'"></i></div><span>'+s.toFixed(1)+'%</span></div></td>'
-      +'<td>'+(c.size_diff_pct)+'%</td><td>'+(c.mass_diff_pct)+'%</td><td>'+(c.center_distance_in)+'"</td></tr>';
+      +'<td><div style="display:flex;align-items:center;gap:8px">'
+      +'<div class="simbar"><i style="width:'+s+'%;background:'+scoreColor(s)+'"></i></div>'
+      +'<span>'+s.toFixed(1)+'%</span></div></td>'
+      +'<td>'+(c.size_diff_pct)+'%</td>'
+      +'<td>'+(c.mass_diff_pct)+'%</td>'
+      +'<td>'+(c.center_distance_in)+'"</td></tr>';
   });
+
   tbl+='</tbody></table>';
 
-  var chips=COMPONENTS.map(function(k){
+  var chips=HOLDER_IGS_KINDS.map(function(k){
     return '<button class="chipbtn'+(STATE.cmpKind===k?' active':'')+'" onclick="setCmpKind(\''+k+'\')">'+k+'</button>';
   }).join('');
 
-  var html='<div class="card"><div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">'
-    +'<h2>Compare: '+esc(STATE.job)+' vs '+esc(m.job_num)+'</h2>'
-    +'<div class="toggle"><button class="chipbtn'+(STATE.cmpMode==='overlay'?' active':'')+'" onclick="setCmpMode(\'overlay\')">Overlay</button>'
-    +'<button class="chipbtn'+(STATE.cmpMode==='sbs'?' active':'')+'" onclick="setCmpMode(\'sbs\')">Side by side</button></div></div>'
-    +tbl
-    +'<div style="margin-top:16px"><div class="muted" style="font-size:12px;text-transform:uppercase;letter-spacing:.6px;margin-bottom:8px">Holder / plate overlay</div>'
-    +'<div class="cmpbar">'+chips+'</div>'
-    +'<div id="ovStage"></div></div></div>';
+  var html=
+    '<div class="card">' +
+      '<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">' +
+        '<h2>Compare Holder IGS: '+esc(STATE.job)+' vs '+esc(m.job_num)+'</h2>' +
+        '<span class="pill">IGS / IGES ONLY</span>' +
+      '</div>' +
+      tbl +
+      '<div style="margin-top:16px">' +
+        '<div class="muted" style="font-size:12px;text-transform:uppercase;letter-spacing:.6px;margin-bottom:8px">' +
+          'Holder IGS overlay — no JPEG comparison' +
+        '</div>' +
+        '<div class="cmpbar">'+chips+'</div>' +
+        '<div id="ovStage"></div>' +
+      '</div>' +
+    '</div>';
+
   document.getElementById('compareHost').innerHTML=html;
   renderOverlay(m);
 }
 
 function setCmpKind(k){STATE.cmpKind=k;var m=curMatch();if(m){renderCompare(m);}}
-function setCmpMode(md){STATE.cmpMode=md;var m=curMatch();if(m){renderOverlay(m);document.querySelectorAll('.toggle .chipbtn').forEach(function(b){b.classList.toggle('active',b.textContent.toLowerCase().indexOf(md==='sbs'?'side':'overlay')>=0);});}}
 function curMatch(){return (STATE.data.matches||[]).filter(function(x){return x.job_num===STATE.match;})[0];}
 
-function imgTag(job,kind,cls){
-  var u=imgURL(job,kind);
-  return '<img class="'+cls+'" src="'+u+'" onerror="this.style.display=\'none\';this.parentNode.querySelector(\'.ph\')&&(this.parentNode.querySelector(\'.ph\').style.display=\'block\')">';
-}
-
 function renderOverlay(m){
-  var k=STATE.cmpKind, stage=document.getElementById('ovStage');
-  if(STATE.cmpMode==='sbs'){
-    stage.innerHTML='<div class="sbs">'
-      +'<div class="imgbox"><div class="cap"><span>'+esc(STATE.job)+' (current)</span><span>'+esc(k)+'</span></div><div class="body">'+imgTag(STATE.job,k,'')+'<div class="ph" style="display:none">no '+esc(k)+' image</div></div></div>'
-      +'<div class="imgbox"><div class="cap"><span>'+esc(m.job_num)+' (match)</span><span>'+esc(k)+'</span></div><div class="body">'+imgTag(m.job_num,k,'')+'<div class="ph" style="display:none">no '+esc(k)+' image</div></div></div>'
-      +'</div>';
-  }else{
-    stage.innerHTML='<div class="ovstage">'
-      +'<div class="ovwrap">'
-        +'<img class="ovimg" alt="match">'
-        +'<img class="ovimg ovtop" id="ovTop" style="opacity:.5" alt="current">'
-        +'<div class="ph" id="ovPh" style="position:absolute">'+esc(k)+' ISO preview loading…</div>'
-      +'</div>'
-      +'<div class="slider"><span class="muted">'+esc(m.job_num)+' (match)</span>'
-        +'<input type="range" min="0" max="100" value="50" oninput="document.getElementById(\'ovTop\').style.opacity=this.value/100">'
-        +'<span class="muted">'+esc(STATE.job)+' (current)</span></div>'
-      +'<div class="legend">'+(
-        isHolderIgsKind(k)
-          ? 'Holder compare uses combined <b>J'+esc(STATE.job)+'_HOLDERS_….igs</b> (both holders together). Drag to spin, scroll to zoom.'
-          : 'ISO <b>JPG</b> fade when exported. Combined holder <b>IGS</b> is on ID/OD HOLDER tabs only.'
-      )+'</div>'
-      +(isHolderIgsKind(k)
-        ? '<div class="ms3d" id="ms3dHost"><div class="muted" style="padding:18px">Loading holder IGS…</div></div>'
-        : '')
-    +'</div>';
-    if(isHolderIgsKind(k)){
-      bindOverlayJpegs(STATE.job, m.job_num, k);
-      loadMs3dOverlay(STATE.job, m.job_num, k, 'ms3dHost');
-    } else {
-      bindOverlayJpegs(STATE.job, m.job_num, k);
-    }
+  var k=STATE.cmpKind;
+  var stage=document.getElementById('ovStage');
+
+  if(!isHolderIgsKind(k)){
+    stage.innerHTML =
+      '<div class="note">' +
+      'IGS overlay comparison is enabled only for ID HOLDER and OD HOLDER.' +
+      '</div>';
+    return;
   }
+
+  stage.innerHTML =
+    '<div class="ovstage">' +
+      '<div class="legend">' +
+        'Holder compare uses the combined <b>J'+esc(STATE.job)+'_HOLDERS_….igs</b> file. ' +
+        'Current job is blue/cyan. Matched job is orange/yellow. ' +
+        'Drag to spin, scroll to zoom. No JPEGs are used.' +
+      '</div>' +
+      '<div class="ms3d" id="ms3dHost">' +
+        '<div class="muted" style="padding:18px">Loading holder IGS overlay…</div>' +
+      '</div>' +
+    '</div>';
+
+  loadMs3dOverlay(STATE.job, m.job_num, k, 'ms3dHost');
 }
 
 async function loadMs3dOverlay(curJob, matchJob, kind, containerId){
   var host=document.getElementById(containerId);
   if(!host) return;
+
   try{
     var occt=await initOcctImportJs();
     var threeDeps=await loadThreeDeps();
     var THREE=threeDeps.THREE;
     var OrbitControls=threeDeps.OrbitControls;
+
     async function fetchModel(job){
       var metaR=await fetch(modelMetaURL(job,kind));
       if(!metaR.ok) return null;
+
       var meta=await metaR.json();
+
       var bufR=await fetch(meta.url||modelURL(job,kind));
       if(!bufR.ok) return null;
-      return { buf: await bufR.arrayBuffer(), format: (meta.format||'').toLowerCase(), label: meta.label||'' };
+
+      return {
+        buf: await bufR.arrayBuffer(),
+        format: (meta.format||'').toLowerCase(),
+        label: meta.label||''
+      };
     }
+
     var mCur=await fetchModel(curJob);
     var mMatch=await fetchModel(matchJob);
+
     if(!mCur && !mMatch){
-      host.innerHTML='<div class="muted" style="padding:18px">No <b>HOLDERS</b> IGS for <b>'+esc(kind)+'</b>. Re-run export — expect <code>'+esc(curJob)+' HOLDERS\\'+esc(curJob)+'_HOLDERS_….igs</code> (ID+OD together).</div>';
+      host.innerHTML =
+        '<div class="muted" style="padding:18px">' +
+        'No holder IGS/IGES found. Re-run the SolidWorks export and make sure it publishes ' +
+        '<code>J'+esc(curJob)+'_HOLDERS_….igs</code> and the matched job holder IGS into the Matching software folder.' +
+        '</div>';
       return;
     }
-    if(!isHolderIgsKind(kind)){
-      host.innerHTML='<div class="muted" style="padding:18px">IGS 3D compare is for <b>ID HOLDER</b> and <b>OD HOLDER</b> only.</div>';
-      return;
-    }
+
     host.innerHTML='';
-    var viewH=400;
+
+    var viewH=460;
     var renderer=new THREE.WebGLRenderer({antialias:true,alpha:true});
     renderer.setPixelRatio(window.devicePixelRatio||1);
+
+    var scene=new THREE.Scene();
+    scene.background=new THREE.Color(0x070d18);
+
+    var camera=new THREE.PerspectiveCamera(45,(host.clientWidth||860)/viewH,0.1,10000);
+    camera.position.set(120,90,120);
+
     function resizeRenderer(){
       var w=host.clientWidth||860;
       renderer.setSize(w,viewH);
       camera.aspect=w/viewH;
       camera.updateProjectionMatrix();
     }
+
     host.appendChild(renderer.domElement);
-    var scene=new THREE.Scene();
-    scene.background=new THREE.Color(0x070d18);
-    var camera=new THREE.PerspectiveCamera(45,(host.clientWidth||860)/viewH,0.1,10000);
-    camera.position.set(120,90,120);
+
     var controls=new OrbitControls(camera,renderer.domElement);
     controls.enableDamping=true;
     controls.dampingFactor=0.08;
@@ -12710,69 +12716,164 @@ async function loadMs3dOverlay(curJob, matchJob, kind, containerId){
     controls.enableZoom=true;
     controls.minDistance=1;
     controls.maxDistance=5000;
-    var light1=new THREE.DirectionalLight(0xffffff,1.15);light1.position.set(1,2,1);scene.add(light1);
-    var light2=new THREE.DirectionalLight(0xffffff,0.55);light2.position.set(-1,-1,-2);scene.add(light2);
-    scene.add(new THREE.AmbientLight(0xffffff,0.4));
+
+    var light1=new THREE.DirectionalLight(0xffffff,1.2);
+    light1.position.set(1,2,1);
+    scene.add(light1);
+
+    var light2=new THREE.DirectionalLight(0xffffff,0.55);
+    light2.position.set(-1,-1,-2);
+    scene.add(light2);
+
+    scene.add(new THREE.AmbientLight(0xffffff,0.45));
+
     function parseCad(buf, fmt){
       if(!buf) return null;
+
       var u8=new Uint8Array(buf);
       var parsed=null;
-      if(fmt==='igs'||fmt==='iges'){
-        try{ parsed=occt.ReadIgesFile(u8); }catch(e1){parsed=null;}
-      } else if(fmt==='stp'||fmt==='step'){
-        try{ parsed=occt.ReadStepFile(u8); }catch(e2){parsed=null;}
-      } else {
-        try{ parsed=occt.ReadIgesFile(u8); }catch(e3){parsed=null;}
-        if(!parsed||!parsed.meshes||!parsed.meshes.length){
-          try{ parsed=occt.ReadStepFile(u8); }catch(e4){parsed=null;}
+
+      if(fmt==='igs' || fmt==='iges'){
+        try{ parsed=occt.ReadIgesFile(u8); }catch(e1){ parsed=null; }
+      }else if(fmt==='stp' || fmt==='step'){
+        try{ parsed=occt.ReadStepFile(u8); }catch(e2){ parsed=null; }
+      }else{
+        try{ parsed=occt.ReadIgesFile(u8); }catch(e3){ parsed=null; }
+
+        if(!parsed || !parsed.meshes || !parsed.meshes.length){
+          try{ parsed=occt.ReadStepFile(u8); }catch(e4){ parsed=null; }
         }
       }
+
       return parsed;
     }
-    function addMeshes(model,color,opacity){
-      if(!model||!model.buf) return;
-      if(model.format==='easm'||model.format==='x_t'||model.format==='xt'){
-        return;
+
+    function addMeshes(model, solidColor, edgeColor, opacity, label){
+      if(!model || !model.buf) return null;
+
+      if(model.format==='easm' || model.format==='x_t' || model.format==='xt'){
+        return null;
       }
+
       var parsed=parseCad(model.buf, model.format);
-      if(!parsed || !parsed.meshes || !parsed.meshes.length) return;
+      if(!parsed || !parsed.meshes || !parsed.meshes.length) return null;
+
+      var group=new THREE.Group();
+      group.name=label||'';
+
       parsed.meshes.forEach(function(mh){
-        var pos=mh.attributes&&mh.attributes.position?mh.attributes.position.array:null;
-        if(!pos||!pos.length) return;
+        var pos=mh.attributes && mh.attributes.position ? mh.attributes.position.array : null;
+        if(!pos || !pos.length) return;
+
         var geom=new THREE.BufferGeometry();
-        geom.setAttribute('position',new THREE.Float32BufferAttribute(pos,3));
-        if(mh.attributes&&mh.attributes.normal) geom.setAttribute('normal',new THREE.Float32BufferAttribute(mh.attributes.normal.array,3));
-        if(mh.index&&mh.index.array) geom.setIndex(mh.index.array);
-        if(!mh.attributes||!mh.attributes.normal) geom.computeVertexNormals();
-        var mat=new THREE.MeshPhongMaterial({color:color,transparent:true,opacity:opacity,side:THREE.DoubleSide});
-        scene.add(new THREE.Mesh(geom,mat));
+        geom.setAttribute('position', new THREE.Float32BufferAttribute(pos,3));
+
+        if(mh.attributes && mh.attributes.normal){
+          geom.setAttribute('normal', new THREE.Float32BufferAttribute(mh.attributes.normal.array,3));
+        }
+
+        if(mh.index && mh.index.array){
+          geom.setIndex(mh.index.array);
+        }
+
+        if(!mh.attributes || !mh.attributes.normal){
+          geom.computeVertexNormals();
+        }
+
+        var mat=new THREE.MeshPhongMaterial({
+          color: solidColor,
+          transparent: true,
+          opacity: opacity,
+          side: THREE.DoubleSide,
+          depthWrite: false,
+          polygonOffset: true,
+          polygonOffsetFactor: 1,
+          polygonOffsetUnits: 1
+        });
+
+        var mesh=new THREE.Mesh(geom, mat);
+        group.add(mesh);
+
+        try{
+          var edges=new THREE.EdgesGeometry(geom,20);
+          var edgeMat=new THREE.LineBasicMaterial({
+            color: edgeColor,
+            transparent: true,
+            opacity: 0.98
+          });
+          var edgeLines=new THREE.LineSegments(edges, edgeMat);
+          group.add(edgeLines);
+        }catch(e){}
       });
+
+      scene.add(group);
+      return group;
     }
-    addMeshes(mMatch,0xff8c42,0.55);
-    addMeshes(mCur,0x3b82f6,0.72);
+
+    function centerGroupOnOrigin(group){
+      if(!group) return;
+
+      var b=new THREE.Box3().setFromObject(group);
+      if(b.isEmpty()) return;
+
+      var c=b.getCenter(new THREE.Vector3());
+      group.position.x-=c.x;
+      group.position.y-=c.y;
+      group.position.z-=c.z;
+    }
+
+    var gMatch=addMeshes(mMatch,0xff8c42,0xffd199,0.32,'MATCHED_OLD_JOB');
+    var gCur=addMeshes(mCur,0x3b82f6,0x7dd3fc,0.42,'CURRENT_JOB');
+
+    centerGroupOnOrigin(gMatch);
+    centerGroupOnOrigin(gCur);
+
     var box=new THREE.Box3().setFromObject(scene);
+
     if(box.isEmpty()){
-      var note='';
-      if((mCur&&mCur.format==='easm')||(mMatch&&mMatch.format==='easm')) note=' EASM is not readable in-browser — need per-component .igs from macro.';
-      host.innerHTML='<div class="muted" style="padding:18px">Could not mesh <b>'+esc(kind)+'</b>.'+note+' ISO JPG may still show above.</div>';
+      host.innerHTML =
+        '<div class="muted" style="padding:18px">' +
+        'Could not mesh holder IGS. Make sure the files are IGS/IGES or STEP, not EASM/JPEG/X_T.' +
+        '</div>';
       return;
     }
+
     var center=box.getCenter(new THREE.Vector3());
     var size=box.getSize(new THREE.Vector3());
     var maxDim=Math.max(size.x,size.y,size.z,1);
-    camera.position.copy(center).add(new THREE.Vector3(maxDim*1.4,maxDim,maxDim*1.4));
+
+    camera.position.copy(center).add(new THREE.Vector3(maxDim*1.45,maxDim,maxDim*1.45));
     controls.target.copy(center);
+
     resizeRenderer();
     window.addEventListener('resize',resizeRenderer);
-    var leg=document.createElement('div');leg.className='ms3d-legend';
-    leg.innerHTML='<span><i class="dot" style="background:#3b82f6"></i>'+esc(curJob)+' current</span><span><i class="dot" style="background:#ff8c42"></i>'+esc(matchJob)+' match</span>';
+
+    var leg=document.createElement('div');
+    leg.className='ms3d-legend';
+    leg.innerHTML =
+      '<span><i class="dot" style="background:#3b82f6"></i>'+esc(curJob)+' current holder IGS</span>' +
+      '<span><i class="dot" style="background:#ff8c42"></i>'+esc(matchJob)+' matched holder IGS</span>' +
+      '<span style="color:#8aa0c6">solid transparent bodies + bright wireframe edges</span>';
     host.appendChild(leg);
-    var hint=document.createElement('div');hint.className='ms3d-hint';hint.textContent='Drag to spin · scroll to zoom';
+
+    var hint=document.createElement('div');
+    hint.className='ms3d-hint';
+    hint.textContent='Drag to spin · scroll to zoom · no JPEG comparison';
     host.appendChild(hint);
-    function anim(){requestAnimationFrame(anim);controls.update();renderer.render(scene,camera);}
+
+    function anim(){
+      requestAnimationFrame(anim);
+      controls.update();
+      renderer.render(scene,camera);
+    }
+
     anim();
+
   }catch(err){
-    host.innerHTML='<div class="muted" style="padding:18px">3D IGS overlay unavailable: '+esc(err.message||err)+'. ISO JPG previews still load above when exported.</div>';
+    host.innerHTML =
+      '<div class="muted" style="padding:18px">' +
+      '3D holder IGS overlay unavailable: '+esc(err.message||err)+
+      '</div>';
   }
 }
 
