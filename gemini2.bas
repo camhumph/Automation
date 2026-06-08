@@ -103,19 +103,21 @@ Private Const BCP_BOTTOM_ORIENTATION_KEYS As String = "BCP|BOTTOM CLAMPING|BOTTO
 
 Private Const PERSIST_CMS_TOP_AS_STANDARD_VIEWS_BEFORE_BASE_SAVE As Boolean = True
 
-Private Const AUTO_SET_FRONT_FROM_HOLDER_AND_POTS As Boolean = True
+Private Const AUTO_DEFINE_FRONT_FROM_HOLDER_POT_COM As Boolean = True
 
-' In a SolidWorks top view, "front" is usually toward the bottom of the screen.
+' If the holder long dimension is not visible in the current front view,
+' the current front is looking down the holder length, so use *Right as front.
+Private Const HOLDER_LONG_SIDE_VISIBLE_RATIO As Double = 0.8
+
+' Small tolerance for pot-vs-holder front/back center comparison.
+Private Const FRONT_COM_MIN_DELTA_IN As Double = 0.03
+
+' SolidWorks normal convention is usually:
+'   *Front sees from +Z
+'   *Right sees from +X
+' So larger Z/X is closer to that face.
 ' If your result is exactly backwards, change this to False.
-Private Const POT_FRONT_IS_NEGATIVE_TOP_VIEW_Y As Boolean = True
-
-' True = in CMS_TOP, the holder long edge should be the front/back edge.
-' That means the holder looks wide left-to-right in top view.
-' If you instead mean the holder long dimension should run front-to-back,
-' set this False.
-Private Const HOLDER_LONG_SIDE_IS_FRONT_BACK_EDGE As Boolean = True
-
-Private Const HOLDER_FRONT_ORIENT_MIN_RATIO As Double = 1.02
+Private Const FRONT_CLOSER_IS_LARGER_AXIS_VALUE As Boolean = True
 
 ' ============================================================
 ' SPEED / GRAPHICS SETTINGS
@@ -2109,11 +2111,29 @@ On Error GoTo ErrHandler
         Exit Sub
     End If
 
-    If AUTO_SET_FRONT_FROM_HOLDER_AND_POTS Then
-        If AlignTopViewFrontFromHolderAndPots(model) = False Then
-            LogLine "Front/back holder/pot alignment skipped or failed."
+    ' First: save the currently matched top-side orientation as SolidWorks *Top.
+    If persistAsStandardTop Then
+
+        If PersistCurrentViewAsStandardTop(model) Then
+            LogLine "Matched top-side orientation persisted as SolidWorks *Top."
+        Else
+            LogLine "WARNING: Matched top-side orientation could not be persisted as standard top."
+        End If
+
+    End If
+
+    ' Second: define the correct SolidWorks *Front from holder long side + pot/holder COM.
+    If AUTO_DEFINE_FRONT_FROM_HOLDER_POT_COM Then
+        If DefineStandardFrontFromHolderAndPotCom(model) Then
+            LogLine "Standard *Front defined from holder long side and pot/holder center of mass."
+        Else
+            LogLine "WARNING: Could not define standard *Front from holder/pot logic."
         End If
     End If
+
+    ' Third: after front is corrected, rebuild CMS_TOP from the final SolidWorks *Top.
+    model.ShowNamedView2 "*Top", 5
+    StabilizeActiveView model, 100
 
     On Error Resume Next
     model.DeleteNamedView CMS_TOP_VIEW_NAME
@@ -2121,29 +2141,7 @@ On Error GoTo ErrHandler
     model.NameView CMS_TOP_VIEW_NAME
     On Error GoTo ErrHandler
 
-    LogLine "CMS_TOP named view saved from matched top-side orientation."
-
-    If persistAsStandardTop Then
-
-        If PersistCurrentViewAsStandardTop(model) Then
-
-            model.ShowNamedView2 "*Top", 5
-
-            On Error Resume Next
-            model.DeleteNamedView CMS_TOP_VIEW_NAME
-            Err.Clear
-            model.NameView CMS_TOP_VIEW_NAME
-            On Error GoTo ErrHandler
-
-            LogLine "Matched top-side orientation persisted as SolidWorks *Top."
-
-        Else
-
-            LogLine "WARNING: Matched top-side orientation could not be persisted as standard top."
-
-        End If
-
-    End If
+    LogLine "CMS_TOP named view saved from final corrected SolidWorks *Top."
 
     model.ShowNamedView2 CMS_TOP_VIEW_NAME, -1
     StabilizeActiveView model, 100
@@ -2205,6 +2203,524 @@ On Error GoTo ErrHandler
 ErrHandler:
     LogLine "PersistCurrentViewAsStandardTop error: " & Err.Description
     PersistCurrentViewAsStandardTop = False
+End Function
+
+Private Function DefineStandardFrontFromHolderAndPotCom(ByVal model As Object) As Boolean
+On Error GoTo ErrHandler
+
+    DefineStandardFrontFromHolderAndPotCom = False
+
+    If model Is Nothing Then Exit Function
+    If model.GetType <> swDocASSEMBLY Then Exit Function
+
+    Dim holderIndexes As Collection
+    Dim potIndexes As Collection
+
+    BuildFrontOrientIndexCollections holderIndexes, potIndexes
+
+    If holderIndexes Is Nothing Or holderIndexes.count = 0 Then
+        LogLine "Front definition skipped: no holder CAD indexes found."
+        Exit Function
+    End If
+
+    Dim holderIdx As Long
+    holderIdx = PickLargestCadIndexFromCollection(holderIndexes)
+
+    If holderIdx <= 0 Or holderIdx > PartCount Then
+        LogLine "Front definition skipped: invalid holder index."
+        Exit Function
+    End If
+
+    ' Step 1: after top is correct, start by looking at SolidWorks *Front.
+    model.ShowNamedView2 "*Front", 1
+    StabilizeActiveView model, 100
+
+    Dim candidateViewName As String
+    Dim candidateViewId As Long
+    Dim oppositeViewName As String
+    Dim oppositeViewId As Long
+    Dim depthAxis As String
+
+    candidateViewName = "*Front"
+    candidateViewId = 1
+    oppositeViewName = "*Back"
+    oppositeViewId = 2
+    depthAxis = "Z"
+
+    LogLine "Front definition: starting from SolidWorks *Front, depth axis=Z."
+
+    ' Step 2: if the holder long side is going into the screen,
+    ' use the right face as the new front candidate.
+    Dim holderLongIntoScreen As Boolean
+    Dim gotLongTest As Boolean
+
+    gotLongTest = IsHolderLongSideIntoCurrentView(model, holderIdx, holderLongIntoScreen)
+
+    If gotLongTest Then
+
+        If holderLongIntoScreen Then
+
+            LogLine "Front definition: holder long side is perpendicular/into-screen from *Front. Trying *Right as front."
+
+            model.ShowNamedView2 "*Right", 4
+            StabilizeActiveView model, 100
+
+            candidateViewName = "*Right"
+            candidateViewId = 4
+            oppositeViewName = "*Left"
+            oppositeViewId = 3
+            depthAxis = "X"
+
+        Else
+
+            LogLine "Front definition: holder long side is visible from *Front. Keeping *Front as front candidate."
+
+        End If
+
+    Else
+
+        LogLine "Front definition: could not test holder long-side visibility. Keeping *Front as front candidate."
+
+    End If
+
+    ' Step 3: compare pot COM vs holder COM.
+    ' If pots are farther away from the candidate front than holders,
+    ' flip to the opposite face.
+    Dim holderDepth As Double
+    Dim potDepth As Double
+    Dim gotHolderDepth As Boolean
+    Dim gotPotDepth As Boolean
+
+    gotHolderDepth = TryAverageAxisValueForCadIndexes(holderIndexes, depthAxis, True, holderDepth)
+    gotPotDepth = TryAverageAxisValueForCadIndexes(potIndexes, depthAxis, True, potDepth)
+
+    If gotHolderDepth And gotPotDepth Then
+
+        Dim potsFartherFromFront As Boolean
+
+        If FRONT_CLOSER_IS_LARGER_AXIS_VALUE Then
+            potsFartherFromFront = (potDepth < holderDepth - FRONT_COM_MIN_DELTA_IN)
+        Else
+            potsFartherFromFront = (potDepth > holderDepth + FRONT_COM_MIN_DELTA_IN)
+        End If
+
+        LogLine "Front definition COM math:"
+        LogLine "  candidate=" & candidateViewName
+        LogLine "  depth axis=" & depthAxis
+        LogLine "  holder COM avg=" & FormatNumberForCsv(holderDepth)
+        LogLine "  pot COM avg=" & FormatNumberForCsv(potDepth)
+        LogLine "  pots farther from front=" & CStr(potsFartherFromFront)
+
+        If potsFartherFromFront Then
+
+            LogLine "Front definition: pots are farther from front than holders. Switching to opposite face: " & oppositeViewName
+
+            model.ShowNamedView2 oppositeViewName, oppositeViewId
+            StabilizeActiveView model, 100
+
+            candidateViewName = oppositeViewName
+            candidateViewId = oppositeViewId
+
+        End If
+
+    Else
+
+        LogLine "Front definition: pot/holder COM comparison skipped. gotHolderDepth=" & _
+                CStr(gotHolderDepth) & " gotPotDepth=" & CStr(gotPotDepth)
+
+    End If
+
+    ' Step 4: whatever view is active now becomes SolidWorks *Front.
+    If PersistCurrentViewAsStandardFront(model) Then
+
+        model.ShowNamedView2 "*Front", 1
+        StabilizeActiveView model, 100
+
+        LogLine "Front definition complete. Current orientation persisted as SolidWorks *Front."
+        DefineStandardFrontFromHolderAndPotCom = True
+
+    Else
+
+        LogLine "Front definition failed: could not persist current view as SolidWorks *Front."
+        DefineStandardFrontFromHolderAndPotCom = False
+
+    End If
+
+    Exit Function
+
+ErrHandler:
+    LogLine "DefineStandardFrontFromHolderAndPotCom error: " & Err.Description
+    DefineStandardFrontFromHolderAndPotCom = False
+End Function
+
+Private Function PersistCurrentViewAsStandardFront(ByVal model As Object) As Boolean
+On Error GoTo ErrHandler
+
+    PersistCurrentViewAsStandardFront = False
+
+    If model Is Nothing Then Exit Function
+
+    Dim errs As Long
+    swApp.ActivateDoc3 model.GetTitle, False, 0, errs
+    EnsureSwHidden
+
+    Dim ok As Boolean
+    ok = False
+
+    On Error Resume Next
+
+    Err.Clear
+    ok = CBool(model.Extension.UpdateStandardViews("*Front", 1))
+    If Err.Number <> 0 Then
+        Err.Clear
+        ok = False
+    End If
+
+    If ok = False Then
+        Err.Clear
+        ok = CBool(model.UpdateStandardViews("*Front", 1))
+        If Err.Number <> 0 Then
+            Err.Clear
+            ok = False
+        End If
+    End If
+
+    On Error GoTo ErrHandler
+
+    If ok Then
+        PersistCurrentViewAsStandardFront = True
+        LogLine "Standard views REDEFINED: current orientation assigned to *Front, ViewId 1."
+    Else
+        LogLine "WARNING: UpdateStandardViews(*Front,1) did not succeed."
+    End If
+
+    On Error Resume Next
+    model.ForceRebuild3 False
+    model.ViewZoomtofit2
+    On Error GoTo ErrHandler
+
+    Exit Function
+
+ErrHandler:
+    LogLine "PersistCurrentViewAsStandardFront error: " & Err.Description
+    PersistCurrentViewAsStandardFront = False
+End Function
+
+Private Sub BuildFrontOrientIndexCollections(ByRef holderIndexes As Collection, _
+                                             ByRef potIndexes As Collection)
+On Error GoTo ErrHandler
+
+    Set holderIndexes = New Collection
+    Set potIndexes = New Collection
+
+    AddUniqueCadIndexToCollection holderIndexes, _
+        FindCadIndexForOrientationQuoteOrKeys("ID HOLDER", ID_HOLDER_KEYS)
+
+    AddUniqueCadIndexToCollection holderIndexes, _
+        FindCadIndexForOrientationQuoteOrKeys("OD HOLDER", OD_HOLDER_KEYS)
+
+    AddUniqueCadIndexToCollection potIndexes, _
+        FindCadIndexForOrientationQuoteOrKeys("ID POT BLOCK", _
+            "ID POT BLOCK|ID POT|TOP POT BLOCK|TOP POT|TCP POT BLOCK|TCP POT")
+
+    AddUniqueCadIndexToCollection potIndexes, _
+        FindCadIndexForOrientationQuoteOrKeys("OD POT BLOCK", _
+            "OD POT BLOCK|OD POT|BOTTOM POT BLOCK|BOT POT BLOCK|BOTTOM POT|BOT POT|BCP POT BLOCK|BCP POT")
+
+    Exit Sub
+
+ErrHandler:
+    LogLine "BuildFrontOrientIndexCollections error: " & Err.Description
+    Set holderIndexes = New Collection
+    Set potIndexes = New Collection
+End Sub
+
+Private Function PickLargestCadIndexFromCollection(ByVal col As Collection) As Long
+On Error GoTo ErrHandler
+
+    PickLargestCadIndexFromCollection = 0
+
+    If col Is Nothing Then Exit Function
+    If col.count = 0 Then Exit Function
+
+    Dim i As Long
+    Dim cadIdx As Long
+    Dim bestIdx As Long
+    Dim bestVol As Double
+
+    bestIdx = 0
+    bestVol = -1#
+
+    For i = 1 To col.count
+
+        cadIdx = CLng(col(i))
+
+        If cadIdx > 0 And cadIdx <= PartCount Then
+            If parts(cadIdx).BBoxVolume > bestVol Then
+                bestVol = parts(cadIdx).BBoxVolume
+                bestIdx = cadIdx
+            End If
+        End If
+
+    Next i
+
+    PickLargestCadIndexFromCollection = bestIdx
+    Exit Function
+
+ErrHandler:
+    PickLargestCadIndexFromCollection = 0
+End Function
+
+Private Function IsHolderLongSideIntoCurrentView(ByVal model As Object, _
+                                                 ByVal holderIdx As Long, _
+                                                 ByRef longIntoScreen As Boolean) As Boolean
+On Error GoTo ErrHandler
+
+    IsHolderLongSideIntoCurrentView = False
+    longIntoScreen = False
+
+    If model Is Nothing Then Exit Function
+    If holderIdx <= 0 Or holderIdx > PartCount Then Exit Function
+
+    Dim swComp As Object
+    Set swComp = FindAssemblyComponentByName(model, parts(holderIdx).componentName)
+
+    If swComp Is Nothing Then
+        LogLine "Holder long-side test failed: component not found: " & parts(holderIdx).componentName
+        Exit Function
+    End If
+
+    Dim viewW As Double
+    Dim viewH As Double
+
+    If TryGetComponentViewWidthHeightInches(model, swComp, viewW, viewH) = False Then
+        LogLine "Holder long-side test failed: could not get projected holder size."
+        Exit Function
+    End If
+
+    Dim projectedLong As Double
+    projectedLong = viewW
+    If viewH > projectedLong Then projectedLong = viewH
+
+    Dim actualLong As Double
+    actualLong = parts(holderIdx).Length
+
+    If actualLong <= 0# Then Exit Function
+
+    longIntoScreen = (projectedLong < actualLong * HOLDER_LONG_SIDE_VISIBLE_RATIO)
+
+    LogLine "Holder long-side test:"
+    LogLine "  holder=" & parts(holderIdx).componentName
+    LogLine "  actual long=" & FormatNumberForCsv(actualLong)
+    LogLine "  projected W/H=" & FormatNumberForCsv(viewW) & "/" & FormatNumberForCsv(viewH)
+    LogLine "  projected long=" & FormatNumberForCsv(projectedLong)
+    LogLine "  long side into screen=" & CStr(longIntoScreen)
+
+    IsHolderLongSideIntoCurrentView = True
+    Exit Function
+
+ErrHandler:
+    LogLine "IsHolderLongSideIntoCurrentView error: " & Err.Description
+    IsHolderLongSideIntoCurrentView = False
+End Function
+
+Private Function TryAverageAxisValueForCadIndexes(ByVal cadIndexes As Collection, _
+                                                  ByVal axisName As String, _
+                                                  ByVal preferMassCenter As Boolean, _
+                                                  ByRef avgVal As Double) As Boolean
+On Error GoTo ErrHandler
+
+    TryAverageAxisValueForCadIndexes = False
+    avgVal = 0#
+
+    If cadIndexes Is Nothing Then Exit Function
+    If cadIndexes.count = 0 Then Exit Function
+
+    Dim total As Double
+    Dim countVal As Long
+
+    total = 0#
+    countVal = 0
+
+    Dim i As Long
+    Dim cadIdx As Long
+
+    For i = 1 To cadIndexes.count
+
+        cadIdx = CLng(cadIndexes(i))
+
+        Dim px As Double
+        Dim py As Double
+        Dim pz As Double
+
+        If TryGetCadCenterPointInches(cadIdx, preferMassCenter, px, py, pz) Then
+
+            Select Case UCase(Trim(axisName))
+
+                Case "X"
+                    total = total + px
+                    countVal = countVal + 1
+
+                Case "Y"
+                    total = total + py
+                    countVal = countVal + 1
+
+                Case "Z"
+                    total = total + pz
+                    countVal = countVal + 1
+
+            End Select
+
+        End If
+
+    Next i
+
+    If countVal > 0 Then
+        avgVal = total / CDbl(countVal)
+        TryAverageAxisValueForCadIndexes = True
+    End If
+
+    Exit Function
+
+ErrHandler:
+    TryAverageAxisValueForCadIndexes = False
+End Function
+
+Private Function TryGetCadCenterPointInches(ByVal cadIdx As Long, _
+                                            ByVal preferMassCenter As Boolean, _
+                                            ByRef px As Double, _
+                                            ByRef py As Double, _
+                                            ByRef pz As Double) As Boolean
+On Error GoTo ErrHandler
+
+    TryGetCadCenterPointInches = False
+
+    px = 0#
+    py = 0#
+    pz = 0#
+
+    If cadIdx <= 0 Or cadIdx > PartCount Then Exit Function
+
+    If preferMassCenter Then
+        If parts(cadIdx).hasMassCenter Then
+            px = parts(cadIdx).MassCenterX
+            py = parts(cadIdx).MassCenterY
+            pz = parts(cadIdx).MassCenterZ
+            TryGetCadCenterPointInches = True
+            Exit Function
+        End If
+    End If
+
+    If parts(cadIdx).hasAsmCenter Then
+        px = parts(cadIdx).AsmCenterX
+        py = parts(cadIdx).AsmCenterY
+        pz = parts(cadIdx).AsmCenterZ
+        TryGetCadCenterPointInches = True
+        Exit Function
+    End If
+
+    Exit Function
+
+ErrHandler:
+    TryGetCadCenterPointInches = False
+End Function
+
+Private Function TryGetComponentViewWidthHeightInches(ByVal model As Object, _
+                                                      ByVal swComp As Object, _
+                                                      ByRef viewWIn As Double, _
+                                                      ByRef viewHIn As Double) As Boolean
+On Error GoTo ErrHandler
+
+    TryGetComponentViewWidthHeightInches = False
+
+    viewWIn = 0#
+    viewHIn = 0#
+
+    If model Is Nothing Then Exit Function
+    If swComp Is Nothing Then Exit Function
+
+    Dim vBox As Variant
+
+    On Error Resume Next
+    vBox = swComp.GetBox(False, False)
+    On Error GoTo ErrHandler
+
+    If IsEmpty(vBox) Then Exit Function
+    If IsArray(vBox) = False Then Exit Function
+    If UBound(vBox) < 5 Then Exit Function
+
+    Dim swView As Object
+    Set swView = model.ActiveView
+
+    If swView Is Nothing Then Exit Function
+
+    Dim mView As Variant
+    mView = swView.Orientation3.ArrayData
+
+    If IsEmpty(mView) Then Exit Function
+    If IsArray(mView) = False Then Exit Function
+    If UBound(mView) < 8 Then Exit Function
+
+    Dim xs(0 To 7) As Double
+    Dim ys(0 To 7) As Double
+    Dim zs(0 To 7) As Double
+
+    xs(0) = CDbl(vBox(0)): ys(0) = CDbl(vBox(1)): zs(0) = CDbl(vBox(2))
+    xs(1) = CDbl(vBox(3)): ys(1) = CDbl(vBox(1)): zs(1) = CDbl(vBox(2))
+    xs(2) = CDbl(vBox(0)): ys(2) = CDbl(vBox(4)): zs(2) = CDbl(vBox(2))
+    xs(3) = CDbl(vBox(3)): ys(3) = CDbl(vBox(4)): zs(3) = CDbl(vBox(2))
+
+    xs(4) = CDbl(vBox(0)): ys(4) = CDbl(vBox(1)): zs(4) = CDbl(vBox(5))
+    xs(5) = CDbl(vBox(3)): ys(5) = CDbl(vBox(1)): zs(5) = CDbl(vBox(5))
+    xs(6) = CDbl(vBox(0)): ys(6) = CDbl(vBox(4)): zs(6) = CDbl(vBox(5))
+    xs(7) = CDbl(vBox(3)): ys(7) = CDbl(vBox(4)): zs(7) = CDbl(vBox(5))
+
+    Dim firstPoint As Boolean
+    firstPoint = True
+
+    Dim minX As Double
+    Dim maxX As Double
+    Dim minY As Double
+    Dim maxY As Double
+
+    Dim i As Long
+
+    For i = 0 To 7
+
+        Dim vx As Double
+        Dim vy As Double
+
+        vx = (xs(i) * CDbl(mView(0))) + _
+             (ys(i) * CDbl(mView(3))) + _
+             (zs(i) * CDbl(mView(6)))
+
+        vy = (xs(i) * CDbl(mView(1))) + _
+             (ys(i) * CDbl(mView(4))) + _
+             (zs(i) * CDbl(mView(7)))
+
+        If firstPoint Then
+            minX = vx
+            maxX = vx
+            minY = vy
+            maxY = vy
+            firstPoint = False
+        Else
+            If vx < minX Then minX = vx
+            If vx > maxX Then maxX = vx
+            If vy < minY Then minY = vy
+            If vy > maxY Then maxY = vy
+        End If
+
+    Next i
+
+    viewWIn = Abs(maxX - minX) * INCHES_PER_METER
+    viewHIn = Abs(maxY - minY) * INCHES_PER_METER
+
+    TryGetComponentViewWidthHeightInches = (viewWIn > 0# And viewHIn > 0#)
+    Exit Function
+
+ErrHandler:
+    TryGetComponentViewWidthHeightInches = False
 End Function
 
 Private Sub ApplyCmsTopView(ByVal model As Object)
@@ -2298,184 +2814,6 @@ ErrHandler:
     TryGetComponentViewY = False
 End Function
 
-Private Function AlignTopViewFrontFromHolderAndPots(ByVal model As Object) As Boolean
-On Error GoTo ErrHandler
-
-    AlignTopViewFrontFromHolderAndPots = False
-
-    If model Is Nothing Then Exit Function
-    If model.GetType <> swDocASSEMBLY Then Exit Function
-
-    Dim holderIndexes As Collection
-    Dim potIndexes As Collection
-
-    Set holderIndexes = New Collection
-    Set potIndexes = New Collection
-
-    AddUniqueCadIndexToCollection holderIndexes, _
-        FindCadIndexForOrientationQuoteOrKeys("ID HOLDER", ID_HOLDER_KEYS)
-
-    AddUniqueCadIndexToCollection holderIndexes, _
-        FindCadIndexForOrientationQuoteOrKeys("OD HOLDER", OD_HOLDER_KEYS)
-
-    AddUniqueCadIndexToCollection potIndexes, _
-        FindCadIndexForOrientationQuoteOrKeys("ID POT BLOCK", _
-            "ID POT BLOCK|ID POT|TOP POT BLOCK|TOP POT|TCP POT BLOCK|TCP POT")
-
-    AddUniqueCadIndexToCollection potIndexes, _
-        FindCadIndexForOrientationQuoteOrKeys("OD POT BLOCK", _
-            "OD POT BLOCK|OD POT|BOTTOM POT BLOCK|BOT POT BLOCK|BOTTOM POT|BOT POT|BCP POT BLOCK|BCP POT")
-
-    If holderIndexes.count = 0 Then
-        LogLine "Front/back alignment skipped: no matched holder CAD index."
-        Exit Function
-    End If
-
-    If potIndexes.count = 0 Then
-        LogLine "Front/back alignment: no pot CAD index found; using holder long-side only."
-    End If
-
-    Dim holderIdxForExtents As Long
-    holderIdxForExtents = CLng(holderIndexes(1))
-
-    If holderIdxForExtents <= 0 Or holderIdxForExtents > PartCount Then Exit Function
-
-    Dim holderComp As Object
-    Set holderComp = FindAssemblyComponentByName(model, parts(holderIdxForExtents).componentName)
-
-    If holderComp Is Nothing Then
-        LogLine "Front/back alignment skipped: holder component not found in assembly: " & _
-                parts(holderIdxForExtents).componentName
-        Exit Function
-    End If
-
-    Dim bestStep As Long
-    Dim bestScore As Double
-
-    bestStep = 0
-    bestScore = -1E+99
-
-    Dim stepNo As Long
-
-    ' Test 0, 90, 180, 270 degrees.
-    ' After four ViewRotateplusz calls the view is back where it started.
-    For stepNo = 0 To 3
-
-        Dim viewW As Double
-        Dim viewH As Double
-        Dim gotExt As Boolean
-
-        gotExt = TryGetComponentViewWidthHeight(model, holderComp, viewW, viewH)
-
-        If gotExt Then
-
-            Dim score As Double
-            score = 0#
-
-            Dim longSideOk As Boolean
-
-            If HOLDER_LONG_SIDE_IS_FRONT_BACK_EDGE Then
-                ' Holder long edge is front/back edge.
-                ' In top view, that means long side should run left/right.
-                longSideOk = (viewW >= viewH * HOLDER_FRONT_ORIENT_MIN_RATIO)
-            Else
-                ' Alternate interpretation:
-                ' holder long dimension runs front/back.
-                longSideOk = (viewH >= viewW * HOLDER_FRONT_ORIENT_MIN_RATIO)
-            End If
-
-            If longSideOk Then
-                score = score + 100000#
-            End If
-
-            If viewW > 0# And viewH > 0# Then
-                If HOLDER_LONG_SIDE_IS_FRONT_BACK_EDGE Then
-                    score = score + (viewW / viewH) * 100#
-                Else
-                    score = score + (viewH / viewW) * 100#
-                End If
-            End If
-
-            Dim holderAvgY As Double
-            Dim potAvgY As Double
-            Dim gotHolderY As Boolean
-            Dim gotPotY As Boolean
-
-            gotHolderY = TryGetAverageCadViewY(model, holderIndexes, True, holderAvgY)
-            gotPotY = TryGetAverageCadViewY(model, potIndexes, True, potAvgY)
-
-            If gotHolderY And gotPotY Then
-
-                Dim deltaY As Double
-                deltaY = potAvgY - holderAvgY
-
-                Dim potIsFront As Boolean
-
-                If POT_FRONT_IS_NEGATIVE_TOP_VIEW_Y Then
-                    potIsFront = (deltaY < 0#)
-                Else
-                    potIsFront = (deltaY > 0#)
-                End If
-
-                If potIsFront Then
-                    score = score + 10000# + Abs(deltaY) * 10#
-                Else
-                    score = score - 10000#
-                End If
-
-                LogLine "Front/back candidate +" & CStr(stepNo) & _
-                        " Z-steps: holder view W/H=" & _
-                        FormatNumberForCsv(viewW) & "/" & FormatNumberForCsv(viewH) & _
-                        " pot-holder viewY delta=" & FormatNumberForCsv(deltaY) & _
-                        " longSideOk=" & CStr(longSideOk) & _
-                        " potIsFront=" & CStr(potIsFront) & _
-                        " score=" & FormatNumberForCsv(score)
-
-            Else
-
-                LogLine "Front/back candidate +" & CStr(stepNo) & _
-                        " Z-steps: holder view W/H=" & _
-                        FormatNumberForCsv(viewW) & "/" & FormatNumberForCsv(viewH) & _
-                        " longSideOk=" & CStr(longSideOk) & _
-                        " score=" & FormatNumberForCsv(score) & _
-                        "  no pot/holder center comparison"
-
-            End If
-
-            If score > bestScore Then
-                bestScore = score
-                bestStep = stepNo
-            End If
-
-        End If
-
-        model.ViewRotateplusz
-        DoEvents
-
-    Next stepNo
-
-    ' We rotated four times, so we should be back to the starting top view.
-    ' Now apply the selected rotation.
-    Dim i As Long
-
-    For i = 1 To bestStep
-        model.ViewRotateplusz
-        DoEvents
-    Next i
-
-    LogLine "Front/back holder/pot alignment selected +" & CStr(bestStep) & _
-            " Z-step(s). Best score=" & FormatNumberForCsv(bestScore)
-
-    StabilizeActiveView model, 50
-
-    AlignTopViewFrontFromHolderAndPots = True
-    Exit Function
-
-ErrHandler:
-    LogLine "AlignTopViewFrontFromHolderAndPots error: " & Err.Description
-    AlignTopViewFrontFromHolderAndPots = False
-End Function
-
 Private Function FindCadIndexForOrientationQuoteOrKeys(ByVal quoteName As String, _
                                                        ByVal fallbackKeys As String) As Long
 On Error GoTo ErrHandler
@@ -2515,230 +2853,6 @@ On Error Resume Next
 
     col.Add cadIdx
 End Sub
-
-Private Function TryGetAverageCadViewY(ByVal model As Object, _
-                                       ByVal cadIndexes As Collection, _
-                                       ByVal preferMassCenter As Boolean, _
-                                       ByRef avgViewY As Double) As Boolean
-On Error GoTo ErrHandler
-
-    TryGetAverageCadViewY = False
-    avgViewY = 0#
-
-    If model Is Nothing Then Exit Function
-    If cadIndexes Is Nothing Then Exit Function
-    If cadIndexes.count = 0 Then Exit Function
-
-    Dim totalY As Double
-    Dim countY As Long
-
-    totalY = 0#
-    countY = 0
-
-    Dim i As Long
-    Dim cadIdx As Long
-
-    For i = 1 To cadIndexes.count
-
-        cadIdx = CLng(cadIndexes(i))
-
-        Dim px As Double
-        Dim py As Double
-        Dim pz As Double
-
-        If TryGetCadPointInches(cadIdx, preferMassCenter, px, py, pz) Then
-
-            Dim vx As Double
-            Dim vy As Double
-
-            If TryProjectPointToActiveViewXY(model, px, py, pz, vx, vy) Then
-                totalY = totalY + vy
-                countY = countY + 1
-            End If
-
-        End If
-
-    Next i
-
-    If countY > 0 Then
-        avgViewY = totalY / CDbl(countY)
-        TryGetAverageCadViewY = True
-    End If
-
-    Exit Function
-
-ErrHandler:
-    TryGetAverageCadViewY = False
-End Function
-
-Private Function TryGetCadPointInches(ByVal cadIdx As Long, _
-                                      ByVal preferMassCenter As Boolean, _
-                                      ByRef px As Double, _
-                                      ByRef py As Double, _
-                                      ByRef pz As Double) As Boolean
-On Error GoTo ErrHandler
-
-    TryGetCadPointInches = False
-
-    px = 0#
-    py = 0#
-    pz = 0#
-
-    If cadIdx <= 0 Or cadIdx > PartCount Then Exit Function
-
-    If preferMassCenter Then
-        If parts(cadIdx).hasMassCenter Then
-            px = parts(cadIdx).MassCenterX
-            py = parts(cadIdx).MassCenterY
-            pz = parts(cadIdx).MassCenterZ
-            TryGetCadPointInches = True
-            Exit Function
-        End If
-    End If
-
-    If parts(cadIdx).hasAsmCenter Then
-        px = parts(cadIdx).AsmCenterX
-        py = parts(cadIdx).AsmCenterY
-        pz = parts(cadIdx).AsmCenterZ
-        TryGetCadPointInches = True
-        Exit Function
-    End If
-
-    Exit Function
-
-ErrHandler:
-    TryGetCadPointInches = False
-End Function
-
-Private Function TryProjectPointToActiveViewXY(ByVal model As Object, _
-                                               ByVal px As Double, _
-                                               ByVal py As Double, _
-                                               ByVal pz As Double, _
-                                               ByRef viewX As Double, _
-                                               ByRef viewY As Double) As Boolean
-On Error GoTo ErrHandler
-
-    TryProjectPointToActiveViewXY = False
-
-    viewX = 0#
-    viewY = 0#
-
-    If model Is Nothing Then Exit Function
-
-    Dim swView As Object
-    Set swView = model.ActiveView
-
-    If swView Is Nothing Then Exit Function
-
-    Dim mView As Variant
-    mView = swView.Orientation3.ArrayData
-
-    If IsEmpty(mView) Then Exit Function
-    If IsArray(mView) = False Then Exit Function
-    If UBound(mView) < 8 Then Exit Function
-
-    viewX = (px * CDbl(mView(0))) + (py * CDbl(mView(3))) + (pz * CDbl(mView(6)))
-    viewY = (px * CDbl(mView(1))) + (py * CDbl(mView(4))) + (pz * CDbl(mView(7)))
-
-    TryProjectPointToActiveViewXY = True
-    Exit Function
-
-ErrHandler:
-    TryProjectPointToActiveViewXY = False
-End Function
-
-Private Function TryGetComponentViewWidthHeight(ByVal model As Object, _
-                                                ByVal swComp As Object, _
-                                                ByRef viewW As Double, _
-                                                ByRef viewH As Double) As Boolean
-On Error GoTo ErrHandler
-
-    TryGetComponentViewWidthHeight = False
-
-    viewW = 0#
-    viewH = 0#
-
-    If model Is Nothing Then Exit Function
-    If swComp Is Nothing Then Exit Function
-
-    Dim vBox As Variant
-
-    On Error Resume Next
-    vBox = swComp.GetBox(False, False)
-    On Error GoTo ErrHandler
-
-    If IsEmpty(vBox) Then Exit Function
-    If IsArray(vBox) = False Then Exit Function
-    If UBound(vBox) < 5 Then Exit Function
-
-    Dim swView As Object
-    Set swView = model.ActiveView
-
-    If swView Is Nothing Then Exit Function
-
-    Dim mView As Variant
-    mView = swView.Orientation3.ArrayData
-
-    If IsEmpty(mView) Then Exit Function
-    If IsArray(mView) = False Then Exit Function
-    If UBound(mView) < 8 Then Exit Function
-
-    Dim xs(0 To 7) As Double
-    Dim ys(0 To 7) As Double
-    Dim zs(0 To 7) As Double
-
-    xs(0) = CDbl(vBox(0)): ys(0) = CDbl(vBox(1)): zs(0) = CDbl(vBox(2))
-    xs(1) = CDbl(vBox(3)): ys(1) = CDbl(vBox(1)): zs(1) = CDbl(vBox(2))
-    xs(2) = CDbl(vBox(0)): ys(2) = CDbl(vBox(4)): zs(2) = CDbl(vBox(2))
-    xs(3) = CDbl(vBox(3)): ys(3) = CDbl(vBox(4)): zs(3) = CDbl(vBox(2))
-
-    xs(4) = CDbl(vBox(0)): ys(4) = CDbl(vBox(1)): zs(4) = CDbl(vBox(5))
-    xs(5) = CDbl(vBox(3)): ys(5) = CDbl(vBox(1)): zs(5) = CDbl(vBox(5))
-    xs(6) = CDbl(vBox(0)): ys(6) = CDbl(vBox(4)): zs(6) = CDbl(vBox(5))
-    xs(7) = CDbl(vBox(3)): ys(7) = CDbl(vBox(4)): zs(7) = CDbl(vBox(5))
-
-    Dim firstPoint As Boolean
-    firstPoint = True
-
-    Dim minX As Double
-    Dim maxX As Double
-    Dim minY As Double
-    Dim maxY As Double
-
-    Dim i As Long
-
-    For i = 0 To 7
-
-        Dim vx As Double
-        Dim vy As Double
-
-        vx = (xs(i) * CDbl(mView(0))) + (ys(i) * CDbl(mView(3))) + (zs(i) * CDbl(mView(6)))
-        vy = (xs(i) * CDbl(mView(1))) + (ys(i) * CDbl(mView(4))) + (zs(i) * CDbl(mView(7)))
-
-        If firstPoint Then
-            minX = vx
-            maxX = vx
-            minY = vy
-            maxY = vy
-            firstPoint = False
-        Else
-            If vx < minX Then minX = vx
-            If vx > maxX Then maxX = vx
-            If vy < minY Then minY = vy
-            If vy > maxY Then maxY = vy
-        End If
-
-    Next i
-
-    viewW = Abs(maxX - minX)
-    viewH = Abs(maxY - minY)
-
-    TryGetComponentViewWidthHeight = (viewW > 0# And viewH > 0#)
-    Exit Function
-
-ErrHandler:
-    TryGetComponentViewWidthHeight = False
-End Function
 
 Private Function FindComponentByKeys(ByVal assyModel As Object, ByVal pipeKeys As String) As Object
 On Error GoTo ErrHandler
