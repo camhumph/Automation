@@ -7593,6 +7593,9 @@ On Error GoTo ErrHandler
     If camN > 0 Then AssignPullcoreClass camRows, camN, True
     If keyN > 0 Then AssignPullcoreClass keyRows, keyN, False
 
+    ' Make absolutely sure a CAD pullcore component is not reused twice.
+    BlockDuplicatePullcoreCadMatches
+
     If AUTO_LABEL_PULLCORE_ID_OD_BY_HEIGHT Then
         If LabelPullcoreCamsAndKeysByHeight() = False Then
             LabelPullcoreKeysByProximity
@@ -7601,15 +7604,15 @@ On Error GoTo ErrHandler
         LabelPullcoreKeysByProximity
     End If
 
-    ' Keys nest inside cams and are frequently the same size as one another,
-    ' so size matching cannot place them. Name each key from the cam it sits
-    ' inside (closest assembly center). Cams are distinct and already named.
+    ' Final authority for generic qty-2 pullcore rows:
+    ' highest Y = ID, lowest Y = OD.
+    FinalizePullcoreCamIdOdNames
+
+    ' For keys, keep them tied to the nearest/nested cam side.
     RelabelPullcoreKeysByNestedCam
 
-    ' Preserve descriptive BOM names and make sure no two matches end up with
-    ' an identical quote name (which would collide on export).
+    ' Must run last so final names are unique.
     DisambiguatePullcoreQuoteNames
-    FinalizePullcoreCamIdOdNames
 
     On Error Resume Next
     If Not swModel Is Nothing Then
@@ -8200,110 +8203,255 @@ Private Function PullcoreLocationNameIsDescriptive(ByVal desc As String) As Bool
     End If
 End Function
 
-' After matching, force ID/OD PULLCORE CAM (and KEY pairs) from assembly Y center.
+Private Sub BlockDuplicatePullcoreCadMatches()
+On Error GoTo ErrHandler
+
+    If PullcoreMatchCount <= 1 Then Exit Sub
+
+    Dim used As Object
+    Set used = CreateObject("Scripting.Dictionary")
+
+    Dim i As Long
+    Dim cadIdx As Long
+    Dim k As String
+    Dim firstMatch As Long
+
+    For i = 1 To PullcoreMatchCount
+
+        cadIdx = PullcoreMatches(i).CadPartIndex
+
+        If cadIdx > 0 Then
+
+            k = CStr(cadIdx)
+
+            If used.Exists(k) Then
+
+                firstMatch = CLng(used(k))
+
+                LogLine "PULLCORE duplicate CAD blocked. '" & _
+                        PullcoreMatches(i).quoteName & "' tried to reuse CAD '" & _
+                        parts(cadIdx).componentName & "', already used by '" & _
+                        PullcoreMatches(firstMatch).quoteName & "'."
+
+                PullcoreMatches(i).CadPartIndex = 0
+                PullcoreMatches(i).Status = "NO CAD MATCH - duplicate CAD already used by " & _
+                                            PullcoreMatches(firstMatch).quoteName
+
+            Else
+
+                used(k) = i
+
+            End If
+
+        End If
+
+    Next i
+
+    Exit Sub
+
+ErrHandler:
+    LogLine "BlockDuplicatePullcoreCadMatches error: " & Err.Description
+End Sub
+
+Private Sub SortPullcoreMatchArrayByY(ByRef matchArr() As Long, ByVal matchN As Long)
+On Error GoTo ErrHandler
+
+    If matchN <= 1 Then Exit Sub
+
+    Dim i As Long
+    Dim j As Long
+    Dim tmp As Long
+
+    Dim yi As Double
+    Dim yj As Double
+
+    For i = 1 To matchN - 1
+
+        For j = i + 1 To matchN
+
+            yi = GetPullcoreMatchHeightValue(matchArr(i), "Y")
+            yj = GetPullcoreMatchHeightValue(matchArr(j), "Y")
+
+            ' Higher Y should come first because higher Y = ID.
+            If yi < yj Then
+                tmp = matchArr(i)
+                matchArr(i) = matchArr(j)
+                matchArr(j) = tmp
+            End If
+
+        Next j
+
+    Next i
+
+    Exit Sub
+
+ErrHandler:
+    LogLine "SortPullcoreMatchArrayByY error: " & Err.Description
+End Sub
+
 Private Sub FinalizePullcoreCamIdOdNames()
 On Error GoTo ErrHandler
 
     If PullcoreMatchCount <= 0 Then Exit Sub
 
-    Dim camIdx() As Long
+    PullcoreIdOdHeightAxisUsed = "Y"
+
+    Dim camMatches() As Long
+    Dim keyMatches() As Long
     Dim camN As Long
+    Dim keyN As Long
+
     camN = 0
-    ReDim camIdx(1 To PullcoreMatchCount)
+    keyN = 0
+
+    ReDim camMatches(1 To PullcoreMatchCount)
+    ReDim keyMatches(1 To PullcoreMatchCount)
+
+    Dim usedCamCad As Object
+    Dim usedKeyCad As Object
+
+    Set usedCamCad = CreateObject("Scripting.Dictionary")
+    Set usedKeyCad = CreateObject("Scripting.Dictionary")
 
     Dim i As Long
-    Dim ci As Long
+    Dim cadIdx As Long
+    Dim cadKey As String
+
     For i = 1 To PullcoreMatchCount
-        If PullcoreMatches(i).isCam And PullcoreMatches(i).CadPartIndex > 0 Then
-            ci = PullcoreMatches(i).CadPartIndex
-            If ci > 0 And ci <= PartCount Then
-                If parts(ci).hasAsmCenter Then
-                    camN = camN + 1
-                    camIdx(camN) = i
+
+        cadIdx = PullcoreMatches(i).CadPartIndex
+
+        If cadIdx > 0 And cadIdx <= PartCount Then
+
+            If parts(cadIdx).hasAsmCenter Then
+
+                cadKey = CStr(cadIdx)
+
+                If PullcoreMatches(i).isCam Then
+
+                    If usedCamCad.Exists(cadKey) = False Then
+                        camN = camN + 1
+                        camMatches(camN) = i
+                        usedCamCad(cadKey) = i
+                    Else
+                        LogLine "WARNING: Duplicate pullcore CAM CAD ignored for ID/OD naming: " & _
+                                parts(cadIdx).componentName
+                    End If
+
+                Else
+
+                    If usedKeyCad.Exists(cadKey) = False Then
+                        keyN = keyN + 1
+                        keyMatches(keyN) = i
+                        usedKeyCad(cadKey) = i
+                    Else
+                        LogLine "WARNING: Duplicate pullcore KEY CAD ignored for ID/OD naming: " & _
+                                parts(cadIdx).componentName
+                    End If
+
                 End If
+
             End If
+
         End If
+
     Next i
 
-    If camN < 2 Then
-        LogLine "Pullcore ID/OD finalize skipped: need 2 CAM matches with centers (have " & camN & ")."
-        Exit Sub
-    End If
+    If camN >= 2 Then
 
-    Dim axisName As String
-    axisName = UCase(Trim(PULLCORE_ID_OD_HEIGHT_AXIS))
-    If axisName <> "Y" And axisName <> "Z" Then axisName = "Y"
-    PullcoreIdOdHeightAxisUsed = axisName
+        SortPullcoreMatchArrayByY camMatches, camN
 
-    Dim sorted() As Long
-    ReDim sorted(1 To camN)
-    For i = 1 To camN
-        sorted(i) = camIdx(i)
-    Next i
+        Dim idCamMatch As Long
+        Dim odCamMatch As Long
 
-    Dim a As Long
-    Dim b As Long
-    Dim tmp As Long
-    Dim va As Double
-    Dim vb As Double
-    For a = 1 To camN - 1
-        For b = a + 1 To camN
-            va = GetPullcoreMatchHeightValue(sorted(a), axisName)
-            vb = GetPullcoreMatchHeightValue(sorted(b), axisName)
-            If PULLCORE_ID_IS_HIGHER Then
-                If va < vb Then tmp = sorted(a): sorted(a) = sorted(b): sorted(b) = tmp
+        idCamMatch = camMatches(1)
+        odCamMatch = camMatches(camN)
+
+        ForcePullcoreMatchLabel idCamMatch, "ID PULLCORE CAM"
+        ForcePullcoreMatchLabel odCamMatch, "OD PULLCORE CAM"
+
+        LogLine "Pullcore CAM ID/OD split by Y:"
+        LogLine "  ID CAM = " & parts(PullcoreMatches(idCamMatch).CadPartIndex).componentName & _
+                " Y=" & FormatNumberForCsv(parts(PullcoreMatches(idCamMatch).CadPartIndex).AsmCenterY)
+        LogLine "  OD CAM = " & parts(PullcoreMatches(odCamMatch).CadPartIndex).componentName & _
+                " Y=" & FormatNumberForCsv(parts(PullcoreMatches(odCamMatch).CadPartIndex).AsmCenterY)
+
+        If keyN = 1 Then
+
+            If PullcoreMatchDistanceSq(keyMatches(1), idCamMatch) <= _
+               PullcoreMatchDistanceSq(keyMatches(1), odCamMatch) Then
+
+                ForcePullcoreMatchLabel keyMatches(1), "ID PULLCORE KEY"
+
             Else
-                If va > vb Then tmp = sorted(a): sorted(a) = sorted(b): sorted(b) = tmp
+
+                ForcePullcoreMatchLabel keyMatches(1), "OD PULLCORE KEY"
+
             End If
-        Next b
-    Next a
 
-    ForcePullcoreMatchLabel sorted(1), "ID PULLCORE CAM"
-    ForcePullcoreMatchLabel sorted(camN), "OD PULLCORE CAM"
+        ElseIf keyN = 2 Then
 
-    If camN > 2 Then
-        For i = 2 To camN - 1
-            ForcePullcoreMatchLabel sorted(i), "PULLCORE CAM " & CStr(i)
-        Next i
-    End If
+            Dim k1 As Long
+            Dim k2 As Long
 
-    Dim keyIdx() As Long
-    Dim keyN As Long
-    keyN = 0
-    ReDim keyIdx(1 To PullcoreMatchCount)
-    For i = 1 To PullcoreMatchCount
-        If (Not PullcoreMatches(i).isCam) And PullcoreMatches(i).CadPartIndex > 0 Then
-            keyN = keyN + 1
-            keyIdx(keyN) = i
+            k1 = keyMatches(1)
+            k2 = keyMatches(2)
+
+            Dim optionA As Double
+            Dim optionB As Double
+
+            optionA = PullcoreMatchDistanceSq(k1, idCamMatch) + PullcoreMatchDistanceSq(k2, odCamMatch)
+            optionB = PullcoreMatchDistanceSq(k2, idCamMatch) + PullcoreMatchDistanceSq(k1, odCamMatch)
+
+            If optionA <= optionB Then
+                ForcePullcoreMatchLabel k1, "ID PULLCORE KEY"
+                ForcePullcoreMatchLabel k2, "OD PULLCORE KEY"
+            Else
+                ForcePullcoreMatchLabel k2, "ID PULLCORE KEY"
+                ForcePullcoreMatchLabel k1, "OD PULLCORE KEY"
+            End If
+
+        ElseIf keyN > 2 Then
+
+            Dim n As Long
+
+            For n = 1 To keyN
+
+                If PullcoreMatchDistanceSq(keyMatches(n), idCamMatch) <= _
+                   PullcoreMatchDistanceSq(keyMatches(n), odCamMatch) Then
+
+                    ForcePullcoreMatchLabel keyMatches(n), "ID PULLCORE KEY"
+
+                Else
+
+                    ForcePullcoreMatchLabel keyMatches(n), "OD PULLCORE KEY"
+
+                End If
+
+            Next n
+
         End If
-    Next i
 
-    If keyN = 2 Then
-        Dim idCam As Long
-        Dim odCam As Long
-        idCam = sorted(1)
-        odCam = sorted(camN)
-        Dim k1 As Long
-        Dim k2 As Long
-        k1 = keyIdx(1)
-        k2 = keyIdx(2)
-        If PullcoreMatchDistanceSq(k1, idCam) + PullcoreMatchDistanceSq(k2, odCam) <= _
-           PullcoreMatchDistanceSq(k2, idCam) + PullcoreMatchDistanceSq(k1, odCam) Then
-            ForcePullcoreMatchLabel k1, "ID PULLCORE KEY"
-            ForcePullcoreMatchLabel k2, "OD PULLCORE KEY"
-        Else
-            ForcePullcoreMatchLabel k2, "ID PULLCORE KEY"
-            ForcePullcoreMatchLabel k1, "OD PULLCORE KEY"
+    Else
+
+        LogLine "Pullcore CAM ID/OD split skipped: need at least two CAM matches with Y centers."
+
+        ' If cams were not available but two keys are, still split keys by Y.
+        If keyN >= 2 Then
+
+            SortPullcoreMatchArrayByY keyMatches, keyN
+
+            ForcePullcoreMatchLabel keyMatches(1), "ID PULLCORE KEY"
+            ForcePullcoreMatchLabel keyMatches(keyN), "OD PULLCORE KEY"
+
+            LogLine "Pullcore KEY ID/OD split by Y without cams."
+
         End If
-    ElseIf keyN = 1 Then
-        If PullcoreMatchDistanceSq(keyIdx(1), sorted(1)) <= PullcoreMatchDistanceSq(keyIdx(1), sorted(camN)) Then
-            ForcePullcoreMatchLabel keyIdx(1), "ID PULLCORE KEY"
-        Else
-            ForcePullcoreMatchLabel keyIdx(1), "OD PULLCORE KEY"
-        End If
+
     End If
 
     Exit Sub
+
 ErrHandler:
     LogLine "FinalizePullcoreCamIdOdNames error: " & Err.Description
 End Sub
@@ -8322,8 +8470,9 @@ End Sub
 Private Function SwapCamForKey(ByVal name As String) As String
     Dim p As Long
     p = InStrRev(UCase(name), "CAM")
+
     If p > 0 Then
-        SwapCamForKey = Left(name, p - 1) & "Key" & mid(name, p + 3)
+        SwapCamForKey = Left(name, p - 1) & "KEY" & mid(name, p + 3)
     Else
         SwapCamForKey = name
     End If
@@ -12399,62 +12548,296 @@ ErrHandler:
 End Sub
 
 Private Sub OrganizeJobFiles()
-    On Error GoTo eh
+On Error GoTo eh
+
     Dim fso As Object
     Set fso = CreateObject("Scripting.FileSystemObject")
+
     If Not fso.FolderExists(CurrentJobFolder) Then Exit Sub
-    Dim baseDir As String, pdfDir As String, legacyBase As String
+
+    Dim baseDir As String
+    Dim pdfDir As String
+    Dim legacyBase As String
+
     baseDir = CurrentJobFolder & "\" & CurrentJobNumber & " Base"
     legacyBase = CurrentJobFolder & "\base"
     pdfDir = CurrentJobFolder & "\pdf"
+
     EnsureFolderDeep baseDir
     EnsureFolderDeep pdfDir
-    If fso.FolderExists(legacyBase) Then
-        Dim legF As Object
-        For Each legF In fso.GetFolder(legacyBase).Files
-            On Error Resume Next
-            fso.MoveFile legF.Path, GetUniqueFilePath(baseDir & "\" & legF.Name)
-            On Error GoTo eh
-        Next legF
-        On Error Resume Next
-        If fso.GetFolder(legacyBase).Files.Count = 0 Then fso.DeleteFolder legacyBase, True
-        On Error GoTo eh
-    End If
-    Dim names As Collection, f As Object
-    Set names = New Collection
-    For Each f In fso.GetFolder(CurrentJobFolder).Files
-        names.Add f.Name
-    Next f
-    Dim idx As Long, nm As String, ext As String, dest As String, src As String, target As String
-    Dim movedBase As Long, movedPdf As Long
+
+    Dim movedBase As Long
+    Dim movedPdf As Long
+
     movedBase = 0
     movedPdf = 0
-    For idx = 1 To names.Count
-        nm = names(idx)
-        ext = UCase$(GetFileExtension(nm))
-        dest = ""
-        If ext = "SLDPRT" Or ext = "SLDASM" Then
-            dest = baseDir
-        ElseIf ext = "PDF" Or ext = "XLS" Or ext = "XLSX" Or ext = "XLSM" Then
-            dest = pdfDir
-        ElseIf ext = "CSV" And (InStr(UCase$(nm), "EXPORT") > 0 Or InStr(UCase$(nm), "SIGNATURE") > 0 Or InStr(UCase$(nm), "PULL") > 0) Then
-            dest = pdfDir
+
+    ' Move anything from old lowercase "base" folder into the proper Base folder.
+    If fso.FolderExists(legacyBase) Then
+        movedBase = movedBase + MoveSolidWorksNativeFilesFromFolderToBase(legacyBase, baseDir)
+
+        On Error Resume Next
+        If fso.GetFolder(legacyBase).Files.Count = 0 And fso.GetFolder(legacyBase).SubFolders.Count = 0 Then
+            fso.DeleteFolder legacyBase, True
         End If
-        If dest <> "" Then
-            src = CurrentJobFolder & "\" & nm
-            target = dest & "\" & nm
-            On Error Resume Next
-            If fso.FileExists(target) Then target = GetUniqueFilePath(target)
-            fso.MoveFile src, target
-            On Error GoTo eh
-            If dest = baseDir Then movedBase = movedBase + 1 Else movedPdf = movedPdf + 1
-        End If
-    Next idx
-    LogLine "OrganizeJobFiles: moved " & movedBase & " CAD file(s) -> " & CurrentJobNumber & " Base, " & movedPdf & " report(s) -> pdf"
+        On Error GoTo eh
+    End If
+
+    ' Move all root-level SolidWorks native files into Base.
+    movedBase = movedBase + MoveSolidWorksNativeFilesFromFolderToBase(CurrentJobFolder, baseDir)
+
+    ' Move reports / PDFs / BOM files into pdf folder.
+    movedPdf = movedPdf + MoveReportFilesFromFolderToPdf(CurrentJobFolder, pdfDir)
+
+    LogLine "OrganizeJobFiles: moved " & movedBase & _
+            " SolidWorks native file(s) -> " & CurrentJobNumber & _
+            " Base, " & movedPdf & " report/BOM file(s) -> pdf"
+
     Exit Sub
+
 eh:
     LogLine "OrganizeJobFiles error: " & Err.Description
 End Sub
+
+Private Function MoveSolidWorksNativeFilesFromFolderToBase(ByVal sourceFolder As String, _
+                                                           ByVal baseDir As String) As Long
+On Error GoTo ErrHandler
+
+    MoveSolidWorksNativeFilesFromFolderToBase = 0
+
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    If sourceFolder = "" Then Exit Function
+    If baseDir = "" Then Exit Function
+    If fso.FolderExists(sourceFolder) = False Then Exit Function
+
+    EnsureFolderDeep baseDir
+
+    Dim fileNames As Collection
+    Set fileNames = New Collection
+
+    Dim f As Object
+
+    For Each f In fso.GetFolder(sourceFolder).Files
+        If ShouldMoveFileToBaseFolder(f.Name) Then
+            fileNames.Add f.Path
+        End If
+    Next f
+
+    Dim i As Long
+    Dim srcPath As String
+    Dim targetPath As String
+    Dim nm As String
+
+    For i = 1 To fileNames.Count
+
+        srcPath = CStr(fileNames(i))
+        nm = fso.GetFileName(srcPath)
+
+        If LCase(fso.GetParentFolderName(srcPath)) <> LCase(baseDir) Then
+
+            targetPath = GetUniqueFilePath(baseDir & "\" & nm)
+
+            If MoveFileRobust(srcPath, targetPath) Then
+                MoveSolidWorksNativeFilesFromFolderToBase = MoveSolidWorksNativeFilesFromFolderToBase + 1
+                LogLine "Moved SolidWorks native file to Base: " & nm
+            Else
+                LogLine "WARNING: Could not move SolidWorks native file to Base: " & srcPath
+            End If
+
+        End If
+
+    Next i
+
+    Exit Function
+
+ErrHandler:
+    LogLine "MoveSolidWorksNativeFilesFromFolderToBase error: " & Err.Description
+    MoveSolidWorksNativeFilesFromFolderToBase = 0
+End Function
+
+Private Function MoveReportFilesFromFolderToPdf(ByVal sourceFolder As String, _
+                                                ByVal pdfDir As String) As Long
+On Error GoTo ErrHandler
+
+    MoveReportFilesFromFolderToPdf = 0
+
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    If sourceFolder = "" Then Exit Function
+    If pdfDir = "" Then Exit Function
+    If fso.FolderExists(sourceFolder) = False Then Exit Function
+
+    EnsureFolderDeep pdfDir
+
+    Dim fileNames As Collection
+    Set fileNames = New Collection
+
+    Dim f As Object
+
+    For Each f In fso.GetFolder(sourceFolder).Files
+        If ShouldMoveFileToPdfFolder(f.Name) Then
+            fileNames.Add f.Path
+        End If
+    Next f
+
+    Dim i As Long
+    Dim srcPath As String
+    Dim targetPath As String
+    Dim nm As String
+
+    For i = 1 To fileNames.Count
+
+        srcPath = CStr(fileNames(i))
+        nm = fso.GetFileName(srcPath)
+
+        If LCase(fso.GetParentFolderName(srcPath)) <> LCase(pdfDir) Then
+
+            targetPath = GetUniqueFilePath(pdfDir & "\" & nm)
+
+            If MoveFileRobust(srcPath, targetPath) Then
+                MoveReportFilesFromFolderToPdf = MoveReportFilesFromFolderToPdf + 1
+                LogLine "Moved report/BOM file to pdf folder: " & nm
+            Else
+                LogLine "WARNING: Could not move report/BOM file to pdf folder: " & srcPath
+            End If
+
+        End If
+
+    Next i
+
+    Exit Function
+
+ErrHandler:
+    LogLine "MoveReportFilesFromFolderToPdf error: " & Err.Description
+    MoveReportFilesFromFolderToPdf = 0
+End Function
+
+Private Function ShouldMoveFileToBaseFolder(ByVal fileName As String) As Boolean
+On Error GoTo ErrHandler
+
+    ShouldMoveFileToBaseFolder = False
+
+    Dim ext As String
+    Dim n As String
+
+    ext = UCase(GetFileExtension(fileName))
+    n = UCase(fileName)
+
+    If ext = "SLDPRT" Then
+        ShouldMoveFileToBaseFolder = True
+        Exit Function
+    End If
+
+    If ext = "SLDASM" Then
+        ShouldMoveFileToBaseFolder = True
+        Exit Function
+    End If
+
+    ' Imported assembly generated part names like 861000196_MB-ASM_05-20-2026.sldasm-Part-4
+    If InStr(n, ".SLDASM-PART-") > 0 Then
+        ShouldMoveFileToBaseFolder = True
+        Exit Function
+    End If
+
+    If InStr(n, ".SLDASM-") > 0 And InStr(n, "PART") > 0 Then
+        ShouldMoveFileToBaseFolder = True
+        Exit Function
+    End If
+
+    Exit Function
+
+ErrHandler:
+    ShouldMoveFileToBaseFolder = False
+End Function
+
+Private Function ShouldMoveFileToPdfFolder(ByVal fileName As String) As Boolean
+On Error GoTo ErrHandler
+
+    ShouldMoveFileToPdfFolder = False
+
+    Dim ext As String
+    Dim n As String
+
+    ext = UCase(GetFileExtension(fileName))
+    n = UCase(fileName)
+
+    Select Case ext
+
+        Case "PDF", "XLS", "XLSX", "XLSM"
+            ShouldMoveFileToPdfFolder = True
+            Exit Function
+
+        Case "CSV"
+            If InStr(n, "EXPORT") > 0 Or _
+               InStr(n, "SIGNATURE") > 0 Or _
+               InStr(n, "PULL") > 0 Or _
+               InStr(n, "BOM") > 0 Then
+
+                ShouldMoveFileToPdfFolder = True
+                Exit Function
+
+            End If
+
+        Case "TXT"
+            If InStr(n, "BOM") > 0 Or _
+               InStr(n, "EXPORT") > 0 Then
+
+                ShouldMoveFileToPdfFolder = True
+                Exit Function
+
+            End If
+
+    End Select
+
+    Exit Function
+
+ErrHandler:
+    ShouldMoveFileToPdfFolder = False
+End Function
+
+Private Function MoveFileRobust(ByVal srcPath As String, ByVal targetPath As String) As Boolean
+On Error GoTo ErrHandler
+
+    MoveFileRobust = False
+
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    If srcPath = "" Or targetPath = "" Then Exit Function
+    If fso.FileExists(srcPath) = False Then Exit Function
+
+    EnsureFolderDeep fso.GetParentFolderName(targetPath)
+
+    On Error Resume Next
+    Err.Clear
+    fso.MoveFile srcPath, targetPath
+
+    If Err.Number = 0 Then
+        MoveFileRobust = fso.FileExists(targetPath)
+        Exit Function
+    End If
+
+    Err.Clear
+    fso.CopyFile srcPath, targetPath, True
+
+    If Err.Number = 0 And fso.FileExists(targetPath) Then
+
+        Err.Clear
+        fso.DeleteFile srcPath, True
+
+        MoveFileRobust = True
+        Exit Function
+
+    End If
+
+    Exit Function
+
+ErrHandler:
+    MoveFileRobust = False
+End Function
 
 Private Sub WriteExportLogBomSummary()
 On Error GoTo ErrHandler
@@ -12990,7 +13373,61 @@ Private Function FindBomHeaderLikeInArrayRow(ByVal data As Variant, ByVal r As L
 End Function
 
 Private Function FindBomQtyColumnInArrayRow(ByVal data As Variant, ByVal r As Long, ByVal colCount As Long) As Long
-    FindBomQtyColumnInArrayRow = FindBomHeaderLikeInArrayRow(data, r, colCount, Array("QTY", "QUANTITY", "QNTY", "QUAN"))
+On Error GoTo ErrHandler
+
+    FindBomQtyColumnInArrayRow = 0
+
+    Dim c As Long
+    Dim h As String
+    Dim k As String
+
+    ' First pass: normal QTY-style headers.
+    For c = 1 To colCount
+
+        h = NormalizeText(GetArrayValue(data, r, c))
+        k = NormalizeKey(h)
+
+        If k <> "" Then
+            If InStr(k, "QTY") > 0 Or _
+               InStr(k, "QUANTITY") > 0 Or _
+               InStr(k, "QNTY") > 0 Or _
+               InStr(k, "QUAN") > 0 Then
+
+                FindBomQtyColumnInArrayRow = c
+                Exit Function
+
+            End If
+        End If
+
+    Next c
+
+    ' Second pass: Tempcraft / CMS style "No. Req'd" quantity header.
+    For c = 1 To colCount
+
+        h = NormalizeText(GetArrayValue(data, r, c))
+        k = NormalizeKey(h)
+
+        If k <> "" Then
+            If InStr(k, "REQ") > 0 Then
+                If InStr(k, "NO") > 0 Or _
+                   InStr(k, "NUM") > 0 Or _
+                   InStr(k, "NUMBER") > 0 Or _
+                   InStr(k, "REQUIRED") > 0 Or _
+                   InStr(k, "REQD") > 0 Then
+
+                    FindBomQtyColumnInArrayRow = c
+                    Exit Function
+
+                End If
+            End If
+        End If
+
+    Next c
+
+    Exit Function
+
+ErrHandler:
+    FindBomQtyColumnInArrayRow = 0
 End Function
 
 Private Function FindBomMaterialColumnInArrayRow(ByVal data As Variant, ByVal r As Long, ByVal colCount As Long) As Long
