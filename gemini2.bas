@@ -133,6 +133,7 @@ Private Const FAST_SKIP_HOLDERS_PACKAGE_DXF As Boolean = False
 
 ' Match Studio: no JPEG previews.
 Private Const CREATE_COMPONENT_ISO_JPEGS As Boolean = False
+Private Const CREATE_MATCH_STUDIO_HOLDERS_STL As Boolean = True
 Private Const CREATE_COMPONENT_IGS_WITH_XT As Boolean = False
 Private Const CREATE_COMPONENT_EASM_WITH_XT As Boolean = False
 
@@ -1243,7 +1244,7 @@ On Error GoTo ErrHandler
             If InStr(n, "_BASE_") > 0 Or InStr(n, "_HOLDERS_") > 0 Then
 
                 Select Case ext
-                    Case "x_t", "igs", "iges", "easm", "dxf"
+                    Case "x_t", "igs", "iges", "easm", "dxf", "stl"
                         fileList.Add f.Path
                 End Select
 
@@ -1541,7 +1542,7 @@ On Error GoTo ErrHandler
 
         If Left(nameUpper, Len(UCase(CurrentJobNumber))) = UCase(CurrentJobNumber) Then
             Select Case ext
-                Case "x_t", "igs", "easm", "dxf", "sldasm"
+                Case "x_t", "igs", "iges", "easm", "dxf", "stl", "sldasm"
                     fso.CopyFile file.path, networkRoot & "\" & file.name, True
                     LogLine "Copied root output file to network: " & file.name
             End Select
@@ -4663,12 +4664,15 @@ On Error GoTo ErrHandler
     If holderToken = "" Then holderToken = "HOLDERS"
 
     Dim holdersIgsPath As String
+    Dim holdersStlPath As String
     Dim holdersDxfPath As String
 
     holdersIgsPath = outputFolder & "\" & CurrentJobNumber & "_" & holderToken & "_" & custToken & "_" & dateToken & ".igs"
+    holdersStlPath = outputFolder & "\" & CurrentJobNumber & "_" & holderToken & "_" & custToken & "_" & dateToken & ".stl"
     holdersDxfPath = outputFolder & "\" & CurrentJobNumber & "_" & holderToken & "_" & custToken & "_" & dateToken & ".dxf"
 
     holdersIgsPath = GetUniqueFilePath(holdersIgsPath)
+    holdersStlPath = GetUniqueFilePath(holdersStlPath)
     holdersDxfPath = GetUniqueFilePath(holdersDxfPath)
 
     Dim tempFolder As String
@@ -4694,6 +4698,11 @@ On Error GoTo ErrHandler
     StabilizeActiveView swModel, 200
 
     SaveModelAs swModel, holdersIgsPath
+
+    If CREATE_MATCH_STUDIO_HOLDERS_STL Then
+        LogLine "Exporting HOLDERS package STL for Match Studio overlay."
+        SaveModelAs swModel, holdersStlPath
+    End If
 
     If FAST_BATCH_EXPORT And FAST_SKIP_HOLDERS_PACKAGE_DXF Then
         LogLine "FAST: skipping HOLDERS DXF (IGS still saved)."
@@ -12745,7 +12754,7 @@ Private Sub CopyMatchingArtifactsRecursive(ByVal srcFolder As String, ByVal dstF
         ' Do not publish JPEG/PNG preview images.
         If ext = "CSV" Or ext = "TXT" Or ext = "PDF" Then take = True
         If ext = "XLS" Or ext = "XLSX" Or ext = "XLSM" Then take = True
-        If ext = "IGS" Or ext = "IGES" Or ext = "EASM" Or ext = "X_T" Or ext = "XT" Or ext = "DXF" Then take = True
+        If ext = "IGS" Or ext = "IGES" Or ext = "STL" Or ext = "EASM" Or ext = "X_T" Or ext = "XT" Or ext = "DXF" Then take = True
         If take Then fso.CopyFile f.Path, dstFolder & "\" & nm, True
     Next f
     For Each sub_ In fso.GetFolder(srcFolder).SubFolders
@@ -13207,7 +13216,7 @@ On Error GoTo ErrHandler
 
     If InStr(n, UCase(CurrentJobNumber & "_BASE_")) > 0 Then
         Select Case ext
-            Case "dxf", "easm", "x_t", "igs", "iges"
+            Case "dxf", "easm", "x_t", "igs", "iges", "stl"
                 IsBaseOrHoldersPackageFile = True
                 Exit Function
         End Select
@@ -13215,7 +13224,7 @@ On Error GoTo ErrHandler
 
     If InStr(n, UCase(CurrentJobNumber & "_HOLDERS_")) > 0 Then
         Select Case ext
-            Case "dxf", "igs", "iges"
+            Case "dxf", "igs", "iges", "stl"
                 IsBaseOrHoldersPackageFile = True
                 Exit Function
         End Select

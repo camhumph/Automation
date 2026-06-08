@@ -11801,7 +11801,7 @@ ELGIN_QUOTE_SHEET_DIRS = [
     p.strip() for p in os.environ.get("ELGIN_QUOTE_SHEET_DIRS", _default_img_dirs).split(";") if p.strip()
 ]
 _MS_IMG_EXTS = (".jpg", ".jpeg", ".png", ".gif", ".webp")
-_MS_MODEL_EXTS = (".igs", ".iges", ".easm", ".x_t", ".xt", ".step", ".stp")
+_MS_MODEL_EXTS = (".stl", ".obj", ".igs", ".iges", ".step", ".stp", ".easm", ".x_t", ".xt")
 _MS_SHEET_EXTS = (".xls", ".xlsx", ".xlsm", ".pdf")
 _ms_img_cache = {}
 _ms_model_cache = {}
@@ -11993,10 +11993,12 @@ def ms_find_job_models(job_num: str, kind: str = "") -> list[dict]:
         })
 
     fmt_rank = {
-        ".igs": 0,
-        ".iges": 0,
-        ".step": 1,
-        ".stp": 1,
+        ".stl": 0,
+        ".obj": 1,
+        ".igs": 2,
+        ".iges": 2,
+        ".step": 3,
+        ".stp": 3,
         ".easm": 9,
         ".x_t": 9,
         ".xt": 9,
@@ -12007,10 +12009,10 @@ def ms_find_job_models(job_num: str, kind: str = "") -> list[dict]:
         ext = "." + x["format"].lower()
 
         # Strong preference for exact combined holders file:
-        # J8449_HOLDERS_861000172_06-03-2026.igs
+        # J8449_HOLDERS_861000172_06-03-2026.stl / .igs
         combined_holders_bonus = 0 if "_HOLDERS_" in fnu else 5
 
-        # Prefer IGS/IGES over everything else.
+        # Prefer STL for browser overlay; keep IGS as source/archive fallback.
         format_rank = fmt_rank.get(ext, 8)
 
         # Avoid BASE assemblies for holder overlay.
@@ -12743,13 +12745,13 @@ function renderOverlay(m){
   stage.innerHTML =
     '<div class="ovstage">' +
       '<div class="legend">' +
-        '<b>'+esc(k)+'</b> compare uses the combined <b>HOLDERS</b> IGS file for each job, not individual holder files. ' +
-        'Example: <code>J8449_HOLDERS_861000172_06-03-2026.igs</code>. ' +
-        'Current job is blue/cyan. Matched job is orange/yellow. ' +
-        'Drag to spin, scroll to zoom. No JPEGs are used.' +
+        '<b>'+esc(k)+'</b> compare uses the combined <b>HOLDERS</b> package for each job. ' +
+        'IGS is kept as source CAD; <b>STL</b> is used for browser overlay when available. ' +
+        'Example: <code>J8449_HOLDERS_861000172_06-03-2026.stl</code>. ' +
+        'Current job is blue/cyan. Matched job is orange/yellow. No JPEGs are used.' +
       '</div>' +
       '<div class="ms3d" id="ms3dHost">' +
-        '<div class="muted" style="padding:18px">Loading combined HOLDERS IGS overlay…</div>' +
+        '<div class="muted" style="padding:18px">Loading combined HOLDERS overlay…</div>' +
       '</div>' +
       '<div id="ms3dFileInfo" class="note"></div>' +
     '</div>';
@@ -12763,14 +12765,13 @@ async function loadMs3dOverlay(curJob, matchJob, kind, containerId){
 
   if(!host) return;
 
-  // ID HOLDER and OD HOLDER both use the combined HOLDERS IGS.
+  // ID HOLDER and OD HOLDER both use the combined HOLDERS package.
   var modelKind='HOLDERS';
 
   try{
-    var occt=await initOcctImportJs();
-    var threeDeps=await loadThreeDeps();
-    var THREE=threeDeps.THREE;
-    var OrbitControls=threeDeps.OrbitControls;
+    var THREE=await import('https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js');
+    var OrbitControls=(await import('https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js')).OrbitControls;
+    var STLLoader=(await import('https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/STLLoader.js')).STLLoader;
 
     async function fetchModel(job){
       var metaR=await fetch(modelMetaURL(job,modelKind));
@@ -12815,19 +12816,20 @@ async function loadMs3dOverlay(curJob, matchJob, kind, containerId){
 
     if(fileInfo){
       fileInfo.innerHTML =
-        '<div><b>Current job model:</b> ' +
+        '<div><b>Current job display mesh:</b> ' +
           (mCur.ok ? esc(mCur.label) : '<span style="color:var(--bad)">'+esc(mCur.error)+'</span>') +
         '</div>' +
-        '<div><b>Matched job model:</b> ' +
+        '<div><b>Matched job display mesh:</b> ' +
           (mMatch.ok ? esc(mMatch.label) : '<span style="color:var(--bad)">'+esc(mMatch.error)+'</span>') +
-        '</div>';
+        '</div>' +
+        '<div class="muted">The STL is the browser-display mesh exported from the combined HOLDERS package. IGS is kept as source CAD. No JPEGs are used.</div>';
     }
 
     if(!mCur.ok && !mMatch.ok){
       host.innerHTML =
         '<div class="muted" style="padding:18px">' +
-        'No combined holder IGS/IGES found for either job. Re-run the SolidWorks export and make sure it publishes files like: ' +
-        '<code>J'+esc(curJob)+'_HOLDERS_….igs</code> and <code>J'+esc(matchJob)+'_HOLDERS_….igs</code>.' +
+        'No combined holder STL/IGS/IGES found for either job. Re-run the SolidWorks export and make sure it publishes files like: ' +
+        '<code>J'+esc(curJob)+'_HOLDERS_….igs</code> and <code>J'+esc(curJob)+'_HOLDERS_….stl</code>.' +
         '</div>';
       return;
     }
@@ -12872,14 +12874,23 @@ async function loadMs3dOverlay(curJob, matchJob, kind, containerId){
 
     scene.add(new THREE.AmbientLight(0xffffff,0.45));
 
-    function parseCad(model){
+    var occtPromise=null;
+
+    async function getOcct(){
+      if(!occtPromise){
+        occtPromise=initOcctImportJs();
+      }
+      return await occtPromise;
+    }
+
+    async function parseIgesOrStep(model){
       if(!model || !model.ok || !model.buf) return null;
 
       var fmt=String(model.format||'').toLowerCase();
       var u8=new Uint8Array(model.buf);
       var parsed=null;
+      var occt=await getOcct();
 
-      // IGS/IGES preferred.
       if(fmt==='igs' || fmt==='iges'){
         try{
           parsed=occt.ReadIgesFile(u8);
@@ -12888,7 +12899,6 @@ async function loadMs3dOverlay(curJob, matchJob, kind, containerId){
         }
       }
 
-      // STEP fallback.
       if(!parsed || !parsed.meshes || !parsed.meshes.length){
         if(fmt==='stp' || fmt==='step'){
           try{
@@ -12899,7 +12909,6 @@ async function loadMs3dOverlay(curJob, matchJob, kind, containerId){
         }
       }
 
-      // Last-resort auto try.
       if(!parsed || !parsed.meshes || !parsed.meshes.length){
         try{
           parsed=occt.ReadIgesFile(u8);
@@ -12915,71 +12924,86 @@ async function loadMs3dOverlay(curJob, matchJob, kind, containerId){
       return parsed;
     }
 
-    function addMeshes(model, solidColor, edgeColor, opacity, label){
-      if(!model || !model.ok || !model.buf) return null;
+    function addGeometryToGroup(group, geom, solidColor, edgeColor, opacity){
+      if(!geom) return;
 
-      // No JPEG/EASM/X_T compare. Combined HOLDERS IGS/IGES/STEP only.
-      if(model.format==='easm' || model.format==='x_t' || model.format==='xt'){
-        return null;
+      if(!geom.attributes.normal){
+        geom.computeVertexNormals();
       }
 
-      var parsed=parseCad(model);
+      var mat=new THREE.MeshPhongMaterial({
+        color:solidColor,
+        transparent:true,
+        opacity:opacity,
+        side:THREE.DoubleSide,
+        depthWrite:false,
+        polygonOffset:true,
+        polygonOffsetFactor:1,
+        polygonOffsetUnits:1
+      });
 
-      if(!parsed || !parsed.meshes || !parsed.meshes.length){
+      var mesh=new THREE.Mesh(geom,mat);
+      group.add(mesh);
+
+      try{
+        var edges=new THREE.EdgesGeometry(geom,20);
+        var edgeMat=new THREE.LineBasicMaterial({
+          color:edgeColor,
+          transparent:true,
+          opacity:0.98
+        });
+
+        var edgeLines=new THREE.LineSegments(edges,edgeMat);
+        group.add(edgeLines);
+      }catch(e){}
+    }
+
+    async function addModel(model, solidColor, edgeColor, opacity, label){
+      if(!model || !model.ok || !model.buf) return null;
+
+      var fmt=String(model.format||'').toLowerCase();
+
+      if(fmt==='easm' || fmt==='x_t' || fmt==='xt'){
         return null;
       }
 
       var group=new THREE.Group();
       group.name=label||'';
 
-      parsed.meshes.forEach(function(mh){
-        var pos=mh.attributes && mh.attributes.position ? mh.attributes.position.array : null;
-
-        if(!pos || !pos.length) return;
-
-        var geom=new THREE.BufferGeometry();
-        geom.setAttribute('position', new THREE.Float32BufferAttribute(pos,3));
-
-        if(mh.attributes && mh.attributes.normal){
-          geom.setAttribute('normal', new THREE.Float32BufferAttribute(mh.attributes.normal.array,3));
-        }
-
-        if(mh.index && mh.index.array){
-          geom.setIndex(mh.index.array);
-        }
-
-        if(!mh.attributes || !mh.attributes.normal){
-          geom.computeVertexNormals();
-        }
-
-        // Transparent solid body.
-        var mat=new THREE.MeshPhongMaterial({
-          color:solidColor,
-          transparent:true,
-          opacity:opacity,
-          side:THREE.DoubleSide,
-          depthWrite:false,
-          polygonOffset:true,
-          polygonOffsetFactor:1,
-          polygonOffsetUnits:1
-        });
-
-        var mesh=new THREE.Mesh(geom,mat);
-        group.add(mesh);
-
-        // Bright edge wireframe.
+      if(fmt==='stl'){
         try{
-          var edges=new THREE.EdgesGeometry(geom,20);
-          var edgeMat=new THREE.LineBasicMaterial({
-            color:edgeColor,
-            transparent:true,
-            opacity:0.98
-          });
+          var loader=new STLLoader();
+          var geom=loader.parse(model.buf);
+          addGeometryToGroup(group, geom, solidColor, edgeColor, opacity);
+        }catch(e){
+          return null;
+        }
+      }else{
+        var parsed=await parseIgesOrStep(model);
 
-          var edgeLines=new THREE.LineSegments(edges,edgeMat);
-          group.add(edgeLines);
-        }catch(e){}
-      });
+        if(!parsed || !parsed.meshes || !parsed.meshes.length){
+          return null;
+        }
+
+        parsed.meshes.forEach(function(mh){
+          var pos=mh.attributes && mh.attributes.position ? mh.attributes.position.array : null;
+
+          if(!pos || !pos.length) return;
+
+          var geom=new THREE.BufferGeometry();
+          geom.setAttribute('position', new THREE.Float32BufferAttribute(pos,3));
+
+          if(mh.attributes && mh.attributes.normal){
+            geom.setAttribute('normal', new THREE.Float32BufferAttribute(mh.attributes.normal.array,3));
+          }
+
+          if(mh.index && mh.index.array){
+            geom.setIndex(mh.index.array);
+          }
+
+          addGeometryToGroup(group, geom, solidColor, edgeColor, opacity);
+        });
+      }
 
       if(group.children.length<=0){
         return null;
@@ -13004,8 +13028,8 @@ async function loadMs3dOverlay(curJob, matchJob, kind, containerId){
 
     // Orange/yellow = matched/old job.
     // Blue/cyan = current/new job.
-    var gMatch=addMeshes(mMatch,0xff8c42,0xffd199,0.32,'MATCHED_OLD_JOB');
-    var gCur=addMeshes(mCur,0x3b82f6,0x7dd3fc,0.42,'CURRENT_JOB');
+    var gMatch=await addModel(mMatch,0xff8c42,0xffd199,0.32,'MATCHED_OLD_JOB');
+    var gCur=await addModel(mCur,0x3b82f6,0x7dd3fc,0.42,'CURRENT_JOB');
 
     centerGroupOnOrigin(gMatch);
     centerGroupOnOrigin(gCur);
@@ -13015,11 +13039,11 @@ async function loadMs3dOverlay(curJob, matchJob, kind, containerId){
     if(box.isEmpty()){
       host.innerHTML =
         '<div class="muted" style="padding:18px">' +
-          '<b>Could not mesh the combined holder IGS.</b><br><br>' +
-          'The file was found, but the browser mesher could not convert it into triangles.<br>' +
+          '<b>Could not mesh the combined holders.</b><br><br>' +
+          'The files were found, but no browser-readable mesh was produced.<br>' +
           'Current file: <code>'+(mCur.ok ? esc(mCur.label) : 'not found')+'</code><br>' +
           'Matched file: <code>'+(mMatch.ok ? esc(mMatch.label) : 'not found')+'</code><br><br>' +
-          'Make sure these are real exported IGES solid/surface files, not EASM, X_T, empty exports, or shortcut/reference files.' +
+          'Fix: export same-name <code>.stl</code> files beside the combined holder IGS files, then refresh Match Studio.' +
         '</div>';
       return;
     }
@@ -13037,14 +13061,14 @@ async function loadMs3dOverlay(curJob, matchJob, kind, containerId){
     var leg=document.createElement('div');
     leg.className='ms3d-legend';
     leg.innerHTML =
-      '<span><i class="dot" style="background:#3b82f6"></i>'+esc(curJob)+' current combined HOLDERS IGS</span>' +
-      '<span><i class="dot" style="background:#ff8c42"></i>'+esc(matchJob)+' matched combined HOLDERS IGS</span>' +
-      '<span style="color:#8aa0c6">transparent solid bodies + bright wireframe edges</span>';
+      '<span><i class="dot" style="background:#3b82f6"></i>'+esc(curJob)+' current holders</span>' +
+      '<span><i class="dot" style="background:#ff8c42"></i>'+esc(matchJob)+' matched holders</span>' +
+      '<span style="color:#8aa0c6">transparent solids + bright wireframe edges</span>';
     host.appendChild(leg);
 
     var hint=document.createElement('div');
     hint.className='ms3d-hint';
-    hint.textContent='Drag to spin · scroll to zoom · combined HOLDERS IGS only';
+    hint.textContent='Drag to spin · scroll to zoom · combined HOLDERS only';
     host.appendChild(hint);
 
     function anim(){
@@ -13058,7 +13082,7 @@ async function loadMs3dOverlay(curJob, matchJob, kind, containerId){
   }catch(err){
     host.innerHTML =
       '<div class="muted" style="padding:18px">' +
-      '3D combined holder IGS overlay unavailable: '+esc(err.message||err)+
+      '3D combined holder overlay unavailable: '+esc(err.message||err)+
       '</div>';
   }
 }
