@@ -27,12 +27,18 @@ Option Explicit
 '
 ' NO prints folder, NO individual part X_T/DXF, NO J Block,
 ' NO Pull Core, NO Pyropel, NO dimensioned DXF.
+'
+' Job folder search (MODULE6121): current month plus JOB_SEARCH_MONTHS_BACK
+' prior months (default 2 => this month + 2 before, like Elgin_UPDATED).
+' Also seeds CMS_Block_Naming_Library.csv from recent macro exports.
 ' ============================================================
 
 ' ============================================================
 ' USER SETTINGS
 ' ============================================================
-Private Const ROOT_JOB_PATH As String = "C:\Users\lenovo\Desktop\000000005.May 2026"
+Private Const PUBLIC_DOWNLOADS_PATH As String = "\\Mycloudex2ultra\mexico\Downloads"
+Private Const LOCAL_DOWNLOADS_FALLBACK As String = "C:\Users\lenovo\Desktop"
+Private Const LIMIT_JOB_SEARCH_TO_RECENT_MONTHS As Boolean = True
 Private Const EXTRACT_FOLDER_NAME As String = "_EXTRACTED_ZIP"
 Private Const LOCAL_WORKSPACE_ROOT As String = "C:\CMS_Local_Workspace"
 
@@ -277,8 +283,16 @@ On Error GoTo ErrHandler
 
     LogLine "========================================"
     LogLine "BASE EXPORT MACRO STARTED"
-    LogLine "Root path: " & ROOT_JOB_PATH
+    LogLine "Root path: " & ResolveRootJobPath()
+    LogLine "Matching publish root: " & ResolveMatchingRoot()
+    LogLine "Job search month window (MODULE6121): " & CStr(JOB_SEARCH_MONTHS_BACK + 1) & " months"
     LogLine "========================================"
+
+    If M6121_SEED_LIBRARY_FROM_RECENT_JOBS Then
+        LogStart "Seed CAD naming library from recent jobs (MODULE6121)"
+        SeedCadNamingLibraryFromRecentJobs
+        LogDone "Seed CAD naming library from recent jobs (MODULE6121)"
+    End If
 
     Dim jobInput As String
     jobInput = Trim(InputBox("Enter one or more C numbers." & vbCrLf & _
@@ -367,7 +381,7 @@ On Error GoTo ErrHandler
     JobBaseName = ""
 
     LogStart "Find job folder"
-    NetworkJobFolder = FindJobFolderByText(ROOT_JOB_PATH, CurrentJobNumber)
+    NetworkJobFolder = FindJobFolderByText(ResolveRootJobPath(), CurrentJobNumber)
     LogLine "Job folder result: " & NetworkJobFolder
     If NetworkJobFolder = "" Then
         LogErrorText "Could not find job folder for: " & CurrentJobNumber
@@ -901,6 +915,7 @@ On Error GoTo ErrHandler
     Dim score As Long
     For Each subFolder In root.SubFolders
         nameUpper = UCase(subFolder.Name)
+        If ShouldSkipJobSearchTopFolder(subFolder.Name, wantUpper) Then GoTo NextTop
         If nameUpper = UCase(EXTRACT_FOLDER_NAME) Then GoTo NextTop
         score = -1
         If nameUpper = wantUpper Then
@@ -920,8 +935,10 @@ NextTop:
     End If
     For Each subFolder In root.SubFolders
         nameUpper = UCase(subFolder.Name)
-        If nameUpper <> UCase(EXTRACT_FOLDER_NAME) Then
-            SearchJobFolderRecursive subFolder, wantUpper, 1, bestPath, bestScore
+        If ShouldSkipJobSearchTopFolder(subFolder.Name, wantUpper) = False Then
+            If nameUpper <> UCase(EXTRACT_FOLDER_NAME) Then
+                SearchJobFolderRecursive subFolder, wantUpper, 1, bestPath, bestScore
+            End If
         End If
     Next subFolder
     If bestPath = "" Then
@@ -932,6 +949,22 @@ NextTop:
 ErrHandler:
     LogLine "FindJobFolderByText error: " & Err.Description
     FindJobFolderByText = ""
+End Function
+
+Private Function ShouldSkipJobSearchTopFolder(ByVal folderName As String, ByVal wantUpper As String) As Boolean
+On Error GoTo ErrHandler
+
+    ShouldSkipJobSearchTopFolder = False
+
+    If LIMIT_JOB_SEARCH_TO_RECENT_MONTHS = False Then Exit Function
+
+    If JobSearchTopFolderIsAllowed(folderName, wantUpper) Then Exit Function
+
+    ShouldSkipJobSearchTopFolder = True
+    Exit Function
+
+ErrHandler:
+    ShouldSkipJobSearchTopFolder = False
 End Function
 
 Private Sub SearchJobFolderRecursive(ByVal folder As Object, ByVal wantUpper As String, _
@@ -4484,12 +4517,29 @@ Private Sub ComputePullcoreQuote()
 End Sub
 
 ' ============================================================
-' NETWORK-AWARE PUBLISH
+' NETWORK-AWARE PATHS + PUBLISH
 ' Private local folder by default; public company share when on
 ' the company Netgear Wi-Fi. Publishes the job signature CSV (so
 ' Elgin's matcher imports it), plus the filled sheets, dimension
 ' CSVs and ISO images, so all the tools share one location.
 ' ============================================================
+
+Private Function ResolveRootJobPath() As String
+On Error Resume Next
+
+    Dim root As String
+
+    If IsOnCompanyWifi() Then
+        root = PUBLIC_DOWNLOADS_PATH
+    Else
+        root = LOCAL_DOWNLOADS_FALLBACK
+        Dim fso As Object
+        Set fso = CreateObject("Scripting.FileSystemObject")
+        If fso.FolderExists(PUBLIC_DOWNLOADS_PATH) Then root = PUBLIC_DOWNLOADS_PATH
+    End If
+
+    ResolveRootJobPath = root
+End Function
 
 Private Function GetWifiSsidVba() As String
     On Error Resume Next
