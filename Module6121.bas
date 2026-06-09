@@ -32,9 +32,15 @@ Option Explicit
 ' ============================================================
 ' USER SETTINGS
 ' ============================================================
-Private Const ROOT_JOB_PATH As String = "C:\Users\lenovo\Desktop\000000005.May 2026"
+' Job downloads root is resolved at runtime (company share vs local fallback).
+Private Const PUBLIC_DOWNLOADS_PATH As String = "\\Mycloudex2ultra\mexico\Downloads"
+Private Const LOCAL_DOWNLOADS_FALLBACK As String = "C:\Users\lenovo\Desktop"
 Private Const EXTRACT_FOLDER_NAME As String = "_EXTRACTED_ZIP"
 Private Const LOCAL_WORKSPACE_ROOT As String = "C:\CMS_Local_Workspace"
+
+' Limit job-folder search to recent month folders (current + prior months).
+Private Const LIMIT_JOB_SEARCH_TO_RECENT_MONTHS As Boolean = True
+Private Const JOB_SEARCH_RECENT_MONTH_COUNT As Long = 3   ' this month + 2 months before
 
 ' --- Network-aware publishing (private local vs public company share) ---
 ' On the company Netgear Wi-Fi -> publish to the PUBLIC share so the office and
@@ -147,6 +153,17 @@ Private Const POTBLOCK_STEEL_TYPE As String = "#2 4140"
 Private Const QUOTE_ROUND_UP_TO_QUARTER As Boolean = True
 Private Const xlCalculationManual As Long = -4135
 
+' --- Pot-block plate library (learns plate roles from prior matched jobs) ---
+Private Const USE_POTBLOCK_PLATE_LIBRARY As Boolean = True
+Private Const LEARN_POTBLOCK_PLATE_LIBRARY As Boolean = True
+Private Const POTBLOCK_PLATE_LIBRARY_FILE As String = "CMS_PotBlock_Plate_Library.csv"
+Private Const PLATE_LIB_MAX_SINGLE_DIM_DIFF_IN As Double = 0.75
+Private Const PLATE_LIB_MAX_TOTAL_DIM_DIFF_IN As Double = 1.75
+Private Const PLATE_LIB_MAX_NORM_DISTANCE As Double = 0.4
+Private Const PLATE_LIB_SCORE_DIM_WEIGHT As Double = 1#
+Private Const PLATE_LIB_SCORE_LOC_WEIGHT As Double = 3#
+Private Const PLATE_LIB_MAX_SCORE As Double = 2.9
+
 ' Pot-block plate name keys (CAD bounding-box matching for the Excel fill)
 Private Const KEYS_TCP As String = "TCP|TOP CLAMP PLATE|TOP CLAMP|ID SMED|TOP SMED|SMED TOP"
 Private Const KEYS_BCP As String = "BCP|BOTTOM CLAMP PLATE|BOTTOM CLAMP|BOT CLAMP|OD SMED|BOTTOM SMED|SMED BOT"
@@ -201,6 +218,21 @@ Private Type ExportInfo
     BomLength As Double
     HasBomDims As Boolean
     Status As String
+End Type
+
+Private Type PotBlockPlateLibEntry
+    plateRole As String
+    Length As Double
+    Width As Double
+    Thickness As Double
+    CenterX As Double
+    CenterY As Double
+    CenterZ As Double
+    NormX As Double
+    NormY As Double
+    NormZ As Double
+    sourceJob As String
+    sourceComponent As String
 End Type
 
 ' --- Globals ---
@@ -277,7 +309,7 @@ On Error GoTo ErrHandler
 
     LogLine "========================================"
     LogLine "BASE EXPORT MACRO STARTED"
-    LogLine "Root path: " & ROOT_JOB_PATH
+    LogLine "Root path: " & ResolveRootJobPath()
     LogLine "========================================"
 
     Dim jobInput As String
@@ -367,7 +399,7 @@ On Error GoTo ErrHandler
     JobBaseName = ""
 
     LogStart "Find job folder"
-    NetworkJobFolder = FindJobFolderByText(ROOT_JOB_PATH, CurrentJobNumber)
+    NetworkJobFolder = FindJobFolderByText(ResolveRootJobPath(), CurrentJobNumber)
     LogLine "Job folder result: " & NetworkJobFolder
     If NetworkJobFolder = "" Then
         LogErrorText "Could not find job folder for: " & CurrentJobNumber
@@ -450,6 +482,7 @@ On Error GoTo ErrHandler
     ScanActiveSolidWorksDocument
     SortPartsByVolumeDescending
     ClassifyPotBlockPlatesFromCad
+    ApplyPotBlockPlateLibraryFallback
     LogLine "CAD PartCount=" & PartCount
     WritePartDimensionCsv CurrentJobFolder & "\XT_Export_CAD_Dimensions.csv"
     LogDone "Scan CAD parts"
@@ -485,6 +518,9 @@ On Error GoTo ErrHandler
     ExportCount = 0
     ReDim ExportRows(1 To 1)
     BuildExportRowsFromBom
+    RefinePotBlockPlatesFromBomMatches
+    ApplyPotBlockPlateLibraryFallback
+    If LEARN_POTBLOCK_PLATE_LIBRARY Then LearnPotBlockPlateLibraryFromCurrentJob
     WriteExportCheckCsv CurrentJobFolder & "\XT_Export_BOM_Match_Report.csv"
     LogLine "ExportCount=" & ExportCount
     LogDone "Match BOM to CAD"
@@ -880,6 +916,97 @@ End Sub
 ' ============================================================
 ' FIND JOB FOLDER (by C number)
 ' ============================================================
+
+Private Function ResolveRootJobPath() As String
+    On Error Resume Next
+    Dim root As String
+    If IsOnCompanyWifi() Then
+        root = PUBLIC_DOWNLOADS_PATH
+    Else
+        root = LOCAL_DOWNLOADS_FALLBACK
+        Dim fso As Object
+        Set fso = CreateObject("Scripting.FileSystemObject")
+        If fso.FolderExists(PUBLIC_DOWNLOADS_PATH) Then root = PUBLIC_DOWNLOADS_PATH
+    End If
+    ResolveRootJobPath = root
+End Function
+
+Private Function TryParseJobFolderDate(ByVal folderName As String, ByRef outDate As Date) As Boolean
+On Error GoTo ErrHandler
+    TryParseJobFolderDate = False
+    Dim re As Object
+    Set re = CreateObject("VBScript.RegExp")
+    re.Global = True
+    re.IgnoreCase = True
+    re.Pattern = "(\d{1,2})[-\/](\d{1,2})[-\/](\d{2,4})"
+    Dim matches As Object
+    Set matches = re.Execute(folderName)
+    If matches.Count = 0 Then Exit Function
+    Dim m As Object
+    Set m = matches(matches.Count - 1)
+    Dim mo As Long, dy As Long, yr As Long
+    mo = CLng(Val(m.SubMatches(0)))
+    dy = CLng(Val(m.SubMatches(1)))
+    yr = CLng(Val(m.SubMatches(2)))
+    If yr > 0 And yr < 100 Then yr = 2000 + yr
+    If mo >= 1 And mo <= 12 And dy >= 1 And dy <= 31 And yr >= 1990 And yr <= 2100 Then
+        outDate = DateSerial(yr, mo, dy)
+        TryParseJobFolderDate = True
+    End If
+    Exit Function
+ErrHandler:
+    TryParseJobFolderDate = False
+End Function
+
+Private Function GetJobFolderMatchScore(ByVal folderName As String, _
+                                        ByVal wantUpper As String, _
+                                        ByVal depth As Long) As Long
+On Error GoTo ErrHandler
+    GetJobFolderMatchScore = -1
+    Dim nameUpper As String
+    nameUpper = UCase(Trim(folderName))
+    Dim score As Long
+    score = -1
+    If nameUpper = wantUpper Then
+        score = 1000 - depth
+    ElseIf InStr(nameUpper, wantUpper) > 0 Then
+        score = 500 - (depth * 20) - Abs(Len(nameUpper) - Len(wantUpper))
+    End If
+    If score < 0 Then Exit Function
+    If InStr(nameUpper, "CHANGE") > 0 Or InStr(nameUpper, "CHANGES") > 0 Or _
+       InStr(nameUpper, "UPDATED") > 0 Or InStr(nameUpper, "UPDATE") > 0 Then
+        score = score + 5000
+    End If
+    Dim folderDate As Date
+    If TryParseJobFolderDate(folderName, folderDate) Then
+        score = score + CLng(CDbl(folderDate))
+    End If
+    GetJobFolderMatchScore = score
+    Exit Function
+ErrHandler:
+    GetJobFolderMatchScore = -1
+End Function
+
+Private Function ShouldSkipJobSearchTopFolder(ByVal folderName As String, ByVal wantUpper As String) As Boolean
+On Error GoTo ErrHandler
+    ShouldSkipJobSearchTopFolder = False
+    If LIMIT_JOB_SEARCH_TO_RECENT_MONTHS = False Then Exit Function
+    If JOB_SEARCH_RECENT_MONTH_COUNT <= 0 Then Exit Function
+    Dim n As String
+    n = UCase(folderName)
+    If InStr(n, wantUpper) > 0 Then Exit Function
+    Dim m As Long
+    For m = 0 To JOB_SEARCH_RECENT_MONTH_COUNT - 1
+        Dim monthLabel As String
+        monthLabel = UCase(Format(DateAdd("m", -m, Date), "mmmm yyyy"))
+        If InStr(n, monthLabel) > 0 Then Exit Function
+    Next m
+    ShouldSkipJobSearchTopFolder = True
+    Exit Function
+ErrHandler:
+    ShouldSkipJobSearchTopFolder = False
+End Function
+
 Private Function FindJobFolderByText(ByVal rootPath As String, ByVal searchText As String) As String
 On Error GoTo ErrHandler
     Dim fso As Object
@@ -897,17 +1024,11 @@ On Error GoTo ErrHandler
     bestPath = ""
     bestScore = -1
     Dim subFolder As Object
-    Dim nameUpper As String
     Dim score As Long
     For Each subFolder In root.SubFolders
-        nameUpper = UCase(subFolder.Name)
-        If nameUpper = UCase(EXTRACT_FOLDER_NAME) Then GoTo NextTop
-        score = -1
-        If nameUpper = wantUpper Then
-            score = 1000
-        ElseIf InStr(nameUpper, wantUpper) > 0 Then
-            score = 500 - Abs(Len(nameUpper) - Len(wantUpper))
-        End If
+        If ShouldSkipJobSearchTopFolder(subFolder.Name, wantUpper) Then GoTo NextTop
+        If UCase(subFolder.Name) = UCase(EXTRACT_FOLDER_NAME) Then GoTo NextTop
+        score = GetJobFolderMatchScore(subFolder.Name, wantUpper, 0)
         If score > bestScore Then
             bestScore = score
             bestPath = subFolder.path
@@ -915,17 +1036,22 @@ On Error GoTo ErrHandler
 NextTop:
     Next subFolder
     If bestPath <> "" Then
+        LogLine "Selected job folder (score=" & CStr(bestScore) & "): " & bestPath
         FindJobFolderByText = bestPath
         Exit Function
     End If
     For Each subFolder In root.SubFolders
-        nameUpper = UCase(subFolder.Name)
-        If nameUpper <> UCase(EXTRACT_FOLDER_NAME) Then
-            SearchJobFolderRecursive subFolder, wantUpper, 1, bestPath, bestScore
+        If ShouldSkipJobSearchTopFolder(subFolder.Name, wantUpper) = False Then
+            If UCase(subFolder.Name) <> UCase(EXTRACT_FOLDER_NAME) Then
+                SearchJobFolderRecursive subFolder, wantUpper, 1, bestPath, bestScore
+            End If
         End If
     Next subFolder
     If bestPath = "" Then
         If InStr(UCase(root.Name), wantUpper) > 0 Then bestPath = rootPath
+    End If
+    If bestPath <> "" Then
+        LogLine "Selected job folder (score=" & CStr(bestScore) & "): " & bestPath
     End If
     FindJobFolderByText = bestPath
     Exit Function
@@ -940,17 +1066,10 @@ On Error Resume Next
     If folder Is Nothing Then Exit Sub
     If depth > 3 Then Exit Sub
     Dim subFolder As Object
-    Dim nameUpper As String
     Dim score As Long
     For Each subFolder In folder.SubFolders
-        nameUpper = UCase(subFolder.Name)
-        If nameUpper = UCase(EXTRACT_FOLDER_NAME) Then GoTo NextSub
-        score = -1
-        If nameUpper = wantUpper Then
-            score = 1000 - depth
-        ElseIf InStr(nameUpper, wantUpper) > 0 Then
-            score = 500 - (depth * 20) - Abs(Len(nameUpper) - Len(wantUpper))
-        End If
+        If UCase(subFolder.Name) = UCase(EXTRACT_FOLDER_NAME) Then GoTo NextSub
+        score = GetJobFolderMatchScore(subFolder.Name, wantUpper, depth)
         If score > bestScore Then
             bestScore = score
             bestPath = subFolder.path
@@ -4482,6 +4601,472 @@ Private Sub ComputePullcoreQuote()
             " cuin x $" & PULLCORE_RATE & " = $" & FormatNumberForCsv(totVol * PULLCORE_RATE)
     WritePullcorePriceFile
 End Sub
+
+' ============================================================
+' POT-BLOCK PLATE LIBRARY
+' Learns the six plate roles from matched jobs and fills gaps when
+' geometry classification or BOM matching is incomplete.
+' ============================================================
+
+Private Function GetPotBlockPlateLibraryPath() As String
+On Error GoTo ErrHandler
+    Dim root As String
+    root = ResolveMatchingRoot()
+    If root = "" Then root = LOCAL_WORKSPACE_ROOT
+    EnsureFolderDeep root
+    GetPotBlockPlateLibraryPath = root & "\" & POTBLOCK_PLATE_LIBRARY_FILE
+    Exit Function
+ErrHandler:
+    GetPotBlockPlateLibraryPath = LOCAL_WORKSPACE_ROOT & "\" & POTBLOCK_PLATE_LIBRARY_FILE
+End Function
+
+Private Sub EnsurePotBlockPlateLibraryHeader(ByVal libPath As String)
+On Error GoTo ErrHandler
+    If libPath = "" Then Exit Sub
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    EnsureFolderDeep fso.GetParentFolderName(libPath)
+    If fso.FileExists(libPath) Then Exit Sub
+    Dim f As Integer
+    f = FreeFile
+    Open libPath For Output As #f
+    Print #f, "Version,JobNumber,PlateRole,Length,Width,Thickness,CenterX,CenterY,CenterZ,NormX,NormY,NormZ,ComponentName,LearnedOn"
+    Close #f
+    LogLine "Created pot-block plate library: " & libPath
+    Exit Sub
+ErrHandler:
+    LogLine "EnsurePotBlockPlateLibraryHeader error: " & Err.Description
+    On Error Resume Next
+    Close #f
+End Sub
+
+Private Function PlateRoleKeyFromQuoteName(ByVal quoteName As String) As String
+    Dim k As String
+    k = NormalizeKey(quoteName)
+    Select Case k
+        Case "TCP": PlateRoleKeyFromQuoteName = "TCP"
+        Case "BCP": PlateRoleKeyFromQuoteName = "BCP"
+        Case "IDHOLDER": PlateRoleKeyFromQuoteName = "ID HOLDER"
+        Case "ODHOLDER": PlateRoleKeyFromQuoteName = "OD HOLDER"
+        Case "IDPOT": PlateRoleKeyFromQuoteName = "ID POT"
+        Case "ODPOT": PlateRoleKeyFromQuoteName = "OD POT"
+    End Select
+End Function
+
+Private Function GetPlateRoleGeometryIndex(ByVal plateRole As String) As Long
+    Select Case NormalizeKey(plateRole)
+        Case "TCP": GetPlateRoleGeometryIndex = gIdxTCP
+        Case "BCP": GetPlateRoleGeometryIndex = gIdxBCP
+        Case "IDHOLDER": GetPlateRoleGeometryIndex = gIdxIDH
+        Case "ODHOLDER": GetPlateRoleGeometryIndex = gIdxODH
+        Case "IDPOT": GetPlateRoleGeometryIndex = gIdxIDP
+        Case "ODPOT": GetPlateRoleGeometryIndex = gIdxODP
+    End Select
+End Function
+
+Private Sub SetPlateRoleGeometryIndex(ByVal plateRole As String, ByVal idx As Long)
+    Select Case NormalizeKey(plateRole)
+        Case "TCP": gIdxTCP = idx
+        Case "BCP": gIdxBCP = idx
+        Case "IDHOLDER": gIdxIDH = idx
+        Case "ODHOLDER": gIdxODH = idx
+        Case "IDPOT": gIdxIDP = idx
+        Case "ODPOT": gIdxODP = idx
+    End Select
+End Sub
+
+Private Sub RefinePotBlockPlatesFromBomMatches()
+On Error GoTo ErrHandler
+    Dim i As Long, roleKey As String
+    For i = 1 To ExportCount
+        If ExportRows(i).HasCad Then
+            roleKey = PlateRoleKeyFromQuoteName(ExportRows(i).quoteName)
+            If roleKey <> "" Then SetPlateRoleGeometryIndex roleKey, ExportRows(i).CadPartIndex
+        End If
+    Next i
+    Exit Sub
+ErrHandler:
+    LogLine "RefinePotBlockPlatesFromBomMatches error: " & Err.Description
+End Sub
+
+Private Sub LearnPotBlockPlateLibraryFromCurrentJob()
+On Error GoTo ErrHandler
+    If USE_POTBLOCK_PLATE_LIBRARY = False Then Exit Sub
+    If LEARN_POTBLOCK_PLATE_LIBRARY = False Then Exit Sub
+    If PartCount <= 0 Then Exit Sub
+    Dim libPath As String
+    libPath = GetPotBlockPlateLibraryPath()
+    EnsurePotBlockPlateLibraryHeader libPath
+    Dim existing As Object
+    Set existing = LoadPotBlockPlateLibraryKeyDict(libPath)
+    Dim f As Integer
+    f = FreeFile
+    Open libPath For Append As #f
+    Dim learnedCount As Long
+    learnedCount = 0
+    Dim roles As Variant
+    roles = Array("TCP", "BCP", "ID HOLDER", "OD HOLDER", "ID POT", "OD POT")
+    Dim i As Long, idx As Long
+    For i = LBound(roles) To UBound(roles)
+        idx = GetPlateRoleGeometryIndex(CStr(roles(i)))
+        If idx > 0 Then
+            If AppendPotBlockPlateLibraryRow(f, existing, CStr(roles(i)), idx) Then learnedCount = learnedCount + 1
+        End If
+    Next i
+    Close #f
+    LogLine "Pot-block plate library learned rows=" & learnedCount
+    LogLine "Pot-block plate library path: " & libPath
+    Exit Sub
+ErrHandler:
+    LogLine "LearnPotBlockPlateLibraryFromCurrentJob error: " & Err.Description
+    On Error Resume Next
+    Close #f
+End Sub
+
+Private Function AppendPotBlockPlateLibraryRow(ByVal f As Integer, _
+                                               ByVal existing As Object, _
+                                               ByVal plateRole As String, _
+                                               ByVal cadIdx As Long) As Boolean
+On Error GoTo ErrHandler
+    AppendPotBlockPlateLibraryRow = False
+    If cadIdx <= 0 Or cadIdx > PartCount Then Exit Function
+    If Trim(plateRole) = "" Then Exit Function
+    Dim key As String
+    key = CurrentJobNumber & "|" & NormalizeKey(plateRole) & "|" & NormalizeKey(parts(cadIdx).componentName)
+    If Not existing Is Nothing Then
+        If existing.Exists(key) Then Exit Function
+    End If
+    Dim cx As Double, cy As Double, cz As Double
+    Dim nx As Double, ny As Double, nz As Double
+    cx = 0#: cy = 0#: cz = 0#
+    nx = 0.5: ny = 0.5: nz = 0.5
+    TryGetPlateLibCenterPointInches cadIdx, cx, cy, cz
+    TryGetCurrentPartNormLocation cadIdx, nx, ny, nz
+    Print #f, CsvText("1") & "," & _
+              CsvText(CurrentJobNumber) & "," & _
+              CsvText(plateRole) & "," & _
+              FormatNumberForCsv(parts(cadIdx).Length) & "," & _
+              FormatNumberForCsv(parts(cadIdx).Width) & "," & _
+              FormatNumberForCsv(parts(cadIdx).Thickness) & "," & _
+              FormatNumberForCsv(cx) & "," & _
+              FormatNumberForCsv(cy) & "," & _
+              FormatNumberForCsv(cz) & "," & _
+              FormatNumberForCsv(nx) & "," & _
+              FormatNumberForCsv(ny) & "," & _
+              FormatNumberForCsv(nz) & "," & _
+              CsvText(parts(cadIdx).componentName) & "," & _
+              CsvText(Format(Now, "yyyy-mm-dd hh:nn:ss"))
+    If Not existing Is Nothing Then existing(key) = True
+    LogLine "Plate library learned: " & plateRole & " -> " & parts(cadIdx).componentName
+    AppendPotBlockPlateLibraryRow = True
+    Exit Function
+ErrHandler:
+    LogLine "AppendPotBlockPlateLibraryRow error: " & Err.Description
+    AppendPotBlockPlateLibraryRow = False
+End Function
+
+Private Function LoadPotBlockPlateLibraryKeyDict(ByVal libPath As String) As Object
+On Error GoTo ErrHandler
+    Dim dict As Object
+    Set dict = CreateObject("Scripting.Dictionary")
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    If fso.FileExists(libPath) = False Then
+        Set LoadPotBlockPlateLibraryKeyDict = dict
+        Exit Function
+    End If
+    Dim ts As Object
+    Set ts = fso.OpenTextFile(libPath, 1, False)
+    Dim line As String, fields As Collection, key As String
+    If Not ts.AtEndOfStream Then line = ts.ReadLine
+    Do While Not ts.AtEndOfStream
+        line = ts.ReadLine
+        Set fields = CsvSplitToCollection(line)
+        If Not fields Is Nothing Then
+            If fields.Count >= 13 Then
+                key = CStr(fields(2)) & "|" & NormalizeKey(CStr(fields(3))) & "|" & NormalizeKey(CStr(fields(13)))
+                dict(key) = True
+            End If
+        End If
+    Loop
+    ts.Close
+    Set LoadPotBlockPlateLibraryKeyDict = dict
+    Exit Function
+ErrHandler:
+    Set LoadPotBlockPlateLibraryKeyDict = CreateObject("Scripting.Dictionary")
+End Function
+
+Private Function LoadPotBlockPlateLibrary(ByRef lib() As PotBlockPlateLibEntry, ByRef libCount As Long) As Boolean
+On Error GoTo ErrHandler
+    LoadPotBlockPlateLibrary = False
+    libCount = 0
+    ReDim lib(1 To 1)
+    Dim libPath As String
+    libPath = GetPotBlockPlateLibraryPath()
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    If fso.FileExists(libPath) = False Then
+        LogLine "Pot-block plate library not found: " & libPath
+        Exit Function
+    End If
+    Dim ts As Object
+    Set ts = fso.OpenTextFile(libPath, 1, False)
+    Dim line As String, fields As Collection
+    If Not ts.AtEndOfStream Then line = ts.ReadLine
+    Do While Not ts.AtEndOfStream
+        line = ts.ReadLine
+        If Trim(line) <> "" Then
+            Set fields = CsvSplitToCollection(line)
+            If Not fields Is Nothing Then
+                If fields.Count >= 13 Then
+                    If Val(CStr(fields(4))) > 0 And Val(CStr(fields(5))) > 0 And Val(CStr(fields(6))) > 0 Then
+                        libCount = libCount + 1
+                        ReDim Preserve lib(1 To libCount)
+                        lib(libCount).sourceJob = CStr(fields(2))
+                        lib(libCount).plateRole = CStr(fields(3))
+                        lib(libCount).Length = CDbl(Val(CStr(fields(4))))
+                        lib(libCount).Width = CDbl(Val(CStr(fields(5))))
+                        lib(libCount).Thickness = CDbl(Val(CStr(fields(6))))
+                        lib(libCount).CenterX = CDbl(Val(CStr(fields(7))))
+                        lib(libCount).CenterY = CDbl(Val(CStr(fields(8))))
+                        lib(libCount).CenterZ = CDbl(Val(CStr(fields(9))))
+                        lib(libCount).NormX = CDbl(Val(CStr(fields(10))))
+                        lib(libCount).NormY = CDbl(Val(CStr(fields(11))))
+                        lib(libCount).NormZ = CDbl(Val(CStr(fields(12))))
+                        lib(libCount).sourceComponent = CStr(fields(13))
+                    End If
+                End If
+            End If
+        End If
+    Loop
+    ts.Close
+    LoadPotBlockPlateLibrary = (libCount > 0)
+    LogLine "Loaded pot-block plate library rows=" & libCount & " from " & libPath
+    Exit Function
+ErrHandler:
+    LogLine "LoadPotBlockPlateLibrary error: " & Err.Description
+    LoadPotBlockPlateLibrary = False
+    libCount = 0
+End Function
+
+Private Sub ApplyPotBlockPlateLibraryFallback()
+On Error GoTo ErrHandler
+    If USE_POTBLOCK_PLATE_LIBRARY = False Then Exit Sub
+    If PartCount <= 0 Then Exit Sub
+    Dim lib() As PotBlockPlateLibEntry
+    Dim libCount As Long
+    If LoadPotBlockPlateLibrary(lib, libCount) = False Then Exit Sub
+    Dim roles As Variant
+    roles = Array("TCP", "BCP", "ID HOLDER", "OD HOLDER", "ID POT", "OD POT")
+    Dim usedPart() As Boolean
+    ReDim usedPart(1 To PartCount)
+    Dim i As Long, ri As Long, roleName As String, bestIdx As Long, bestScore As Double
+    Dim matchedCount As Long
+    matchedCount = 0
+    For ri = LBound(roles) To UBound(roles)
+        roleName = CStr(roles(ri))
+        If GetPlateRoleGeometryIndex(roleName) > 0 Then
+            usedPart(GetPlateRoleGeometryIndex(roleName)) = True
+        End If
+    Next ri
+    For ri = LBound(roles) To UBound(roles)
+        roleName = CStr(roles(ri))
+        If GetPlateRoleGeometryIndex(roleName) = 0 Then
+            If FindBestLibraryPartForPlateRole(roleName, lib, libCount, usedPart, bestIdx, bestScore) Then
+                SetPlateRoleGeometryIndex roleName, bestIdx
+                usedPart(bestIdx) = True
+                matchedCount = matchedCount + 1
+                LogLine "Plate library matched " & roleName & " -> " & parts(bestIdx).componentName & _
+                        " score=" & FormatNumberForCsv(bestScore)
+            End If
+        End If
+    Next ri
+    If matchedCount > 0 Then
+        LogLine "Pot-block plate library fallback matched count=" & matchedCount
+    End If
+    Exit Sub
+ErrHandler:
+    LogLine "ApplyPotBlockPlateLibraryFallback error: " & Err.Description
+End Sub
+
+Private Function FindBestLibraryPartForPlateRole(ByVal plateRole As String, _
+                                                 ByRef lib() As PotBlockPlateLibEntry, _
+                                                 ByVal libCount As Long, _
+                                                 ByRef usedPart() As Boolean, _
+                                                 ByRef bestIdx As Long, _
+                                                 ByRef bestScore As Double) As Boolean
+On Error GoTo ErrHandler
+    FindBestLibraryPartForPlateRole = False
+    bestIdx = 0
+    bestScore = 1E+99
+    If libCount <= 0 Then Exit Function
+    Dim roleKey As String
+    roleKey = NormalizeKey(plateRole)
+    Dim i As Long, j As Long, sc As Double, dimDiff As Double, locDist As Double
+    For i = 1 To PartCount
+        If usedPart(i) = False Then
+            For j = 1 To libCount
+                If NormalizeKey(lib(j).plateRole) = roleKey Then
+                    sc = PlateLibScoreForPart(i, lib(j), dimDiff, locDist)
+                    If sc < bestScore Then
+                        bestScore = sc
+                        bestIdx = i
+                    End If
+                End If
+            Next j
+        End If
+    Next i
+    If bestIdx > 0 And bestScore <= PLATE_LIB_MAX_SCORE Then
+        FindBestLibraryPartForPlateRole = True
+    End If
+    Exit Function
+ErrHandler:
+    FindBestLibraryPartForPlateRole = False
+End Function
+
+Private Function PlateLibScoreForPart(ByVal cadIdx As Long, _
+                                      ByRef e As PotBlockPlateLibEntry, _
+                                      ByRef dimDiff As Double, _
+                                      ByRef locDist As Double) As Double
+On Error GoTo ErrHandler
+    PlateLibScoreForPart = 1E+99
+    If cadIdx <= 0 Or cadIdx > PartCount Then Exit Function
+    dimDiff = Abs(parts(cadIdx).Length - e.Length) + _
+              Abs(parts(cadIdx).Width - e.Width) + _
+              Abs(parts(cadIdx).Thickness - e.Thickness)
+    If Abs(parts(cadIdx).Length - e.Length) > PLATE_LIB_MAX_SINGLE_DIM_DIFF_IN Then Exit Function
+    If Abs(parts(cadIdx).Width - e.Width) > PLATE_LIB_MAX_SINGLE_DIM_DIFF_IN Then Exit Function
+    If Abs(parts(cadIdx).Thickness - e.Thickness) > PLATE_LIB_MAX_SINGLE_DIM_DIFF_IN Then Exit Function
+    If dimDiff > PLATE_LIB_MAX_TOTAL_DIM_DIFF_IN Then Exit Function
+    locDist = 1E+99
+    Dim nx As Double, ny As Double, nz As Double
+    If TryGetCurrentPartNormLocation(cadIdx, nx, ny, nz) Then
+        locDist = Sqr((nx - e.NormX) ^ 2 + (ny - e.NormY) ^ 2 + (nz - e.NormZ) ^ 2)
+        If locDist > PLATE_LIB_MAX_NORM_DISTANCE Then Exit Function
+    Else
+        locDist = 0.5
+    End If
+    PlateLibScoreForPart = (dimDiff * PLATE_LIB_SCORE_DIM_WEIGHT) + (locDist * PLATE_LIB_SCORE_LOC_WEIGHT)
+    Exit Function
+ErrHandler:
+    PlateLibScoreForPart = 1E+99
+End Function
+
+Private Function TryGetPlateLibCenterPointInches(ByVal cadIdx As Long, _
+                                                 ByRef cx As Double, _
+                                                 ByRef cy As Double, _
+                                                 ByRef cz As Double) As Boolean
+On Error GoTo ErrHandler
+    TryGetPlateLibCenterPointInches = False
+    cx = 0#: cy = 0#: cz = 0#
+    If cadIdx <= 0 Or cadIdx > PartCount Then Exit Function
+    If parts(cadIdx).hasAsmCenter Then
+        cx = parts(cadIdx).AsmCenterX
+        cy = parts(cadIdx).AsmCenterY
+        cz = parts(cadIdx).AsmCenterZ
+        TryGetPlateLibCenterPointInches = True
+    End If
+    Exit Function
+ErrHandler:
+    TryGetPlateLibCenterPointInches = False
+End Function
+
+Private Function TryGetCurrentPartNormLocation(ByVal cadIdx As Long, _
+                                               ByRef nx As Double, _
+                                               ByRef ny As Double, _
+                                               ByRef nz As Double) As Boolean
+On Error GoTo ErrHandler
+    TryGetCurrentPartNormLocation = False
+    If cadIdx <= 0 Or cadIdx > PartCount Then Exit Function
+    Dim minX As Double, minY As Double, minZ As Double
+    Dim maxX As Double, maxY As Double, maxZ As Double
+    If TryGetCurrentCadCenterBounds(minX, minY, minZ, maxX, maxY, maxZ) = False Then Exit Function
+    Dim cx As Double, cy As Double, cz As Double
+    If TryGetPlateLibCenterPointInches(cadIdx, cx, cy, cz) = False Then Exit Function
+    nx = 0.5: ny = 0.5: nz = 0.5
+    If Abs(maxX - minX) > 0.000001 Then nx = (cx - minX) / (maxX - minX)
+    If Abs(maxY - minY) > 0.000001 Then ny = (cy - minY) / (maxY - minY)
+    If Abs(maxZ - minZ) > 0.000001 Then nz = (cz - minZ) / (maxZ - minZ)
+    If nx < 0# Then nx = 0#
+    If nx > 1# Then nx = 1#
+    If ny < 0# Then ny = 0#
+    If ny > 1# Then ny = 1#
+    If nz < 0# Then nz = 0#
+    If nz > 1# Then nz = 1#
+    TryGetCurrentPartNormLocation = True
+    Exit Function
+ErrHandler:
+    TryGetCurrentPartNormLocation = False
+End Function
+
+Private Function TryGetCurrentCadCenterBounds(ByRef minX As Double, _
+                                              ByRef minY As Double, _
+                                              ByRef minZ As Double, _
+                                              ByRef maxX As Double, _
+                                              ByRef maxY As Double, _
+                                              ByRef maxZ As Double) As Boolean
+On Error GoTo ErrHandler
+    TryGetCurrentCadCenterBounds = False
+    Dim firstVal As Boolean
+    firstVal = True
+    Dim i As Long, cx As Double, cy As Double, cz As Double
+    For i = 1 To PartCount
+        If TryGetPlateLibCenterPointInches(i, cx, cy, cz) Then
+            If firstVal Then
+                minX = cx: maxX = cx
+                minY = cy: maxY = cy
+                minZ = cz: maxZ = cz
+                firstVal = False
+            Else
+                If cx < minX Then minX = cx
+                If cx > maxX Then maxX = cx
+                If cy < minY Then minY = cy
+                If cy > maxY Then maxY = cy
+                If cz < minZ Then minZ = cz
+                If cz > maxZ Then maxZ = cz
+            End If
+        End If
+    Next i
+    TryGetCurrentCadCenterBounds = Not firstVal
+    Exit Function
+ErrHandler:
+    TryGetCurrentCadCenterBounds = False
+End Function
+
+Private Function CsvSplitToCollection(ByVal line As String) As Collection
+On Error GoTo ErrHandler
+    Dim result As New Collection
+    Dim i As Long, ch As String, token As String, inQuotes As Boolean
+    token = ""
+    inQuotes = False
+    i = 1
+    Do While i <= Len(line)
+        ch = Mid(line, i, 1)
+        If ch = Chr(34) Then
+            If inQuotes And i < Len(line) Then
+                If Mid(line, i + 1, 1) = Chr(34) Then
+                    token = token & Chr(34)
+                    i = i + 1
+                Else
+                    inQuotes = False
+                End If
+            Else
+                inQuotes = True
+            End If
+        ElseIf ch = "," And inQuotes = False Then
+            result.Add token
+            token = ""
+        Else
+            token = token & ch
+        End If
+        i = i + 1
+    Loop
+    result.Add token
+    Set CsvSplitToCollection = result
+    Exit Function
+ErrHandler:
+    Set CsvSplitToCollection = New Collection
+End Function
 
 ' ============================================================
 ' NETWORK-AWARE PUBLISH
