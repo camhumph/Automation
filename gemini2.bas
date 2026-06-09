@@ -50,7 +50,8 @@ Private Const PUBLISH_OUTPUTS As Boolean = True
 Private Const AUTO_UPLOAD_JOB_SIGNATURE_TO_ELGIN As Boolean = True
 Private Const ELGIN_API_BASE_URL As String = "http://localhost:2926"
 Private Const ELGIN_SIGNATURE_API_KEY As String = "cms-signature-upload"
-Private Const LIMIT_JOB_SEARCH_TO_CURRENT_AND_PREVIOUS_MONTH As Boolean = True
+' Current month plus JOB_SEARCH_MONTHS_BACK prior months (see MODULE6121).
+Private Const LIMIT_JOB_SEARCH_TO_RECENT_MONTHS As Boolean = True
 
 Private Const PUSH_OUTPUTS_TO_NETWORK As Boolean = False
 Private Const DELETE_EXTRACTED_ZIP_AFTER_FLATTEN As Boolean = True
@@ -642,7 +643,14 @@ On Error GoTo ErrHandler
     LogLine "Auto-label pullcore ID/OD by height: " & CStr(AUTO_LABEL_PULLCORE_ID_OD_BY_HEIGHT)
     LogLine "OD holder center rotation deg: " & CStr(OD_HOLDER_CENTER_ROTATION_DEG)
     LogLine "FORCE_ALL_DXF_VIEWS_1_TO_1: " & CStr(FORCE_ALL_DXF_VIEWS_1_TO_1)
+    LogLine "Job search month window (MODULE6121): " & CStr(JOB_SEARCH_MONTHS_BACK + 1) & " months"
     LogLine "========================================"
+
+    If M6121_SEED_LIBRARY_FROM_RECENT_JOBS Then
+        LogStart "Seed CAD naming library from recent jobs (MODULE6121)"
+        SeedCadNamingLibraryFromRecentJobs
+        LogDone "Seed CAD naming library from recent jobs (MODULE6121)"
+    End If
 
     Dim jobInput As String
     jobInput = Trim(InputBox("Enter one or multiple job numbers/search texts." & vbCrLf & _
@@ -15930,21 +15938,9 @@ On Error GoTo ErrHandler
 
     ShouldSkipJobSearchTopFolder = False
 
-    If LIMIT_JOB_SEARCH_TO_CURRENT_AND_PREVIOUS_MONTH = False Then Exit Function
+    If LIMIT_JOB_SEARCH_TO_RECENT_MONTHS = False Then Exit Function
 
-    Dim n As String
-    n = UCase(folderName)
-
-    If InStr(n, wantUpper) > 0 Then Exit Function
-
-    Dim currentMonth As String
-    Dim previousMonth As String
-
-    currentMonth = UCase(Format(Date, "mmmm yyyy"))
-    previousMonth = UCase(Format(DateAdd("m", -1, Date), "mmmm yyyy"))
-
-    If InStr(n, currentMonth) > 0 Then Exit Function
-    If InStr(n, previousMonth) > 0 Then Exit Function
+    If JobSearchTopFolderIsAllowed(folderName, wantUpper) Then Exit Function
 
     ShouldSkipJobSearchTopFolder = True
     Exit Function
