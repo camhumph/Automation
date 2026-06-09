@@ -117,7 +117,7 @@ logger = logging.getLogger(APP_SLUG)
 # Force with ELGIN_NETWORK_MODE = auto | local | company
 # ============================================================
 ELGIN_COMPANY_SSID = os.environ.get("ELGIN_COMPANY_SSID", "NETGEAR")
-ELGIN_NETWORK_MODE = os.environ.get("ELGIN_NETWORK_MODE", "auto").strip().lower()
+ELGIN_NETWORK_MODE = os.environ.get("ELGIN_NETWORK_MODE", "company").strip().lower()
 ELGIN_PUBLIC_DATA_ROOT = os.environ.get(
     "ELGIN_PUBLIC_DATA_ROOT",
     r"\\Mycloudex2ultra\mexico\Cameron's stuff\Matching software",
@@ -173,11 +173,21 @@ logger.info(
     ELGIN_MATCHING_SOFTWARE_DIR, ELGIN_NETWORK_MODE, ELGIN_CMS_ON_COMPANY,
 )
 
+# Force Elgin CMS / Match Studio default storage to the shared Matching software folder.
+# Environment variables can still override if needed.
+if "ELGIN_DB_PATH" not in os.environ and "NEXUS_DB_PATH" not in os.environ:
+    DB_PATH = os.path.join(ELGIN_MATCHING_SOFTWARE_DIR, "shop_analytics_pro.db")
 
 HTTPS_CERT_FILE = os.environ.get("ELGIN_SSL_CERT", os.environ.get("NEXUS_SSL_CERT", ""))
 HTTPS_KEY_FILE = os.environ.get("ELGIN_SSL_KEY", os.environ.get("NEXUS_SSL_KEY", ""))
 
-UPLOAD_DIR = os.environ.get("ELGIN_UPLOAD_DIR", os.environ.get("NEXUS_UPLOAD_DIR", "uploads"))
+UPLOAD_DIR = os.environ.get(
+    "ELGIN_UPLOAD_DIR",
+    os.environ.get(
+        "NEXUS_UPLOAD_DIR",
+        os.path.join(ELGIN_MATCHING_SOFTWARE_DIR, "_uploads"),
+    ),
+)
 STEEL_UPLOAD_DIR = os.path.join(UPLOAD_DIR, "steel_sheets")
 os.makedirs(STEEL_UPLOAD_DIR, exist_ok=True)
 
@@ -253,6 +263,11 @@ JOB_SIGNATURE_COMPONENT_ALIASES = {
 }
 
 JOB_SIGNATURE_DEFAULT_LIMIT = int(os.environ.get("ELGIN_JOB_SIGNATURE_MATCH_LIMIT", "10"))
+
+# Tolerance bands for signature matching — differences within these bands are forgiven.
+SIGNATURE_MATCH_SIZE_TOLERANCE = float(os.environ.get("ELGIN_SIGNATURE_SIZE_TOLERANCE", "0.08"))
+SIGNATURE_MATCH_MASS_TOLERANCE = float(os.environ.get("ELGIN_SIGNATURE_MASS_TOLERANCE", "0.15"))
+SIGNATURE_MATCH_CENTER_TOLERANCE = float(os.environ.get("ELGIN_SIGNATURE_CENTER_TOLERANCE", "0.15"))
 
 
 # ============================================================
@@ -4692,10 +4707,27 @@ def _relative_diff(a: float, b: float, floor: float = 0.001) -> float:
     return abs(a - b) / denom
 
 
+def _tolerant_diff(raw_diff: float, tolerance: float) -> float:
+    """Forgive differences within tolerance; scale remaining gap above the band."""
+    raw_diff = max(0.0, float(raw_diff or 0))
+    tolerance = max(0.0, float(tolerance or 0))
+    if tolerance <= 0:
+        return raw_diff
+    if raw_diff <= tolerance:
+        return 0.0
+    return (raw_diff - tolerance) / max(1.0 - tolerance, 0.001)
+
+
 def compare_signature_component(current: dict, candidate: dict) -> dict:
     dims = ["length", "width", "thickness"]
-    size_diff = sum(_relative_diff(current.get(k), candidate.get(k), 0.25) for k in dims) / 3.0
-    mass_diff = _relative_diff(current.get("mass"), candidate.get("mass"), 0.1)
+    size_diff = sum(
+        _tolerant_diff(_relative_diff(current.get(k), candidate.get(k), 0.25), SIGNATURE_MATCH_SIZE_TOLERANCE)
+        for k in dims
+    ) / 3.0
+    mass_diff = _tolerant_diff(
+        _relative_diff(current.get("mass"), candidate.get("mass"), 0.1),
+        SIGNATURE_MATCH_MASS_TOLERANCE,
+    )
 
     center_distance = math.sqrt(
         (float(current.get("center_x") or 0) - float(candidate.get("center_x") or 0)) ** 2 +
@@ -4704,10 +4736,13 @@ def compare_signature_component(current: dict, candidate: dict) -> dict:
     )
     cur_diag = math.sqrt(sum(float(current.get(k) or 0) ** 2 for k in dims))
     cand_diag = math.sqrt(sum(float(candidate.get(k) or 0) ** 2 for k in dims))
-    center_diff = center_distance / max((cur_diag + cand_diag) / 2.0, 1.0)
+    center_diff = _tolerant_diff(
+        center_distance / max((cur_diag + cand_diag) / 2.0, 1.0),
+        SIGNATURE_MATCH_CENTER_TOLERANCE,
+    )
 
     # Lower score is better. Size and mass dominate; center/COG separates same-size stacks.
-    diff_score = (0.45 * size_diff) + (0.35 * mass_diff) + (0.20 * center_diff)
+    diff_score = (0.40 * size_diff) + (0.25 * mass_diff) + (0.35 * center_diff)
     similarity = max(0.0, min(100.0, 100.0 * (1.0 - diff_score)))
 
     return {
@@ -11409,7 +11444,7 @@ function renderSignatureMatches(payload){
         <div><span style="color:var(--dim)">#${idx+1}</span> <span style="color:var(--blue);font-weight:900;font-size:1.15rem">J${esc(m.job_num||'')}</span> <span style="color:var(--dim)">components ${m.matched_components||0}/6, coverage ${coverage}%</span></div>
         <div style="font-size:1.35rem;color:${signatureScoreColor(m.score)};font-weight:900">${Number(m.score||0).toFixed(1)}%</div>
       </div>
-      <div style="overflow:auto;margin-top:10px"><table class="itable"><thead><tr><th>PART</th><th>MATCH</th><th>CURRENT DIMS / OLD DIMS</th><th>CURRENT MASS / OLD MASS</th><th>CURRENT CENTER / OLD CENTER</th><th>SIZE DIFF</th><th>MASS DIFF</th><th>CENTER DIST</th></tr></thead><tbody>${comps}</tbody></table></div>
+      <div style="overflow:auto;margin-top:10px"><table class="itable"><thead><tr><th>PART</th><th>MATCH</th><th>CURRENT DIMS / OLD DIMS</th><th>CURRENT MASS / OLD MASS</th><th>CURRENT COM / OLD COM</th><th>SIZE DIFF</th><th>MASS DIFF</th><th>COM DIST</th></tr></thead><tbody>${comps}</tbody></table></div>
       ${missing}
     </div>`;
   }).join('');
@@ -11780,15 +11815,22 @@ ELGIN_STEEL_VENDOR_EMAIL = os.environ.get("ELGIN_STEEL_VENDOR_EMAIL", "steel-ven
 ELGIN_STEEL_PRICE_PER_LB = float(os.environ.get("ELGIN_STEEL_PRICE_PER_LB", "1.50"))
 ELGIN_STEEL_DENSITY_LB_IN3 = float(os.environ.get("ELGIN_STEEL_DENSITY_LB_IN3", "0.283"))
 ELGIN_PULLCORE_RATE = float(os.environ.get("ELGIN_PULLCORE_RATE", "77.98"))
+ELGIN_LOCAL_WORKSPACE_ROOT = os.environ.get("ELGIN_LOCAL_WORKSPACE_ROOT", r"C:\CMS_Local_Workspace")
+_default_img_dirs = ";".join(
+    p for p in [ELGIN_MATCHING_SOFTWARE_DIR, ELGIN_LOCAL_WORKSPACE_ROOT, ELGIN_PRIVATE_DATA_ROOT] if p
+)
 ELGIN_JOB_IMAGE_DIRS = [
-    p.strip() for p in os.environ.get("ELGIN_JOB_IMAGE_DIRS", ELGIN_MATCHING_SOFTWARE_DIR).split(";") if p.strip()
+    p.strip() for p in os.environ.get("ELGIN_JOB_IMAGE_DIRS", _default_img_dirs).split(";") if p.strip()
 ]
 ELGIN_QUOTE_SHEET_DIRS = [
-    p.strip() for p in os.environ.get("ELGIN_QUOTE_SHEET_DIRS", ELGIN_MATCHING_SOFTWARE_DIR).split(";") if p.strip()
+    p.strip() for p in os.environ.get("ELGIN_QUOTE_SHEET_DIRS", _default_img_dirs).split(";") if p.strip()
 ]
 _MS_IMG_EXTS = (".jpg", ".jpeg", ".png", ".gif", ".webp")
+_MS_MODEL_EXTS = (".stl", ".obj", ".igs", ".iges", ".step", ".stp", ".easm", ".x_t", ".xt")
 _MS_SHEET_EXTS = (".xls", ".xlsx", ".xlsm", ".pdf")
 _ms_img_cache = {}
+_ms_model_cache = {}
+_MS_COMPONENT_KINDS = ("TCP", "BCP", "ID HOLDER", "OD HOLDER", "ID POT", "OD POT")
 
 
 def ms_fmt_num(v) -> str:
@@ -11801,27 +11843,98 @@ def ms_fmt_num(v) -> str:
     return ("%.3f" % f).rstrip("0").rstrip(".")
 
 
-def ms_classify_image(fn: str) -> str:
-    u = fn.upper()
-    if "HOLDER" in u and ("OD" in u or "BOT" in u):
-        return "OD HOLDER"
-    if "HOLDER" in u and ("ID" in u or "TOP" in u):
-        return "ID HOLDER"
-    if "HOLDER" in u:
-        return "ID HOLDER"
-    if "POT" in u and ("OD" in u or "BOT" in u):
-        return "OD POT"
-    if "POT" in u and ("ID" in u or "TOP" in u):
+def ms_classify_component_filename(fn: str) -> str:
+    """Map a job artifact filename to Match Studio component kind."""
+    fnu = fn.upper()
+    u = fnu.replace("_", " ")
+    compact = re.sub(r"[^A-Z0-9]", "", u)
+
+    # Combined ID+OD holders.
+    if "_HOLDERS_" in fnu or ("HOLDERS" in compact and "IDHOLDER" not in compact and "ODHOLDER" not in compact):
+        return "HOLDERS"
+
+    if "IDPOT" in compact or ("POT" in u and "ID" in u and "OD" not in u):
         return "ID POT"
-    if "TCP" in u or "TOP CLAMP" in u:
+
+    if "ODPOT" in compact or ("POT" in u and ("OD" in u or "BOT" in u)):
+        return "OD POT"
+
+    if "TCP" in u or "TOPSMED" in compact or "TOP CLAMP" in u:
         return "TCP"
-    if "BCP" in u or "BOTTOM CLAMP" in u:
+
+    if "BCP" in u or "BOTTOMSMED" in compact or "BOTTOM CLAMP" in u or "BOT CLAMP" in u:
         return "BCP"
-    if "BACK" in u and "ISO" in u:
-        return "BACK ISO"
+
+    if "IDHOLDER" in compact or ("HOLDER" in u and "ID" in u and "OD" not in u):
+        return "ID HOLDER"
+
+    if "ODHOLDER" in compact or ("HOLDER" in u and ("OD" in u or "BOT" in u)):
+        return "OD HOLDER"
+
+    if "HOLDER" in u:
+        return "HOLDER"
+
     if "ISO" in u:
         return "ISO"
+
     return "OTHER"
+
+
+def ms_classify_image(fn: str) -> str:
+    return ms_classify_component_filename(fn)
+
+
+def _ms_job_search_roots(job_num: str) -> list[str]:
+    j = normalize_job_num(job_num) or (job_num or "")
+    roots = []
+    seen = set()
+    for base in ELGIN_JOB_IMAGE_DIRS:
+        if not base:
+            continue
+        for cand in (base, os.path.join(base, j), os.path.join(base, "J" + j)):
+            cand = os.path.normpath(cand)
+            if cand in seen:
+                continue
+            seen.add(cand)
+            if os.path.isdir(cand):
+                roots.append(cand)
+    local_job = os.path.join(ELGIN_LOCAL_WORKSPACE_ROOT, j)
+    if os.path.isdir(local_job) and local_job not in seen:
+        roots.append(local_job)
+    for sub in (f"{j} STL", f"J{j} STL", f"{j} HOLDERS", f"J{j} HOLDERS", f"{j} Base", f"J{j} Base", f"{j} PRINTS"):
+        cand = os.path.join(local_job, sub)
+        cand = os.path.normpath(cand)
+        if cand in seen:
+            continue
+        if os.path.isdir(cand):
+            seen.add(cand)
+            roots.append(cand)
+    return roots
+
+
+def _ms_walk_job_files(job_num: str, allowed_exts: tuple[str, ...], limit: int = 12000):
+    jnorm = re.sub(r"[^A-Z0-9]", "", (normalize_job_num(job_num) or job_num or "").upper())
+    if not jnorm:
+        return
+    scanned = 0
+    for base in _ms_job_search_roots(job_num):
+        for root, dirs, files in os.walk(base):
+            depth = root[len(base):].count(os.sep) if root.startswith(base) else root.count(os.sep)
+            if depth > 5:
+                dirs[:] = []
+                continue
+            for fn in files:
+                ext = os.path.splitext(fn)[1].lower()
+                if ext not in allowed_exts:
+                    continue
+                fnnorm = re.sub(r"[^A-Z0-9]", "", fn.upper())
+                # Accept files named with the job number OR anything inside the job folder.
+                in_job_folder = jnorm in re.sub(r"[^A-Z0-9]", "", root.upper())
+                if jnorm in fnnorm or in_job_folder:
+                    yield os.path.join(root, fn), fn
+                scanned += 1
+                if scanned >= limit:
+                    return
 
 
 def ms_find_job_images(job_num: str):
@@ -11832,41 +11945,120 @@ def ms_find_job_images(job_num: str):
     if cached and (now - cached[0]) < 30:
         return cached[1]
 
-    jnorm = re.sub(r"[^A-Z0-9]", "", key)
     found = []
     seen = set()
-    if jnorm:
-        for base in ELGIN_JOB_IMAGE_DIRS:
-            if not base or not os.path.isdir(base):
-                continue
-            scanned = 0
-            for root, dirs, files in os.walk(base):
-                depth = root[len(base):].count(os.sep)
-                if depth > 4:
-                    dirs[:] = []
-                    continue
-                for fn in files:
-                    ext = os.path.splitext(fn)[1].lower()
-                    if ext not in _MS_IMG_EXTS:
-                        continue
-                    fnnorm = re.sub(r"[^A-Z0-9]", "", fn.upper())
-                    if jnorm in fnnorm:
-                        full = os.path.join(root, fn)
-                        if full in seen:
-                            continue
-                        seen.add(full)
-                        found.append({"kind": ms_classify_image(fn), "label": fn, "path": full})
-                    scanned += 1
-                    if scanned > 8000:
-                        break
-                if scanned > 8000:
-                    break
+    for full, fn in _ms_walk_job_files(job_num, _MS_IMG_EXTS):
+        if full in seen:
+            continue
+        seen.add(full)
+        kind = ms_classify_image(fn)
+        found.append({"kind": kind, "label": fn, "path": full})
 
-    order = {"ID HOLDER": 0, "OD HOLDER": 1, "ID POT": 2, "OD POT": 3,
-             "TCP": 4, "BCP": 5, "ISO": 6, "BACK ISO": 7, "OTHER": 9}
-    found.sort(key=lambda x: (order.get(x["kind"], 8), x["label"]))
+    def _img_sort_key(x: dict) -> tuple:
+        fnu = x["label"].upper().replace("_", " ")
+        order = {"ID HOLDER": 0, "OD HOLDER": 1, "ID POT": 2, "OD POT": 3,
+                 "TCP": 4, "BCP": 5, "ISO": 6, "BACK ISO": 7, "OTHER": 9}
+        # Per-component ISO JPG from macro: J8454_OD HOLDER ISO.jpg
+        iso_rank = 0 if (" ISO." in fnu or " ISO " in fnu or fnu.endswith(" ISO")) else 1
+        return (order.get(x["kind"], 8), iso_rank, x["label"].lower())
+
+    found.sort(key=_img_sort_key)
     _ms_img_cache[key] = (now, found)
     return found
+
+
+def ms_find_job_models(job_num: str, kind: str = "") -> list[dict]:
+    """
+    Match Studio model finder.
+
+    Priority:
+    1. New J#### STL folder files.
+    2. STL/OBJ display meshes.
+    3. IGS/IGES/STEP fallback.
+    4. For ID/OD holder, fallback to combined HOLDERS if individual holder STL is missing.
+    """
+    j = normalize_job_num(job_num) or (job_num or "")
+    requested_kind = (kind or "").strip().upper()
+
+    want = requested_kind
+
+    cache_key = (j.upper(), want)
+    now = time.time()
+
+    cached = _ms_model_cache.get(cache_key)
+    if cached and (now - cached[0]) < 30:
+        return cached[1]
+
+    found = []
+    seen = set()
+
+    for full, fn in _ms_walk_job_files(job_num, _MS_MODEL_EXTS):
+        if full in seen:
+            continue
+
+        seen.add(full)
+
+        ck = ms_classify_component_filename(fn)
+
+        if want:
+            if ck != want:
+                # Holder fallback: if individual holder STL is missing, allow combined HOLDERS.
+                if not (want in ("ID HOLDER", "OD HOLDER") and ck == "HOLDERS"):
+                    continue
+
+        ext = os.path.splitext(fn)[1].lower()
+
+        found.append({
+            "kind": ck,
+            "label": fn,
+            "path": full,
+            "format": ext.lstrip("."),
+        })
+
+    fmt_rank = {
+        ".stl": 0,
+        ".obj": 1,
+        ".igs": 2,
+        ".iges": 2,
+        ".step": 3,
+        ".stp": 3,
+        ".easm": 9,
+        ".x_t": 9,
+        ".xt": 9,
+    }
+
+    def _model_sort_key(x: dict) -> tuple:
+        fnu = x["label"].upper()
+        pth = x["path"].upper()
+        ext = "." + x["format"].lower()
+
+        stl_folder_token = f"{j} STL".upper()
+        in_stl_folder_bonus = 0 if stl_folder_token in pth else 3
+
+        format_rank = fmt_rank.get(ext, 8)
+
+        # Exact component STL beats combined HOLDERS fallback.
+        exact_kind_bonus = 0 if x["kind"] == want else 5
+
+        base_penalty = 10 if "_BASE_" in fnu else 0
+
+        return (
+            in_stl_folder_bonus,
+            exact_kind_bonus,
+            format_rank,
+            base_penalty,
+            x["label"].lower(),
+        )
+
+    found.sort(key=_model_sort_key)
+
+    _ms_model_cache[cache_key] = (now, found)
+    return found
+
+
+def ms_pick_best_model(job_num: str, kind: str) -> str:
+    models = ms_find_job_models(job_num, kind)
+    return models[0]["path"] if models else ""
 
 
 def ms_locate_sheet(j: str, kind: str) -> str:
@@ -12102,6 +12294,68 @@ async def ms_image(job: str, kind: str = "", i: int = 0):
     return FileResponse(path)
 
 
+@app.get("/api/match/models/{job_num}")
+async def ms_models_list(job_num: str, kind: str = ""):
+    models = ms_find_job_models(job_num, kind)
+    return {
+        "job_num": normalize_job_num(job_num),
+        "kind": kind,
+        "models": [{"kind": m["kind"], "label": m["label"], "format": m["format"]} for m in models],
+        "count": len(models),
+    }
+
+
+@app.get("/api/match/model")
+async def ms_model_file(job: str, kind: str = "", i: int = 0):
+    from fastapi.responses import FileResponse
+
+    models = ms_find_job_models(job, kind)
+
+    if not models:
+        raise HTTPException(
+            404,
+            f"No 3D model found for job {job}, kind {kind}",
+        )
+
+    idx = max(0, min(int(i), len(models) - 1))
+    path = models[idx]["path"]
+
+    if not os.path.isfile(path):
+        raise HTTPException(404, "Model file missing")
+
+    return FileResponse(
+        path,
+        filename=os.path.basename(path),
+        media_type="application/octet-stream",
+    )
+
+
+@app.get("/api/match/model-meta")
+async def ms_model_meta(job: str, kind: str = "", i: int = 0):
+    models = ms_find_job_models(job, kind)
+
+    if not models:
+        raise HTTPException(
+            404,
+            f"No model found for job {job}, kind {kind}",
+        )
+
+    idx = max(0, min(int(i), len(models) - 1))
+    m = models[idx]
+    lookup_kind = (kind or "").strip().upper()
+
+    return {
+        "job": normalize_job_num(job),
+        "requested_kind": kind,
+        "lookup_kind": lookup_kind,
+        "kind": m["kind"],
+        "label": m["label"],
+        "format": m["format"],
+        "path": m["path"],
+        "url": f"/api/match/model?job={normalize_job_num(job)}&kind={lookup_kind}&i={idx}",
+    }
+
+
 @app.get("/api/match/file")
 async def ms_file(job: str, kind: str = "steel"):
     from fastapi.responses import FileResponse
@@ -12148,6 +12402,14 @@ MATCH_STUDIO_HTML = r"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>CMS Match Studio</title>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
 <style>
 :root{
   --bg:#0b1220; --panel:#111a2e; --panel2:#0f1729; --line:#22304d;
@@ -12210,6 +12472,12 @@ select.dd{background:var(--panel2);border:1px solid var(--line);color:var(--ink)
 .ovstage{display:grid;grid-template-columns:1fr;gap:14px}
 .ovwrap{position:relative;width:100%;max-width:680px;margin:0 auto;border:1px solid var(--line);border-radius:12px;background:#0a101e;min-height:240px;display:flex;align-items:center;justify-content:center;overflow:hidden}
 .ovimg{max-width:100%;display:block}
+.ms3d{width:100%;max-width:900px;margin:14px auto 0;border:1px solid var(--line);border-radius:12px;background:#070d18;min-height:400px;position:relative;overflow:hidden;touch-action:none;cursor:grab}
+.ms3d:active{cursor:grabbing}
+.ms3d canvas{display:block;width:100%!important;height:400px!important}
+.ms3d .ms3d-legend{position:absolute;left:10px;bottom:10px;display:flex;flex-wrap:wrap;gap:10px;font-size:11px;color:var(--muted);background:rgba(0,0,0,.55);padding:6px 10px;border-radius:8px;pointer-events:none}
+.ms3d .ms3d-hint{position:absolute;right:10px;top:10px;font-size:11px;color:var(--muted);background:rgba(0,0,0,.45);padding:5px 9px;border-radius:8px;pointer-events:none}
+.ms3d .dot{width:10px;height:10px;border-radius:50%;display:inline-block;margin-right:4px}
 .ovtop{position:absolute;inset:0;margin:auto;max-width:100%;max-height:100%;mix-blend-mode:normal}
 .sbs{display:grid;grid-template-columns:1fr 1fr;gap:14px}
 .imgbox{border:1px solid var(--line);border-radius:12px;background:#0a101e;min-height:220px;display:flex;flex-direction:column}
@@ -12252,15 +12520,83 @@ code{background:#0a101e;border:1px solid var(--line);padding:1px 6px;border-radi
 </div>
 
 <script>
-var STATE={jobs:[],job:null,data:null,match:null,cmpKind:'ID HOLDER',cmpMode:'overlay',imgCur:{},imgMatch:{}};
+var STATE={jobs:[],job:null,data:null,match:null,cmpKind:'ID HOLDER',cmpMode:'igs'};
 var COMPONENTS=['TCP','BCP','ID HOLDER','OD HOLDER','ID POT','OD POT'];
+
+var COMPONENT_MODEL_KINDS=[
+  'ID POT',
+  'OD POT',
+  'BCP',
+  'TCP',
+  'ID HOLDER',
+  'OD HOLDER'
+];
+
+function isModelCompareKind(k){
+  return COMPONENT_MODEL_KINDS.indexOf(k)>=0;
+}
 
 function api(p){return fetch(p).then(function(r){if(!r.ok)throw new Error(r.status);return r.json();});}
 function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
 function money(v){var n=Number(v||0);return '$'+n.toLocaleString(undefined,{minimumFractionDigits:0,maximumFractionDigits:0});}
 function money2(v){var n=Number(v||0);return '$'+n.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});}
 function scoreColor(s){var h=Math.max(0,Math.min(120,(Number(s)||0)*1.2));return 'hsl('+h+',75%,52%)';}
-function imgURL(job,kind){return '/api/match/image?job='+encodeURIComponent(job)+'&kind='+encodeURIComponent(kind)+'&i=0';}
+function modelLookupKind(kind){
+  return String(kind||'').toUpperCase().trim();
+}
+
+function modelURL(job,kind){
+  var lookupKind=modelLookupKind(kind);
+  return '/api/match/model?job='+encodeURIComponent(job)+'&kind='+encodeURIComponent(lookupKind)+'&i=0';
+}
+
+function modelMetaURL(job,kind){
+  var lookupKind=modelLookupKind(kind);
+  return '/api/match/model-meta?job='+encodeURIComponent(job)+'&kind='+encodeURIComponent(lookupKind)+'&i=0';
+}
+
+async function loadThreeDeps(){
+  var bases=[
+    { three:'three', orbit:'three/addons/controls/OrbitControls.js' },
+    {
+      three:'https://esm.sh/three@0.160.0',
+      orbit:'https://esm.sh/three@0.160.0/examples/jsm/controls/OrbitControls.js'
+    }
+  ];
+  var lastErr=null;
+  for(var i=0;i<bases.length;i++){
+    try{
+      var THREE=await import(bases[i].three);
+      var ocMod=await import(bases[i].orbit);
+      var OrbitControls=ocMod.OrbitControls;
+      if(!OrbitControls) throw new Error('OrbitControls missing');
+      return { THREE:THREE, OrbitControls:OrbitControls };
+    }catch(e){ lastErr=e; }
+  }
+  throw lastErr||new Error('three.js failed to load');
+}
+
+async function initOcctImportJs(){
+  var bases=['https://esm.sh/occt-import-js@0.0.22','https://cdn.jsdelivr.net/npm/occt-import-js@0.0.22/dist/occt-import-js.js'];
+  var lastErr=null;
+  for(var bi=0;bi<bases.length;bi++){
+    try{
+      var occMod=await import(bases[bi]);
+      var factory=occMod.default||occMod.occtimportjs||occMod;
+      if(factory && typeof factory!=='function' && typeof factory.default==='function') factory=factory.default;
+      if(typeof factory!=='function'){
+        for(var k in occMod){ if(typeof occMod[k]==='function'){ factory=occMod[k]; break; } }
+      }
+      if(typeof factory!=='function') throw new Error('no occt factory');
+      var wasmBase='https://cdn.jsdelivr.net/npm/occt-import-js@0.0.22/dist/';
+      var occt=await factory({ locateFile:function(p){ return wasmBase+p; } });
+      if(occt && typeof occt.then==='function') occt=await occt;
+      if(!occt || typeof occt.ReadIgesFile!=='function') throw new Error('occt API missing');
+      return occt;
+    }catch(e){ lastErr=e; }
+  }
+  throw lastErr||new Error('occt-import-js failed to load');
+}
 
 function loadOverview(){
   api('/api/match/overview?limit=120').then(function(d){
@@ -12358,59 +12694,406 @@ function selectMatch(mj){
 
 function renderCompare(m){
   var rows=(m.components||[]).slice().sort(function(a,b){return COMPONENTS.indexOf(a.component_role)-COMPONENTS.indexOf(b.component_role);});
-  var tbl='<table class="tbl"><thead><tr><th>Component</th><th>Similarity</th><th>Size &Delta;</th><th>Mass &Delta;</th><th>COG dist</th></tr></thead><tbody>';
+
+  var tbl='<table class="tbl"><thead><tr>' +
+    '<th>Component</th>' +
+    '<th>Similarity</th>' +
+    '<th>Size &Delta;</th>' +
+    '<th>Mass &Delta;</th>' +
+    '<th>COM dist</th>' +
+    '</tr></thead><tbody>';
+
   rows.forEach(function(c){
     var s=Number(c.similarity||0);
     tbl+='<tr><td><b>'+esc(c.component_role)+'</b></td>'
-      +'<td><div style="display:flex;align-items:center;gap:8px"><div class="simbar"><i style="width:'+s+'%;background:'+scoreColor(s)+'"></i></div><span>'+s.toFixed(1)+'%</span></div></td>'
-      +'<td>'+(c.size_diff_pct)+'%</td><td>'+(c.mass_diff_pct)+'%</td><td>'+(c.center_distance_in)+'"</td></tr>';
+      +'<td><div style="display:flex;align-items:center;gap:8px">'
+      +'<div class="simbar"><i style="width:'+s+'%;background:'+scoreColor(s)+'"></i></div>'
+      +'<span>'+s.toFixed(1)+'%</span></div></td>'
+      +'<td>'+(c.size_diff_pct)+'%</td>'
+      +'<td>'+(c.mass_diff_pct)+'%</td>'
+      +'<td>'+(c.center_distance_in)+'"</td></tr>';
   });
+
   tbl+='</tbody></table>';
 
-  var chips=COMPONENTS.map(function(k){
+  var chips=COMPONENT_MODEL_KINDS.map(function(k){
     return '<button class="chipbtn'+(STATE.cmpKind===k?' active':'')+'" onclick="setCmpKind(\''+k+'\')">'+k+'</button>';
   }).join('');
 
-  var html='<div class="card"><div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">'
-    +'<h2>Compare: '+esc(STATE.job)+' vs '+esc(m.job_num)+'</h2>'
-    +'<div class="toggle"><button class="chipbtn'+(STATE.cmpMode==='overlay'?' active':'')+'" onclick="setCmpMode(\'overlay\')">Overlay</button>'
-    +'<button class="chipbtn'+(STATE.cmpMode==='sbs'?' active':'')+'" onclick="setCmpMode(\'sbs\')">Side by side</button></div></div>'
-    +tbl
-    +'<div style="margin-top:16px"><div class="muted" style="font-size:12px;text-transform:uppercase;letter-spacing:.6px;margin-bottom:8px">Holder / plate overlay</div>'
-    +'<div class="cmpbar">'+chips+'</div>'
-    +'<div id="ovStage"></div></div></div>';
+  var html=
+    '<div class="card">' +
+      '<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">' +
+        '<h2>Compare STL: '+esc(STATE.job)+' vs '+esc(m.job_num)+'</h2>' +
+        '<span class="pill">STL / IGS</span>' +
+      '</div>' +
+      tbl +
+      '<div style="margin-top:16px">' +
+        '<div class="muted" style="font-size:12px;text-transform:uppercase;letter-spacing:.6px;margin-bottom:8px">' +
+          'STL overlay — no JPEG comparison' +
+        '</div>' +
+        '<div class="cmpbar">'+chips+'</div>' +
+        '<div id="ovStage"></div>' +
+      '</div>' +
+    '</div>';
+
   document.getElementById('compareHost').innerHTML=html;
   renderOverlay(m);
 }
 
 function setCmpKind(k){STATE.cmpKind=k;var m=curMatch();if(m){renderCompare(m);}}
-function setCmpMode(md){STATE.cmpMode=md;var m=curMatch();if(m){renderOverlay(m);document.querySelectorAll('.toggle .chipbtn').forEach(function(b){b.classList.toggle('active',b.textContent.toLowerCase().indexOf(md==='sbs'?'side':'overlay')>=0);});}}
 function curMatch(){return (STATE.data.matches||[]).filter(function(x){return x.job_num===STATE.match;})[0];}
 
-function imgTag(job,kind,cls){
-  var u=imgURL(job,kind);
-  return '<img class="'+cls+'" src="'+u+'" onerror="this.style.display=\'none\';this.parentNode.querySelector(\'.ph\')&&(this.parentNode.querySelector(\'.ph\').style.display=\'block\')">';
+function renderOverlay(m){
+  var k=STATE.cmpKind;
+  var stage=document.getElementById('ovStage');
+
+  if(!isModelCompareKind(k)){
+    stage.innerHTML =
+      '<div class="note">' +
+      'STL overlay comparison is enabled for the six Match Studio components.' +
+      '</div>';
+    return;
+  }
+
+  stage.innerHTML =
+    '<div class="ovstage">' +
+      '<div class="legend">' +
+        '<b>'+esc(k)+'</b> compare uses the exported STL package in <b>J#### STL</b>. ' +
+        'Current job is blue/cyan. Matched job is orange/yellow. ' +
+        'Drag to spin, scroll to zoom. No JPEGs are used.' +
+      '</div>' +
+      '<div class="ms3d" id="ms3dHost">' +
+        '<div class="muted" style="padding:18px">Loading STL overlay…</div>' +
+      '</div>' +
+      '<div id="ms3dFileInfo" class="note"></div>' +
+    '</div>';
+
+  loadMs3dOverlay(STATE.job, m.job_num, k, 'ms3dHost');
 }
 
-function renderOverlay(m){
-  var k=STATE.cmpKind, stage=document.getElementById('ovStage');
-  if(STATE.cmpMode==='sbs'){
-    stage.innerHTML='<div class="sbs">'
-      +'<div class="imgbox"><div class="cap"><span>'+esc(STATE.job)+' (current)</span><span>'+esc(k)+'</span></div><div class="body">'+imgTag(STATE.job,k,'')+'<div class="ph" style="display:none">no '+esc(k)+' image</div></div></div>'
-      +'<div class="imgbox"><div class="cap"><span>'+esc(m.job_num)+' (match)</span><span>'+esc(k)+'</span></div><div class="body">'+imgTag(m.job_num,k,'')+'<div class="ph" style="display:none">no '+esc(k)+' image</div></div></div>'
-      +'</div>';
-  }else{
-    stage.innerHTML='<div class="ovstage">'
-      +'<div class="ovwrap">'
-        +'<img class="ovimg" src="'+imgURL(m.job_num,k)+'" onerror="this.style.visibility=\'hidden\'">'
-        +'<img class="ovimg ovtop" id="ovTop" src="'+imgURL(STATE.job,k)+'" style="opacity:.5" onerror="this.style.visibility=\'hidden\'">'
-        +'<div class="ph" id="ovPh" style="position:absolute">'+esc(k)+' images load here when present</div>'
-      +'</div>'
-      +'<div class="slider"><span class="muted">'+esc(m.job_num)+'</span>'
-        +'<input type="range" min="0" max="100" value="50" oninput="document.getElementById(\'ovTop\').style.opacity=this.value/100">'
-        +'<span class="muted">'+esc(STATE.job)+'</span></div>'
-      +'<div class="legend">Slide to fade between the matched holder (left) and the current holder (right) to judge similarity.</div>'
-    +'</div>';
+async function loadMs3dOverlay(curJob, matchJob, kind, containerId){
+  var host=document.getElementById(containerId);
+  var fileInfo=document.getElementById('ms3dFileInfo');
+
+  if(!host) return;
+
+  var modelKind=modelLookupKind(kind);
+
+  try{
+    var THREE=await import('https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js');
+    var OrbitControls=(await import('https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js')).OrbitControls;
+    var STLLoader=(await import('https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/STLLoader.js')).STLLoader;
+
+    async function fetchModel(job){
+      var metaR=await fetch(modelMetaURL(job,modelKind));
+
+      if(!metaR.ok){
+        return {
+          ok:false,
+          job:job,
+          error:'No model found for '+job+' ('+modelKind+')',
+          meta:null,
+          buf:null
+        };
+      }
+
+      var meta=await metaR.json();
+
+      var bufR=await fetch(meta.url||modelURL(job,modelKind));
+
+      if(!bufR.ok){
+        return {
+          ok:false,
+          job:job,
+          error:'Could not download '+(meta.label||'model'),
+          meta:meta,
+          buf:null
+        };
+      }
+
+      return {
+        ok:true,
+        job:job,
+        buf:await bufR.arrayBuffer(),
+        format:(meta.format||'').toLowerCase(),
+        label:meta.label||'',
+        path:meta.path||'',
+        meta:meta
+      };
+    }
+
+    var mCur=await fetchModel(curJob);
+    var mMatch=await fetchModel(matchJob);
+
+    if(fileInfo){
+      fileInfo.innerHTML =
+        '<div><b>Current job display mesh:</b> ' +
+          (mCur.ok ? esc(mCur.label) : '<span style="color:var(--bad)">'+esc(mCur.error)+'</span>') +
+        '</div>' +
+        '<div><b>Matched job display mesh:</b> ' +
+          (mMatch.ok ? esc(mMatch.label) : '<span style="color:var(--bad)">'+esc(mMatch.error)+'</span>') +
+        '</div>' +
+        '<div class="muted">STL package compare. No JPEGs are used.</div>';
+    }
+
+    if(!mCur.ok && !mMatch.ok){
+      host.innerHTML =
+        '<div class="muted" style="padding:18px">' +
+        'No STL/model found for <b>'+esc(modelKind)+'</b> on either job. Re-run the SolidWorks export and make sure it publishes files into the <code>J#### STL</code> folder.' +
+        '</div>';
+      return;
+    }
+
+    host.innerHTML='';
+
+    var viewH=460;
+    var renderer=new THREE.WebGLRenderer({antialias:true,alpha:true});
+    renderer.setPixelRatio(window.devicePixelRatio||1);
+
+    var scene=new THREE.Scene();
+    scene.background=new THREE.Color(0x070d18);
+
+    var camera=new THREE.PerspectiveCamera(45,(host.clientWidth||860)/viewH,0.1,10000);
+    camera.position.set(120,90,120);
+
+    function resizeRenderer(){
+      var w=host.clientWidth||860;
+      renderer.setSize(w,viewH);
+      camera.aspect=w/viewH;
+      camera.updateProjectionMatrix();
+    }
+
+    host.appendChild(renderer.domElement);
+
+    var controls=new OrbitControls(camera,renderer.domElement);
+    controls.enableDamping=true;
+    controls.dampingFactor=0.08;
+    controls.rotateSpeed=0.9;
+    controls.enablePan=true;
+    controls.enableZoom=true;
+    controls.minDistance=1;
+    controls.maxDistance=5000;
+
+    var light1=new THREE.DirectionalLight(0xffffff,1.2);
+    light1.position.set(1,2,1);
+    scene.add(light1);
+
+    var light2=new THREE.DirectionalLight(0xffffff,0.55);
+    light2.position.set(-1,-1,-2);
+    scene.add(light2);
+
+    scene.add(new THREE.AmbientLight(0xffffff,0.45));
+
+    var occtPromise=null;
+
+    async function getOcct(){
+      if(!occtPromise){
+        occtPromise=initOcctImportJs();
+      }
+      return await occtPromise;
+    }
+
+    async function parseIgesOrStep(model){
+      if(!model || !model.ok || !model.buf) return null;
+
+      var fmt=String(model.format||'').toLowerCase();
+      var u8=new Uint8Array(model.buf);
+      var parsed=null;
+      var occt=await getOcct();
+
+      if(fmt==='igs' || fmt==='iges'){
+        try{
+          parsed=occt.ReadIgesFile(u8);
+        }catch(e1){
+          parsed=null;
+        }
+      }
+
+      if(!parsed || !parsed.meshes || !parsed.meshes.length){
+        if(fmt==='stp' || fmt==='step'){
+          try{
+            parsed=occt.ReadStepFile(u8);
+          }catch(e2){
+            parsed=null;
+          }
+        }
+      }
+
+      if(!parsed || !parsed.meshes || !parsed.meshes.length){
+        try{
+          parsed=occt.ReadIgesFile(u8);
+        }catch(e3){}
+
+        if(!parsed || !parsed.meshes || !parsed.meshes.length){
+          try{
+            parsed=occt.ReadStepFile(u8);
+          }catch(e4){}
+        }
+      }
+
+      return parsed;
+    }
+
+    function addGeometryToGroup(group, geom, solidColor, edgeColor, opacity){
+      if(!geom) return;
+
+      if(!geom.attributes.normal){
+        geom.computeVertexNormals();
+      }
+
+      var mat=new THREE.MeshPhongMaterial({
+        color:solidColor,
+        transparent:true,
+        opacity:opacity,
+        side:THREE.DoubleSide,
+        depthWrite:false,
+        polygonOffset:true,
+        polygonOffsetFactor:1,
+        polygonOffsetUnits:1
+      });
+
+      var mesh=new THREE.Mesh(geom,mat);
+      group.add(mesh);
+
+      try{
+        var edges=new THREE.EdgesGeometry(geom,20);
+        var edgeMat=new THREE.LineBasicMaterial({
+          color:edgeColor,
+          transparent:true,
+          opacity:0.98
+        });
+
+        var edgeLines=new THREE.LineSegments(edges,edgeMat);
+        group.add(edgeLines);
+      }catch(e){}
+    }
+
+    async function addModel(model, solidColor, edgeColor, opacity, label){
+      if(!model || !model.ok || !model.buf) return null;
+
+      var fmt=String(model.format||'').toLowerCase();
+
+      if(fmt==='easm' || fmt==='x_t' || fmt==='xt'){
+        return null;
+      }
+
+      var group=new THREE.Group();
+      group.name=label||'';
+
+      if(fmt==='stl'){
+        try{
+          var loader=new STLLoader();
+          var geom=loader.parse(model.buf);
+          addGeometryToGroup(group, geom, solidColor, edgeColor, opacity);
+        }catch(e){
+          return null;
+        }
+      }else{
+        var parsed=await parseIgesOrStep(model);
+
+        if(!parsed || !parsed.meshes || !parsed.meshes.length){
+          return null;
+        }
+
+        parsed.meshes.forEach(function(mh){
+          var pos=mh.attributes && mh.attributes.position ? mh.attributes.position.array : null;
+
+          if(!pos || !pos.length) return;
+
+          var geom=new THREE.BufferGeometry();
+          geom.setAttribute('position', new THREE.Float32BufferAttribute(pos,3));
+
+          if(mh.attributes && mh.attributes.normal){
+            geom.setAttribute('normal', new THREE.Float32BufferAttribute(mh.attributes.normal.array,3));
+          }
+
+          if(mh.index && mh.index.array){
+            geom.setIndex(mh.index.array);
+          }
+
+          addGeometryToGroup(group, geom, solidColor, edgeColor, opacity);
+        });
+      }
+
+      if(group.children.length<=0){
+        return null;
+      }
+
+      scene.add(group);
+      return group;
+    }
+
+    function centerGroupOnOrigin(group){
+      if(!group) return;
+
+      var b=new THREE.Box3().setFromObject(group);
+      if(b.isEmpty()) return;
+
+      var c=b.getCenter(new THREE.Vector3());
+
+      group.position.x-=c.x;
+      group.position.y-=c.y;
+      group.position.z-=c.z;
+    }
+
+    // Orange/yellow = matched/old job.
+    // Blue/cyan = current/new job.
+    var gMatch=await addModel(mMatch,0xff8c42,0xffd199,0.32,'MATCHED_OLD_JOB');
+    var gCur=await addModel(mCur,0x3b82f6,0x7dd3fc,0.42,'CURRENT_JOB');
+
+    centerGroupOnOrigin(gMatch);
+    centerGroupOnOrigin(gCur);
+
+    var box=new THREE.Box3().setFromObject(scene);
+
+    if(box.isEmpty()){
+      host.innerHTML =
+        '<div class="muted" style="padding:18px">' +
+          '<b>Could not mesh '+esc(modelKind)+'.</b><br><br>' +
+          'The files were found, but no browser-readable mesh was produced.<br>' +
+          'Current file: <code>'+(mCur.ok ? esc(mCur.label) : 'not found')+'</code><br>' +
+          'Matched file: <code>'+(mMatch.ok ? esc(mMatch.label) : 'not found')+'</code><br><br>' +
+          'Fix: re-run the SolidWorks export to publish STL files into the <code>J#### STL</code> folder, then refresh Match Studio.' +
+        '</div>';
+      return;
+    }
+
+    var center=box.getCenter(new THREE.Vector3());
+    var size=box.getSize(new THREE.Vector3());
+    var maxDim=Math.max(size.x,size.y,size.z,1);
+
+    camera.position.copy(center).add(new THREE.Vector3(maxDim*1.45,maxDim,maxDim*1.45));
+    controls.target.copy(center);
+
+    resizeRenderer();
+    window.addEventListener('resize',resizeRenderer);
+
+    var leg=document.createElement('div');
+    leg.className='ms3d-legend';
+    leg.innerHTML =
+      '<span><i class="dot" style="background:#3b82f6"></i>'+esc(curJob)+' current '+esc(modelKind)+'</span>' +
+      '<span><i class="dot" style="background:#ff8c42"></i>'+esc(matchJob)+' matched '+esc(modelKind)+'</span>' +
+      '<span style="color:#8aa0c6">transparent solids + bright wireframe edges</span>';
+    host.appendChild(leg);
+
+    var hint=document.createElement('div');
+    hint.className='ms3d-hint';
+    hint.textContent='Drag to spin · scroll to zoom · '+modelKind;
+    host.appendChild(hint);
+
+    function anim(){
+      requestAnimationFrame(anim);
+      controls.update();
+      renderer.render(scene,camera);
+    }
+
+    anim();
+
+  }catch(err){
+    host.innerHTML =
+      '<div class="muted" style="padding:18px">' +
+      '3D STL overlay unavailable: '+esc(err.message||err)+
+      '</div>';
   }
 }
 
