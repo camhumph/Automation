@@ -193,10 +193,6 @@ Private Const MATCH_STUDIO_STL_MATCH_MAIN_BASE_ORIENTATION As Boolean = True
 ' This is needed because STL does not store named views.
 Private Const POST_ROTATE_STL_TO_CORRECTED_FRONT As Boolean = True
 
-' Use the component's actual assembly transform before applying the corrected BASE STL orientation.
-' This fixes parts that export in their original/local file coordinate system.
-Private Const STL_APPLY_COMPONENT_LOCAL_TO_ASSEMBLY_AXES As Boolean = True
-
 Private Const CREATE_COMPONENT_IGS_WITH_XT As Boolean = False
 Private Const CREATE_COMPONENT_EASM_WITH_XT As Boolean = False
 
@@ -612,8 +608,8 @@ Private CurrentPullcoreStraightenCadIndex As Long
 Private PullCoreDimensionsReportPath As String
 Private PullcoreIdOdHeightAxisUsed As String
 
-Private BaseStlOrientationCaptured As Boolean
-Private BaseStlOrientationM(0 To 8) As Double
+Private FinalStlCoordFrameReady As Boolean
+Private FinalStlCoordM(0 To 8) As Double
 
 ' ============================================================
 ' MAIN - BATCH CONTROLLER
@@ -783,12 +779,12 @@ On Error GoTo ErrHandler
     CurrentPullcoreStraightenCadIndex = 0
     PullCoreDimensionsReportPath = ""
     PullcoreIdOdHeightAxisUsed = ""
-    BaseStlOrientationCaptured = False
+    FinalStlCoordFrameReady = False
 
-    Dim stlMi As Long
-    For stlMi = 0 To 8
-        BaseStlOrientationM(stlMi) = 0#
-    Next stlMi
+    Dim stlCoordI As Long
+    For stlCoordI = 0 To 8
+        FinalStlCoordM(stlCoordI) = 0#
+    Next stlCoordI
 
     MainCadOpenedByMacro = False
     MainCadTitleForClose = ""
@@ -1089,9 +1085,10 @@ On Error GoTo ErrHandler
 
     EnsureCmsTopOrientationFromMatchedTcpBcp swModel, PERSIST_CMS_TOP_AS_STANDARD_VIEWS_BEFORE_BASE_SAVE
 
-    ' Capture the corrected BASE orientation once.
-    ' All Match Studio STLs will be post-rotated into this corrected coordinate frame.
-    CaptureBaseStlOrientationMatrix swModel
+    ' IMPORTANT:
+    ' Capture the final redefined SolidWorks standard-view coordinate system.
+    ' This is the coordinate system all STLs must use.
+    CaptureFinalStandardViewsForStlCoordinateSystem swModel
 
     UnsuppressAllAssemblyComponents swModel
     ShowAllAssemblyComponents swModel
@@ -5553,40 +5550,68 @@ On Error GoTo ErrHandler
 
     Dim orientM(0 To 8) As Double
     Dim gotOrient As Boolean
+    Dim i As Long
 
     gotOrient = False
 
     If MATCH_STUDIO_STL_MATCH_MAIN_BASE_ORIENTATION And POST_ROTATE_STL_TO_CORRECTED_FRONT Then
-        gotOrient = TryCaptureCorrectedFrontOrientationMatrix(model, orientM)
 
-        If gotOrient Then
-            LogLine "STL corrected BASE orientation matrix captured from SolidWorks *Front for: " & label
+        ' Use the one final coordinate frame captured after *Top and *Front were corrected.
+        ' Do NOT use the component's original axes.
+        ' Do NOT use the orientation of the isolated component state.
+        If FinalStlCoordFrameReady Then
+
+            For i = 0 To 8
+                orientM(i) = FinalStlCoordM(i)
+            Next i
+
+            gotOrient = True
+
+            LogLine "STL using FINAL corrected standard-view coordinate system:"
+            LogLine "  Label=" & label
+            LogLine "  Path=" & stlPath
+
         Else
-            LogLine "WARNING: Could not capture corrected *Front matrix for STL: " & label
+
+            LogLine "WARNING: Final STL coordinate system was not captured before STL save."
+            LogLine "Attempting to capture it now from main model/current model."
+
+            If Not swModel Is Nothing Then
+                gotOrient = CaptureFinalStandardViewsForStlCoordinateSystem(swModel)
+            Else
+                gotOrient = CaptureFinalStandardViewsForStlCoordinateSystem(model)
+            End If
+
+            If gotOrient Then
+                For i = 0 To 8
+                    orientM(i) = FinalStlCoordM(i)
+                Next i
+            Else
+                LogLine "WARNING: Could not capture final STL coordinate system. STL may stay in original imported axes."
+            End If
+
         End If
+
     End If
 
-    ' SolidWorks may write the STL using the component's original/local axes.
-    ' Save first, then convert the STL mesh axes into assembly axes using Component.Transform2.
+    ' SolidWorks STL export ignores named views and standard views.
+    ' It writes mesh coordinates in model/original coordinate space.
     SaveModelAs model, stlPath
 
-    If STL_APPLY_COMPONENT_LOCAL_TO_ASSEMBLY_AXES Then
-        If sourceComponentName <> "" Then
-            ApplyComponentAssemblyAxesToStl model, sourceComponentName, stlPath, label
-        Else
-            LogLine "STL component-axis correction skipped for '" & label & "': no source component name."
-        End If
-    End If
-
-    ' Now rotate the assembly-coordinate STL into the corrected BASE orientation.
+    ' Convert exported STL mesh from original model coordinates into your corrected
+    ' Top/Front standard-view coordinate system.
     If gotOrient Then
 
         If ReorientStlFileToMatrix(stlPath, orientM) Then
-            LogLine "STL post-rotated to corrected BASE coordinate system:"
+
+            LogLine "STL post-rotated into FINAL corrected Top/Front coordinate system:"
             LogLine "  " & stlPath
+
         Else
-            LogLine "WARNING: STL corrected BASE post-rotation failed:"
+
+            LogLine "WARNING: STL post-rotation failed:"
             LogLine "  " & stlPath
+
         End If
 
     End If
@@ -5605,11 +5630,11 @@ ErrHandler:
     ApplyCmsTopView model
 End Sub
 
-Private Function CaptureBaseStlOrientationMatrix(ByVal model As Object) As Boolean
+Private Function CaptureFinalStandardViewsForStlCoordinateSystem(ByVal model As Object) As Boolean
 On Error GoTo ErrHandler
 
-    CaptureBaseStlOrientationMatrix = False
-    BaseStlOrientationCaptured = False
+    CaptureFinalStandardViewsForStlCoordinateSystem = False
+    FinalStlCoordFrameReady = False
 
     If model Is Nothing Then Exit Function
 
@@ -5617,43 +5642,74 @@ On Error GoTo ErrHandler
     swApp.ActivateDoc3 model.GetTitle, False, 0, errs
     EnsureSwHidden
 
-    ' Use corrected SolidWorks *Front as the STL coordinate-frame source.
-    ' Earlier code has already redefined *Top and *Front.
-    model.ShowNamedView2 "*Front", 1
-    StabilizeActiveView model, 50
-
+    ' Make sure viewport orientation actually updates even when graphics are frozen/hidden.
     Dim swView As Object
     Set swView = model.ActiveView
 
-    If swView Is Nothing Then Exit Function
+    On Error Resume Next
+    If Not swView Is Nothing Then swView.EnableGraphicsUpdate = True
+    On Error GoTo ErrHandler
+
+    ' Use final corrected SolidWorks *Front.
+    ' Because your macro has already redefined *Top and *Front, this view contains
+    ' the full corrected coordinate frame.
+    model.ShowNamedView2 "*Front", 1
+
+    On Error Resume Next
+    model.ViewZoomtofit2
+    model.GraphicsRedraw2
+    DoEvents
+    WaitMilliseconds 50
+    model.GraphicsRedraw2
+    DoEvents
+    On Error GoTo ErrHandler
+
+    Set swView = model.ActiveView
+
+    If swView Is Nothing Then
+        LogLine "STL coordinate capture failed: ActiveView is Nothing."
+        Exit Function
+    End If
 
     Dim v As Variant
     v = swView.Orientation3.ArrayData
 
-    If IsEmpty(v) Then Exit Function
-    If IsArray(v) = False Then Exit Function
-    If UBound(v) < 8 Then Exit Function
+    If IsEmpty(v) Then
+        LogLine "STL coordinate capture failed: Orientation3.ArrayData is empty."
+        Exit Function
+    End If
+
+    If IsArray(v) = False Then
+        LogLine "STL coordinate capture failed: Orientation3.ArrayData is not an array."
+        Exit Function
+    End If
+
+    If UBound(v) < 8 Then
+        LogLine "STL coordinate capture failed: Orientation matrix has fewer than 9 values."
+        Exit Function
+    End If
 
     Dim i As Long
 
     For i = 0 To 8
-        BaseStlOrientationM(i) = CDbl(v(i))
+        FinalStlCoordM(i) = CDbl(v(i))
     Next i
 
-    BaseStlOrientationCaptured = True
-    CaptureBaseStlOrientationMatrix = True
+    FinalStlCoordFrameReady = True
+    CaptureFinalStandardViewsForStlCoordinateSystem = True
 
-    LogLine "BASE STL orientation matrix captured from corrected SolidWorks *Front:"
-    LogLine "  [" & _
-            FormatNumberForCsv(BaseStlOrientationM(0)) & "," & _
-            FormatNumberForCsv(BaseStlOrientationM(1)) & "," & _
-            FormatNumberForCsv(BaseStlOrientationM(2)) & "; " & _
-            FormatNumberForCsv(BaseStlOrientationM(3)) & "," & _
-            FormatNumberForCsv(BaseStlOrientationM(4)) & "," & _
-            FormatNumberForCsv(BaseStlOrientationM(5)) & "; " & _
-            FormatNumberForCsv(BaseStlOrientationM(6)) & "," & _
-            FormatNumberForCsv(BaseStlOrientationM(7)) & "," & _
-            FormatNumberForCsv(BaseStlOrientationM(8)) & "]"
+    LogLine "FINAL STL coordinate system captured from corrected SolidWorks *Front."
+    LogLine "This is the only orientation matrix that will be used for Match Studio STLs."
+    LogLine "  Matrix=[" & _
+            FormatNumberForCsv(FinalStlCoordM(0)) & "," & _
+            FormatNumberForCsv(FinalStlCoordM(1)) & "," & _
+            FormatNumberForCsv(FinalStlCoordM(2)) & "; " & _
+            FormatNumberForCsv(FinalStlCoordM(3)) & "," & _
+            FormatNumberForCsv(FinalStlCoordM(4)) & "," & _
+            FormatNumberForCsv(FinalStlCoordM(5)) & "; " & _
+            FormatNumberForCsv(FinalStlCoordM(6)) & "," & _
+            FormatNumberForCsv(FinalStlCoordM(7)) & "," & _
+            FormatNumberForCsv(FinalStlCoordM(8)) & "]"
 
 CleanExit:
     On Error Resume Next
@@ -5665,54 +5721,10 @@ CleanExit:
     Exit Function
 
 ErrHandler:
-    LogLine "CaptureBaseStlOrientationMatrix error: " & Err.Description
-    BaseStlOrientationCaptured = False
-    CaptureBaseStlOrientationMatrix = False
+    LogLine "CaptureFinalStandardViewsForStlCoordinateSystem error: " & Err.Description
+    FinalStlCoordFrameReady = False
+    CaptureFinalStandardViewsForStlCoordinateSystem = False
     Resume CleanExit
-End Function
-
-Private Function TryCaptureCorrectedFrontOrientationMatrix(ByVal model As Object, _
-                                                          ByRef m() As Double) As Boolean
-On Error GoTo ErrHandler
-
-    TryCaptureCorrectedFrontOrientationMatrix = False
-
-    If model Is Nothing Then Exit Function
-
-    Dim errs As Long
-    swApp.ActivateDoc3 model.GetTitle, False, 0, errs
-    EnsureSwHidden
-
-    ' Important:
-    ' This assumes your earlier front-definition logic has already persisted
-    ' the desired orientation as SolidWorks *Front.
-    model.ShowNamedView2 "*Front", 1
-    StabilizeActiveView model, 50
-
-    Dim swView As Object
-    Set swView = model.ActiveView
-
-    If swView Is Nothing Then Exit Function
-
-    Dim v As Variant
-    v = swView.Orientation3.ArrayData
-
-    If IsEmpty(v) Then Exit Function
-    If IsArray(v) = False Then Exit Function
-    If UBound(v) < 8 Then Exit Function
-
-    Dim i As Long
-
-    For i = 0 To 8
-        m(i) = CDbl(v(i))
-    Next i
-
-    TryCaptureCorrectedFrontOrientationMatrix = True
-    Exit Function
-
-ErrHandler:
-    LogLine "TryCaptureCorrectedFrontOrientationMatrix error: " & Err.Description
-    TryCaptureCorrectedFrontOrientationMatrix = False
 End Function
 
 Private Function ReorientBinaryStlFileToMatrix(ByVal stlPath As String, _
@@ -6081,526 +6093,6 @@ On Error Resume Next
     x = x / L
     y = y / L
     z = z / L
-End Sub
-
-Private Function ApplyComponentAssemblyAxesToStl(ByVal assyModel As Object, _
-                                                 ByVal componentName As String, _
-                                                 ByVal stlPath As String, _
-                                                 ByVal label As String) As Boolean
-On Error GoTo ErrHandler
-
-    ApplyComponentAssemblyAxesToStl = False
-
-    If assyModel Is Nothing Then Exit Function
-    If assyModel.GetType <> swDocASSEMBLY Then Exit Function
-    If componentName = "" Then Exit Function
-    If stlPath = "" Then Exit Function
-
-    Dim swComp As Object
-    Set swComp = FindAssemblyComponentByName(assyModel, componentName)
-
-    If swComp Is Nothing Then
-        LogLine "STL component-axis correction skipped. Component not found: " & componentName
-        Exit Function
-    End If
-
-    Dim compM(0 To 8) As Double
-
-    If TryGetComponentLocalToAssemblyRotationMatrix(swComp, compM) = False Then
-        LogLine "STL component-axis correction skipped. Could not read transform for: " & componentName
-        Exit Function
-    End If
-
-    If IsNearlyIdentityRotationMatrix(compM) Then
-        LogLine "STL component-axis correction not needed; component transform is identity:"
-        LogLine "  Label=" & label & " Component=" & componentName
-        ApplyComponentAssemblyAxesToStl = True
-        Exit Function
-    End If
-
-    LogLine "Applying STL component local-axis -> assembly-axis correction:"
-    LogLine "  Label=" & label
-    LogLine "  Component=" & componentName
-    LogLine "  Matrix=[" & _
-            FormatNumberForCsv(compM(0)) & "," & FormatNumberForCsv(compM(1)) & "," & FormatNumberForCsv(compM(2)) & "; " & _
-            FormatNumberForCsv(compM(3)) & "," & FormatNumberForCsv(compM(4)) & "," & FormatNumberForCsv(compM(5)) & "; " & _
-            FormatNumberForCsv(compM(6)) & "," & FormatNumberForCsv(compM(7)) & "," & FormatNumberForCsv(compM(8)) & "]"
-
-    If RotateStlFileAroundOwnCenterToMatrix(stlPath, compM) Then
-        LogLine "STL component local-axis -> assembly-axis correction applied OK:"
-        LogLine "  " & stlPath
-        ApplyComponentAssemblyAxesToStl = True
-    Else
-        LogLine "WARNING: STL component local-axis -> assembly-axis correction failed:"
-        LogLine "  " & stlPath
-        ApplyComponentAssemblyAxesToStl = False
-    End If
-
-    Exit Function
-
-ErrHandler:
-    LogLine "ApplyComponentAssemblyAxesToStl error (" & label & "): " & Err.Description
-    ApplyComponentAssemblyAxesToStl = False
-End Function
-
-Private Function TryGetComponentLocalToAssemblyRotationMatrix(ByVal swComp As Object, _
-                                                             ByRef outM() As Double) As Boolean
-On Error GoTo ErrHandler
-
-    TryGetComponentLocalToAssemblyRotationMatrix = False
-
-    If swComp Is Nothing Then Exit Function
-
-    Dim xform As Object
-    Set xform = swComp.Transform2
-
-    If xform Is Nothing Then Exit Function
-
-    Dim v As Variant
-    v = xform.ArrayData
-
-    If IsEmpty(v) Then Exit Function
-    If IsArray(v) = False Then Exit Function
-    If UBound(v) < 8 Then Exit Function
-
-    outM(0) = CDbl(v(0))
-    outM(1) = CDbl(v(1))
-    outM(2) = CDbl(v(2))
-
-    outM(3) = CDbl(v(3))
-    outM(4) = CDbl(v(4))
-    outM(5) = CDbl(v(5))
-
-    outM(6) = CDbl(v(6))
-    outM(7) = CDbl(v(7))
-    outM(8) = CDbl(v(8))
-
-    TryGetComponentLocalToAssemblyRotationMatrix = True
-    Exit Function
-
-ErrHandler:
-    TryGetComponentLocalToAssemblyRotationMatrix = False
-End Function
-
-Private Function IsNearlyIdentityRotationMatrix(ByRef m() As Double) As Boolean
-On Error GoTo ErrHandler
-
-    Dim errSum As Double
-
-    errSum = Abs(m(0) - 1#) + Abs(m(1)) + Abs(m(2)) + _
-             Abs(m(3)) + Abs(m(4) - 1#) + Abs(m(5)) + _
-             Abs(m(6)) + Abs(m(7)) + Abs(m(8) - 1#)
-
-    IsNearlyIdentityRotationMatrix = (errSum < 0.00001)
-    Exit Function
-
-ErrHandler:
-    IsNearlyIdentityRotationMatrix = False
-End Function
-
-Private Function RotateStlFileAroundOwnCenterToMatrix(ByVal stlPath As String, _
-                                                      ByRef m() As Double) As Boolean
-On Error GoTo ErrHandler
-
-    RotateStlFileAroundOwnCenterToMatrix = False
-
-    If stlPath = "" Then Exit Function
-
-    If RotateBinaryStlAroundOwnCenterToMatrix(stlPath, m) Then
-        RotateStlFileAroundOwnCenterToMatrix = True
-        Exit Function
-    End If
-
-    If RotateAsciiStlAroundOwnCenterToMatrix(stlPath, m) Then
-        RotateStlFileAroundOwnCenterToMatrix = True
-        Exit Function
-    End If
-
-    Exit Function
-
-ErrHandler:
-    LogLine "RotateStlFileAroundOwnCenterToMatrix error: " & Err.Description
-    RotateStlFileAroundOwnCenterToMatrix = False
-End Function
-
-Private Function RotateBinaryStlAroundOwnCenterToMatrix(ByVal stlPath As String, _
-                                                        ByRef m() As Double) As Boolean
-On Error GoTo ErrHandler
-
-    RotateBinaryStlAroundOwnCenterToMatrix = False
-
-    Dim fso As Object
-    Set fso = CreateObject("Scripting.FileSystemObject")
-
-    If stlPath = "" Then Exit Function
-    If fso.FileExists(stlPath) = False Then Exit Function
-
-    Dim f As Integer
-    f = FreeFile
-
-    Open stlPath For Binary Access Read Write As #f
-
-    Dim hdr As BinaryStlHeader
-    Get #f, 1, hdr
-
-    If hdr.TriangleCount <= 0 Then GoTo CleanExit
-
-    Dim expectedLen As Double
-    expectedLen = 84# + CDbl(hdr.TriangleCount) * 50#
-
-    If CDbl(LOF(f)) <> expectedLen Then GoTo CleanExit
-
-    Dim tri As BinaryStlTriangle
-
-    If Len(tri) <> 50 Then GoTo CleanExit
-
-    Dim i As Long
-    Dim triPos As Long
-
-    Dim minX As Double
-    Dim minY As Double
-    Dim minZ As Double
-    Dim maxX As Double
-    Dim maxY As Double
-    Dim maxZ As Double
-    Dim firstPt As Boolean
-
-    firstPt = True
-
-    For i = 0 To hdr.TriangleCount - 1
-
-        triPos = 85 + i * 50
-        Get #f, triPos, tri
-
-        IncludeStlPointInBounds tri.x1, tri.y1, tri.z1, firstPt, minX, minY, minZ, maxX, maxY, maxZ
-        IncludeStlPointInBounds tri.x2, tri.y2, tri.z2, firstPt, minX, minY, minZ, maxX, maxY, maxZ
-        IncludeStlPointInBounds tri.x3, tri.y3, tri.z3, firstPt, minX, minY, minZ, maxX, maxY, maxZ
-
-    Next i
-
-    If firstPt Then GoTo CleanExit
-
-    Dim cx As Double
-    Dim cy As Double
-    Dim cz As Double
-
-    cx = (minX + maxX) / 2#
-    cy = (minY + maxY) / 2#
-    cz = (minZ + maxZ) / 2#
-
-    For i = 0 To hdr.TriangleCount - 1
-
-        triPos = 85 + i * 50
-        Get #f, triPos, tri
-
-        TransformStlVectorByMatrix tri.nX, tri.nY, tri.nZ, m
-        NormalizeStlVector tri.nX, tri.nY, tri.nZ
-
-        TransformStlPointAroundCenterByMatrix tri.x1, tri.y1, tri.z1, cx, cy, cz, m
-        TransformStlPointAroundCenterByMatrix tri.x2, tri.y2, tri.z2, cx, cy, cz, m
-        TransformStlPointAroundCenterByMatrix tri.x3, tri.y3, tri.z3, cx, cy, cz, m
-
-        Put #f, triPos, tri
-
-    Next i
-
-    RotateBinaryStlAroundOwnCenterToMatrix = True
-
-CleanExit:
-    On Error Resume Next
-    Close #f
-    Exit Function
-
-ErrHandler:
-    LogLine "RotateBinaryStlAroundOwnCenterToMatrix error: " & Err.Description
-    On Error Resume Next
-    Close #f
-    RotateBinaryStlAroundOwnCenterToMatrix = False
-End Function
-
-Private Sub IncludeStlPointInBounds(ByVal x As Single, _
-                                    ByVal y As Single, _
-                                    ByVal z As Single, _
-                                    ByRef firstPt As Boolean, _
-                                    ByRef minX As Double, _
-                                    ByRef minY As Double, _
-                                    ByRef minZ As Double, _
-                                    ByRef maxX As Double, _
-                                    ByRef maxY As Double, _
-                                    ByRef maxZ As Double)
-On Error Resume Next
-
-    If firstPt Then
-        minX = CDbl(x): maxX = CDbl(x)
-        minY = CDbl(y): maxY = CDbl(y)
-        minZ = CDbl(z): maxZ = CDbl(z)
-        firstPt = False
-    Else
-        If CDbl(x) < minX Then minX = CDbl(x)
-        If CDbl(x) > maxX Then maxX = CDbl(x)
-
-        If CDbl(y) < minY Then minY = CDbl(y)
-        If CDbl(y) > maxY Then maxY = CDbl(y)
-
-        If CDbl(z) < minZ Then minZ = CDbl(z)
-        If CDbl(z) > maxZ Then maxZ = CDbl(z)
-    End If
-End Sub
-
-Private Sub TransformStlPointAroundCenterByMatrix(ByRef x As Single, _
-                                                  ByRef y As Single, _
-                                                  ByRef z As Single, _
-                                                  ByVal cx As Double, _
-                                                  ByVal cy As Double, _
-                                                  ByVal cz As Double, _
-                                                  ByRef m() As Double)
-On Error Resume Next
-
-    Dim ox As Double
-    Dim oy As Double
-    Dim oz As Double
-
-    ox = CDbl(x) - cx
-    oy = CDbl(y) - cy
-    oz = CDbl(z) - cz
-
-    x = CSng(cx + ((ox * m(0)) + (oy * m(3)) + (oz * m(6))))
-    y = CSng(cy + ((ox * m(1)) + (oy * m(4)) + (oz * m(7))))
-    z = CSng(cz + ((ox * m(2)) + (oy * m(5)) + (oz * m(8))))
-End Sub
-
-Private Function RotateAsciiStlAroundOwnCenterToMatrix(ByVal stlPath As String, _
-                                                       ByRef m() As Double) As Boolean
-On Error GoTo ErrHandler
-
-    RotateAsciiStlAroundOwnCenterToMatrix = False
-
-    Dim fso As Object
-    Set fso = CreateObject("Scripting.FileSystemObject")
-
-    If stlPath = "" Then Exit Function
-    If fso.FileExists(stlPath) = False Then Exit Function
-
-    Dim txt As String
-    txt = ReadAllTextFile(stlPath)
-
-    If Trim(txt) = "" Then Exit Function
-
-    If InStr(1, Left$(txt, 512), "solid", vbTextCompare) = 0 Then Exit Function
-    If InStr(1, txt, "vertex", vbTextCompare) = 0 Then Exit Function
-    If InStr(1, txt, "facet normal", vbTextCompare) = 0 Then Exit Function
-
-    txt = Replace(txt, vbCrLf, vbLf)
-    txt = Replace(txt, vbCr, vbLf)
-
-    Dim lines() As String
-    lines = Split(txt, vbLf)
-
-    Dim i As Long
-    Dim rawLine As String
-    Dim t As String
-    Dim toks() As String
-
-    Dim x As Double
-    Dim y As Double
-    Dim z As Double
-
-    Dim minX As Double
-    Dim minY As Double
-    Dim minZ As Double
-    Dim maxX As Double
-    Dim maxY As Double
-    Dim maxZ As Double
-    Dim firstPt As Boolean
-
-    firstPt = True
-
-    For i = LBound(lines) To UBound(lines)
-
-        rawLine = lines(i)
-        t = Trim(rawLine)
-
-        If t <> "" Then
-            toks = Split(NormalizeSpaces(t), " ")
-
-            If UBound(toks) >= 3 Then
-                If LCase$(toks(0)) = "vertex" Then
-
-                    x = ParseStlNumber(toks(1))
-                    y = ParseStlNumber(toks(2))
-                    z = ParseStlNumber(toks(3))
-
-                    IncludeDoublePointInBounds x, y, z, firstPt, minX, minY, minZ, maxX, maxY, maxZ
-
-                End If
-            End If
-        End If
-
-    Next i
-
-    If firstPt Then Exit Function
-
-    Dim cx As Double
-    Dim cy As Double
-    Dim cz As Double
-
-    cx = (minX + maxX) / 2#
-    cy = (minY + maxY) / 2#
-    cz = (minZ + maxZ) / 2#
-
-    Dim outLines() As String
-    ReDim outLines(LBound(lines) To UBound(lines))
-
-    Dim indent As String
-
-    For i = LBound(lines) To UBound(lines)
-
-        rawLine = lines(i)
-        t = Trim(rawLine)
-        indent = LeadingWhitespace(rawLine)
-
-        If t <> "" Then
-
-            toks = Split(NormalizeSpaces(t), " ")
-
-            If UBound(toks) >= 4 Then
-
-                If LCase$(toks(0)) = "facet" And LCase$(toks(1)) = "normal" Then
-
-                    x = ParseStlNumber(toks(2))
-                    y = ParseStlNumber(toks(3))
-                    z = ParseStlNumber(toks(4))
-
-                    TransformDoubleVectorByMatrix x, y, z, m
-                    NormalizeDoubleVector x, y, z
-
-                    outLines(i) = indent & "facet normal " & _
-                                  StlNumber(x) & " " & _
-                                  StlNumber(y) & " " & _
-                                  StlNumber(z)
-
-                ElseIf LCase$(toks(0)) = "vertex" And UBound(toks) >= 3 Then
-
-                    x = ParseStlNumber(toks(1))
-                    y = ParseStlNumber(toks(2))
-                    z = ParseStlNumber(toks(3))
-
-                    TransformDoublePointAroundCenterByMatrix x, y, z, cx, cy, cz, m
-
-                    outLines(i) = indent & "vertex " & _
-                                  StlNumber(x) & " " & _
-                                  StlNumber(y) & " " & _
-                                  StlNumber(z)
-
-                Else
-
-                    outLines(i) = rawLine
-
-                End If
-
-            ElseIf UBound(toks) >= 3 Then
-
-                If LCase$(toks(0)) = "vertex" Then
-
-                    x = ParseStlNumber(toks(1))
-                    y = ParseStlNumber(toks(2))
-                    z = ParseStlNumber(toks(3))
-
-                    TransformDoublePointAroundCenterByMatrix x, y, z, cx, cy, cz, m
-
-                    outLines(i) = indent & "vertex " & _
-                                  StlNumber(x) & " " & _
-                                  StlNumber(y) & " " & _
-                                  StlNumber(z)
-
-                Else
-
-                    outLines(i) = rawLine
-
-                End If
-
-            Else
-
-                outLines(i) = rawLine
-
-            End If
-
-        Else
-
-            outLines(i) = rawLine
-
-        End If
-
-    Next i
-
-    Dim f As Integer
-    f = FreeFile
-
-    Open stlPath For Output As #f
-    Print #f, Join(outLines, vbCrLf)
-    Close #f
-
-    RotateAsciiStlAroundOwnCenterToMatrix = True
-    Exit Function
-
-ErrHandler:
-    LogLine "RotateAsciiStlAroundOwnCenterToMatrix error: " & Err.Description
-
-    On Error Resume Next
-    Close #f
-
-    RotateAsciiStlAroundOwnCenterToMatrix = False
-End Function
-
-Private Sub IncludeDoublePointInBounds(ByVal x As Double, _
-                                       ByVal y As Double, _
-                                       ByVal z As Double, _
-                                       ByRef firstPt As Boolean, _
-                                       ByRef minX As Double, _
-                                       ByRef minY As Double, _
-                                       ByRef minZ As Double, _
-                                       ByRef maxX As Double, _
-                                       ByRef maxY As Double, _
-                                       ByRef maxZ As Double)
-On Error Resume Next
-
-    If firstPt Then
-        minX = x: maxX = x
-        minY = y: maxY = y
-        minZ = z: maxZ = z
-        firstPt = False
-    Else
-        If x < minX Then minX = x
-        If x > maxX Then maxX = x
-
-        If y < minY Then minY = y
-        If y > maxY Then maxY = y
-
-        If z < minZ Then minZ = z
-        If z > maxZ Then maxZ = z
-    End If
-End Sub
-
-Private Sub TransformDoublePointAroundCenterByMatrix(ByRef x As Double, _
-                                                     ByRef y As Double, _
-                                                     ByRef z As Double, _
-                                                     ByVal cx As Double, _
-                                                     ByVal cy As Double, _
-                                                     ByVal cz As Double, _
-                                                     ByRef m() As Double)
-On Error Resume Next
-
-    Dim ox As Double
-    Dim oy As Double
-    Dim oz As Double
-
-    ox = x - cx
-    oy = y - cy
-    oz = z - cz
-
-    x = cx + ((ox * m(0)) + (oy * m(3)) + (oz * m(6)))
-    y = cy + ((ox * m(1)) + (oy * m(4)) + (oz * m(7)))
-    z = cz + ((ox * m(2)) + (oy * m(5)) + (oz * m(8)))
 End Sub
 
 Private Sub ExportIndividualHolderAndClampingDxfs(ByVal outputFolder As String)
