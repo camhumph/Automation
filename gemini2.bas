@@ -1119,7 +1119,7 @@ On Error GoTo ErrHandler
     LogLine "PullcoreMatchCount=" & PullcoreMatchCount
     LogDone "Match BOM to CAD"
 
-    If ExportCount = 0 And PullcoreMatchCount = 0 Then
+    If ExportCount = 0 And PullcoreMatchCount = 0 And HasSpecialPackageCadMatches() = False Then
         LogErrorText "No matched export rows."
         GoTo CleanExit
     End If
@@ -12490,6 +12490,17 @@ On Error GoTo ErrHandler
 
     FindBestJBlockIndex = 0
 
+    Dim specialIdx As Long
+
+    specialIdx = GetSpecialCadMatchByQuoteKeys("EJECTOR J-BLOCK|EJ J-BLOCK|J-BLOCK|J BLOCK|JBLOCK")
+
+    If specialIdx > 0 And specialIdx <= PartCount Then
+        FindBestJBlockIndex = specialIdx
+        LogLine "J BLOCK selected from special CAD/library match: " & _
+                parts(specialIdx).componentName
+        Exit Function
+    End If
+
     Dim bestIdx As Long
     Dim bestScore As Double
 
@@ -12590,6 +12601,17 @@ Private Function FindBestEjectorCamIndex() As Long
 On Error GoTo ErrHandler
 
     FindBestEjectorCamIndex = 0
+
+    Dim specialIdx As Long
+
+    specialIdx = GetSpecialCadMatchByQuoteKeys("EJECTOR CAM|EJ CAM|EJ. CAM|EJ.CAM|CAM")
+
+    If specialIdx > 0 And specialIdx <= PartCount Then
+        FindBestEjectorCamIndex = specialIdx
+        LogLine "EJECTOR CAM selected from special CAD/library match: " & _
+                parts(specialIdx).componentName
+        Exit Function
+    End If
 
     Dim bestIdx As Long
     Dim bestScore As Double
@@ -14580,6 +14602,181 @@ ErrHandler:
     libCount = 0
 End Function
 
+Private Function IsNoBomLibraryPackageHandledQuote(ByVal quoteName As String) As Boolean
+On Error GoTo ErrHandler
+
+    If IsJBlockDxfQuote(quoteName) Then
+        IsNoBomLibraryPackageHandledQuote = True
+        Exit Function
+    End If
+
+    If IsEjectorCamPackageQuote(quoteName) Then
+        IsNoBomLibraryPackageHandledQuote = True
+        Exit Function
+    End If
+
+    IsNoBomLibraryPackageHandledQuote = False
+    Exit Function
+
+ErrHandler:
+    IsNoBomLibraryPackageHandledQuote = False
+End Function
+
+Private Function IsEjectorCamPackageQuote(ByVal quoteName As String) As Boolean
+On Error GoTo ErrHandler
+
+    Dim s As String
+    s = NormalizeText(quoteName)
+
+    If s = "" Then Exit Function
+
+    If InStr(s, "PULLCORE") > 0 Or InStr(s, "PULL CORE") > 0 Then Exit Function
+    If InStr(s, "FLIPPER") > 0 Then Exit Function
+    If InStr(s, "COVER") > 0 Then Exit Function
+    If InStr(s, "J-BLOCK") > 0 Or InStr(s, "J BLOCK") > 0 Or InStr(s, "JBLOCK") > 0 Then Exit Function
+
+    If InStr(s, "EJECTOR CAM") > 0 Then
+        IsEjectorCamPackageQuote = True
+        Exit Function
+    End If
+
+    If InStr(s, "EJ CAM") > 0 Or InStr(s, "EJ. CAM") > 0 Or InStr(s, "EJ.CAM") > 0 Then
+        IsEjectorCamPackageQuote = True
+        Exit Function
+    End If
+
+    ' Library may learn/export this simply as "CAM".
+    If s = "CAM" Or s = "EJECTOR CAM" Then
+        IsEjectorCamPackageQuote = True
+        Exit Function
+    End If
+
+    IsEjectorCamPackageQuote = False
+    Exit Function
+
+ErrHandler:
+    IsEjectorCamPackageQuote = False
+End Function
+
+Private Sub RecordSpecialCadMatchDirect(ByVal quoteName As String, ByVal cadIdx As Long)
+On Error GoTo ErrHandler
+
+    If cadIdx <= 0 Or cadIdx > PartCount Then Exit Sub
+
+    If SpecialBomCadMatches Is Nothing Then
+        Set SpecialBomCadMatches = CreateObject("Scripting.Dictionary")
+    End If
+
+    If SpecialBomCadQuoteNames Is Nothing Then
+        Set SpecialBomCadQuoteNames = CreateObject("Scripting.Dictionary")
+    End If
+
+    PutSpecialCadAlias quoteName, cadIdx
+
+    If IsJBlockDxfQuote(quoteName) Then
+        PutSpecialCadAlias "J BLOCK", cadIdx
+        PutSpecialCadAlias "J-BLOCK", cadIdx
+        PutSpecialCadAlias "JBLOCK", cadIdx
+        PutSpecialCadAlias "EJECTOR J-BLOCK", cadIdx
+        PutSpecialCadAlias "EJ J-BLOCK", cadIdx
+    End If
+
+    If IsEjectorCamPackageQuote(quoteName) Then
+        PutSpecialCadAlias "EJECTOR CAM", cadIdx
+        PutSpecialCadAlias "EJ CAM", cadIdx
+        PutSpecialCadAlias "EJ. CAM", cadIdx
+        PutSpecialCadAlias "EJ.CAM", cadIdx
+        PutSpecialCadAlias "CAM", cadIdx
+    End If
+
+    LogLine "Recorded special CAD package match: '" & quoteName & _
+            "' -> " & parts(cadIdx).componentName
+
+    Exit Sub
+
+ErrHandler:
+    LogLine "RecordSpecialCadMatchDirect error: " & Err.Description
+End Sub
+
+Private Sub PutSpecialCadAlias(ByVal quoteName As String, ByVal cadIdx As Long)
+On Error Resume Next
+
+    If quoteName = "" Then Exit Sub
+    If cadIdx <= 0 Or cadIdx > PartCount Then Exit Sub
+
+    If SpecialBomCadMatches Is Nothing Then
+        Set SpecialBomCadMatches = CreateObject("Scripting.Dictionary")
+    End If
+
+    If SpecialBomCadQuoteNames Is Nothing Then
+        Set SpecialBomCadQuoteNames = CreateObject("Scripting.Dictionary")
+    End If
+
+    SpecialBomCadMatches(NormalizeKey(quoteName)) = cadIdx
+    SpecialBomCadQuoteNames(NormalizeKey(quoteName)) = quoteName
+End Sub
+
+Private Function GetSpecialCadMatchByQuoteKeys(ByVal pipeKeys As String) As Long
+On Error GoTo ErrHandler
+
+    GetSpecialCadMatchByQuoteKeys = 0
+
+    If SpecialBomCadMatches Is Nothing Then Exit Function
+    If pipeKeys = "" Then Exit Function
+
+    Dim keys() As String
+    keys = Split(pipeKeys, "|")
+
+    Dim i As Long
+    Dim k As String
+    Dim cadIdx As Long
+
+    For i = LBound(keys) To UBound(keys)
+
+        k = NormalizeKey(CStr(keys(i)))
+
+        If k <> "" Then
+            If SpecialBomCadMatches.Exists(k) Then
+
+                cadIdx = CLng(SpecialBomCadMatches(k))
+
+                If cadIdx > 0 And cadIdx <= PartCount Then
+                    GetSpecialCadMatchByQuoteKeys = cadIdx
+                    Exit Function
+                End If
+
+            End If
+        End If
+
+    Next i
+
+    Exit Function
+
+ErrHandler:
+    GetSpecialCadMatchByQuoteKeys = 0
+End Function
+
+Private Function HasSpecialPackageCadMatches() As Boolean
+On Error GoTo ErrHandler
+
+    HasSpecialPackageCadMatches = False
+
+    If GetSpecialCadMatchByQuoteKeys("EJECTOR J-BLOCK|EJ J-BLOCK|J-BLOCK|J BLOCK|JBLOCK") > 0 Then
+        HasSpecialPackageCadMatches = True
+        Exit Function
+    End If
+
+    If GetSpecialCadMatchByQuoteKeys("EJECTOR CAM|EJ CAM|EJ. CAM|EJ.CAM|CAM") > 0 Then
+        HasSpecialPackageCadMatches = True
+        Exit Function
+    End If
+
+    Exit Function
+
+ErrHandler:
+    HasSpecialPackageCadMatches = False
+End Function
+
 Private Function TryBuildExportRowsFromCadNamingLibrary() As Boolean
 On Error GoTo ErrHandler
 
@@ -14624,21 +14821,51 @@ On Error GoTo ErrHandler
                             " second=" & FormatNumberForCsv(secondScore)
                 End If
 
-                AddExportRowFromCadPart bestQuote, i
-                parts(i).UsedForBomMatch = True
+                ' IMPORTANT:
+                ' J BLOCK and EJECTOR CAM are package-handled items.
+                ' Do NOT add them as normal export rows, or they go to MISC DETAILS
+                ' and the package DXF flow may never run.
+                If IsNoBomLibraryPackageHandledQuote(bestQuote) Then
 
-                IncrementDictionaryLong usedQuoteCounts, NormalizeKey(bestQuote)
+                    RecordSpecialCadMatchDirect bestQuote, i
 
-                matchedCount = matchedCount + 1
+                    ' Mark used so this library fallback does not treat the same part as a
+                    ' normal export item, but package finders can still retrieve it through
+                    ' SpecialBomCadMatches.
+                    parts(i).UsedForBomMatch = True
 
-                LogLine "CAD library matched: " & parts(i).componentName & _
-                        " -> '" & bestQuote & "'" & _
-                        " score=" & FormatNumberForCsv(bestScore) & _
-                        " dimDiff=" & FormatNumberForCsv(bestDimDiff) & _
-                        " locDist=" & FormatNumberForCsv(bestLocDist) & _
-                        " L/W/T=" & FormatNumberForCsv(parts(i).Length) & "/" & _
-                        FormatNumberForCsv(parts(i).Width) & "/" & _
-                        FormatNumberForCsv(parts(i).Thickness)
+                    IncrementDictionaryLong usedQuoteCounts, NormalizeKey(bestQuote)
+
+                    matchedCount = matchedCount + 1
+
+                    LogLine "CAD library matched PACKAGE item: " & parts(i).componentName & _
+                            " -> '" & bestQuote & "'" & _
+                            " score=" & FormatNumberForCsv(bestScore) & _
+                            " dimDiff=" & FormatNumberForCsv(bestDimDiff) & _
+                            " locDist=" & FormatNumberForCsv(bestLocDist) & _
+                            " L/W/T=" & FormatNumberForCsv(parts(i).Length) & "/" & _
+                            FormatNumberForCsv(parts(i).Width) & "/" & _
+                            FormatNumberForCsv(parts(i).Thickness)
+
+                Else
+
+                    AddExportRowFromCadPart bestQuote, i
+                    parts(i).UsedForBomMatch = True
+
+                    IncrementDictionaryLong usedQuoteCounts, NormalizeKey(bestQuote)
+
+                    matchedCount = matchedCount + 1
+
+                    LogLine "CAD library matched: " & parts(i).componentName & _
+                            " -> '" & bestQuote & "'" & _
+                            " score=" & FormatNumberForCsv(bestScore) & _
+                            " dimDiff=" & FormatNumberForCsv(bestDimDiff) & _
+                            " locDist=" & FormatNumberForCsv(bestLocDist) & _
+                            " L/W/T=" & FormatNumberForCsv(parts(i).Length) & "/" & _
+                            FormatNumberForCsv(parts(i).Width) & "/" & _
+                            FormatNumberForCsv(parts(i).Thickness)
+
+                End If
 
             End If
 
