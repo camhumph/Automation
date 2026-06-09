@@ -119,6 +119,36 @@ Private Const FRONT_COM_MIN_DELTA_IN As Double = 0.03
 ' If your result is exactly backwards, change this to False.
 Private Const FRONT_CLOSER_IS_LARGER_AXIS_VALUE As Boolean = True
 
+Private Const POT_BLOCKS_MUST_BE_FRONT_OF_HOLDERS As Boolean = True
+
+' Minimum depth difference required for pots to count as being in front of holders.
+Private Const POT_FRONT_DEPTH_MIN_DELTA_IN As Double = 0.03
+
+' True = every pot block must be in front of every holder.
+' False = average pot center must be in front of average holder center.
+Private Const POT_FRONT_REQUIRE_EVERY_POT_AHEAD_OF_EVERY_HOLDER As Boolean = True
+
+Private Const USE_CAD_NAMING_LIBRARY As Boolean = True
+Private Const LEARN_CAD_NAMING_LIBRARY_FROM_BOM As Boolean = True
+
+Private Const CAD_NAMING_LIBRARY_FILE As String = "CMS_Block_Naming_Library.csv"
+
+' Matching tolerances for no-BOM library fallback.
+Private Const CAD_LIB_MAX_SINGLE_DIM_DIFF_IN As Double = 0.75
+Private Const CAD_LIB_MAX_TOTAL_DIM_DIFF_IN As Double = 1.75
+Private Const CAD_LIB_MAX_NORM_DISTANCE As Double = 0.4
+
+' Score = dimension difference + normalized location distance.
+Private Const CAD_LIB_SCORE_DIM_WEIGHT As Double = 1#
+Private Const CAD_LIB_SCORE_LOC_WEIGHT As Double = 3#
+Private Const CAD_LIB_MAX_SCORE As Double = 2.9
+
+' One match per quote name by default: ID HOLDER once, OD HOLDER once, etc.
+Private Const CAD_LIB_MAX_MATCHES_PER_QUOTE As Long = 1
+
+' If two possible library names are close, still use best match but log warning.
+Private Const CAD_LIB_AMBIGUOUS_SCORE_GAP As Double = 0.25
+
 ' ============================================================
 ' SPEED / GRAPHICS SETTINGS
 ' ============================================================
@@ -157,6 +187,11 @@ Private Const CREATE_MATCH_STUDIO_HOLDERS_STL As Boolean = False
 Private Const CREATE_MATCH_STUDIO_STL_PACKAGE As Boolean = False
 Private Const CREATE_MATCH_STUDIO_STLS_DURING_EXISTING_EXPORTS As Boolean = True
 Private Const MATCH_STUDIO_STL_FOLDER_SUFFIX As String = " STL"
+Private Const MATCH_STUDIO_STL_MATCH_MAIN_BASE_ORIENTATION As Boolean = True
+
+' Rotates exported STL mesh into the corrected SolidWorks *Front/*Top orientation.
+' This is needed because STL does not store named views.
+Private Const POST_ROTATE_STL_TO_CORRECTED_FRONT As Boolean = True
 Private Const CREATE_COMPONENT_IGS_WITH_XT As Boolean = False
 Private Const CREATE_COMPONENT_EASM_WITH_XT As Boolean = False
 
@@ -450,6 +485,49 @@ Private Type PullcoreMatchInfo
     DxfRotationDeg As Double
 
     Status As String
+End Type
+
+Private Type CadNameLibEntry
+    quoteName As String
+    Length As Double
+    Width As Double
+    Thickness As Double
+
+    CenterX As Double
+    CenterY As Double
+    CenterZ As Double
+
+    NormX As Double
+    NormY As Double
+    NormZ As Double
+
+    sourceJob As String
+    sourceComponent As String
+End Type
+
+Private Type BinaryStlHeader
+    HeaderText As String * 80
+    TriangleCount As Long
+End Type
+
+Private Type BinaryStlTriangle
+    nX As Single
+    nY As Single
+    nZ As Single
+
+    x1 As Single
+    y1 As Single
+    z1 As Single
+
+    x2 As Single
+    y2 As Single
+    z2 As Single
+
+    x3 As Single
+    y3 As Single
+    z3 As Single
+
+    AttributeByteCount As Integer
 End Type
 
 ' ============================================================
@@ -872,53 +950,109 @@ On Error GoTo ErrHandler
 
     WritePartDimensionCsv CurrentJobFolder & "\XT_Export_CAD_Dimensions.csv"
 
+    Dim usedCadNamingLibraryOnly As Boolean
+    usedCadNamingLibraryOnly = False
+
     LogStart "Find BOM"
 
     Dim bomPath As String
     bomPath = FindCustomerBomFile(CurrentJobFolder)
 
     If bomPath = "" Then
-        LogErrorText "No BOM found."
-        GoTo CleanExit
-    End If
 
-    LogLine "BOM selected: " & bomPath
-    LogDone "Find BOM"
+        LogLine "No BOM found. Trying CAD naming library fallback."
+        LogDone "Find BOM"
 
-    If LCase(GetFileExtension(bomPath)) = "pdf" Then
+        If USE_CAD_NAMING_LIBRARY Then
+            LogStart "No-BOM CAD naming library match"
 
-        If READ_PDF_BOM_WITH_PDFTOTEXT Then
-            LogStart "Read PDF BOM with Poppler"
-            ReadCustomerBomPdfUsingPdfToText bomPath
-            LogDone "Read PDF BOM with Poppler"
+            If TryBuildExportRowsFromCadNamingLibrary() Then
+                usedCadNamingLibraryOnly = True
+                LogLine "No-BOM CAD naming library fallback succeeded. ExportCount=" & ExportCount
+            Else
+                LogErrorText "No BOM found and CAD naming library could not identify parts."
+                GoTo CleanExit
+            End If
+
+            LogDone "No-BOM CAD naming library match"
         Else
-            LogErrorText "PDF BOM found but PDF reading disabled."
+            LogErrorText "No BOM found."
             GoTo CleanExit
         End If
 
     Else
 
-        LogStart "Read Excel BOM TURBO"
-        ReadCustomerBom bomPath
-        LogDone "Read Excel BOM TURBO"
+        LogLine "BOM selected: " & bomPath
+        LogDone "Find BOM"
 
-    End If
+        If LCase(GetFileExtension(bomPath)) = "pdf" Then
 
-    LogLine "BomCount=" & BomCount
+            If READ_PDF_BOM_WITH_PDFTOTEXT Then
+                LogStart "Read PDF BOM with Poppler"
+                ReadCustomerBomPdfUsingPdfToText bomPath
+                LogDone "Read PDF BOM with Poppler"
+            Else
+                LogErrorText "PDF BOM found but PDF reading disabled."
+                GoTo CleanExit
+            End If
 
-    If BomCount = 0 Then
-        LogErrorText "No usable BOM rows found."
-        GoTo CleanExit
+        Else
+
+            LogStart "Read Excel BOM TURBO"
+            ReadCustomerBom bomPath
+            LogDone "Read Excel BOM TURBO"
+
+        End If
+
+        LogLine "BomCount=" & BomCount
+
+        If BomCount = 0 Then
+
+            LogLine "BOM was found but no usable rows were parsed. Trying CAD naming library fallback."
+
+            If USE_CAD_NAMING_LIBRARY Then
+                LogStart "No-BOM CAD naming library match"
+
+                If TryBuildExportRowsFromCadNamingLibrary() Then
+                    usedCadNamingLibraryOnly = True
+                    LogLine "CAD naming library fallback succeeded after empty BOM parse. ExportCount=" & ExportCount
+                Else
+                    LogErrorText "No usable BOM rows found and CAD naming library could not identify parts."
+                    GoTo CleanExit
+                End If
+
+                LogDone "No-BOM CAD naming library match"
+            Else
+                LogErrorText "No usable BOM rows found."
+                GoTo CleanExit
+            End If
+
+        End If
+
     End If
 
     LogStart "Match BOM to CAD"
 
-    BuildExportRowsFromBom
+    If usedCadNamingLibraryOnly Then
 
-    If ADD_TOP_BOT_INS_FROM_CAD_GEOMETRY Then
-        LogStart "Add missing TOP/BOT INS from CAD geometry"
-        AddMissingTopBotInsFromCadGeometry
-        LogDone "Add missing TOP/BOT INS from CAD geometry"
+        LogLine "BOM matching skipped. Export rows were created from CAD naming library."
+
+    Else
+
+        BuildExportRowsFromBom
+
+        If ADD_TOP_BOT_INS_FROM_CAD_GEOMETRY Then
+            LogStart "Add missing TOP/BOT INS from CAD geometry"
+            AddMissingTopBotInsFromCadGeometry
+            LogDone "Add missing TOP/BOT INS from CAD geometry"
+        End If
+
+        If LEARN_CAD_NAMING_LIBRARY_FROM_BOM Then
+            LogStart "Learn CAD naming library from matched BOM job"
+            LearnCadNamingLibraryFromCurrentJob
+            LogDone "Learn CAD naming library from matched BOM job"
+        End If
+
     End If
 
     LogStart "Set TCP-top orientation from matched TCP/BCP, then save BASE"
@@ -2283,50 +2417,36 @@ On Error GoTo ErrHandler
 
     End If
 
-    ' Step 3: compare pot COM vs holder COM.
-    ' If pots are farther away from the candidate front than holders,
-    ' flip to the opposite face.
-    Dim holderDepth As Double
-    Dim potDepth As Double
-    Dim gotHolderDepth As Boolean
-    Dim gotPotDepth As Boolean
+    ' Step 3:
+    ' Force the pot blocks to be closer to the active front view than the holders.
+    ' This uses the ACTIVE VIEW depth direction, not a guessed X/Z sign.
+    Dim flippedForPots As Boolean
+    flippedForPots = False
 
-    gotHolderDepth = TryAverageAxisValueForCadIndexes(holderIndexes, depthAxis, True, holderDepth)
-    gotPotDepth = TryAverageAxisValueForCadIndexes(potIndexes, depthAxis, True, potDepth)
+    If POT_BLOCKS_MUST_BE_FRONT_OF_HOLDERS Then
 
-    If gotHolderDepth And gotPotDepth Then
+        If EnsurePotBlocksCloserThanHoldersInActiveView( _
+                model, _
+                holderIndexes, _
+                potIndexes, _
+                oppositeViewName, _
+                oppositeViewId, _
+                flippedForPots) Then
 
-        Dim potsFartherFromFront As Boolean
+            If flippedForPots Then
+                LogLine "Front definition: flipped to opposite face so pot blocks are closer to front."
 
-        If FRONT_CLOSER_IS_LARGER_AXIS_VALUE Then
-            potsFartherFromFront = (potDepth < holderDepth - FRONT_COM_MIN_DELTA_IN)
+                candidateViewName = oppositeViewName
+                candidateViewId = oppositeViewId
+            Else
+                LogLine "Front definition: pot blocks are already closer to front."
+            End If
+
         Else
-            potsFartherFromFront = (potDepth > holderDepth + FRONT_COM_MIN_DELTA_IN)
-        End If
 
-        LogLine "Front definition COM math:"
-        LogLine "  candidate=" & candidateViewName
-        LogLine "  depth axis=" & depthAxis
-        LogLine "  holder COM avg=" & FormatNumberForCsv(holderDepth)
-        LogLine "  pot COM avg=" & FormatNumberForCsv(potDepth)
-        LogLine "  pots farther from front=" & CStr(potsFartherFromFront)
-
-        If potsFartherFromFront Then
-
-            LogLine "Front definition: pots are farther from front than holders. Switching to opposite face: " & oppositeViewName
-
-            model.ShowNamedView2 oppositeViewName, oppositeViewId
-            StabilizeActiveView model, 100
-
-            candidateViewName = oppositeViewName
-            candidateViewId = oppositeViewId
+            LogLine "WARNING: Could not verify pot blocks are closer to front than holders."
 
         End If
-
-    Else
-
-        LogLine "Front definition: pot/holder COM comparison skipped. gotHolderDepth=" & _
-                CStr(gotHolderDepth) & " gotPotDepth=" & CStr(gotPotDepth)
 
     End If
 
@@ -2335,6 +2455,16 @@ On Error GoTo ErrHandler
 
         model.ShowNamedView2 "*Front", 1
         StabilizeActiveView model, 100
+
+        ' Final safety check:
+        ' After SolidWorks standard views are redefined, verify *Front still has
+        ' the pot blocks closer than the holders. If not, flip *Back and save that
+        ' as the new *Front.
+        If POT_BLOCKS_MUST_BE_FRONT_OF_HOLDERS Then
+            If EnforcePotBlocksCloserAfterFrontPersist(model, holderIndexes, potIndexes) = False Then
+                LogLine "WARNING: Final *Front verification failed. Pot blocks may still be behind holders."
+            End If
+        End If
 
         LogLine "Front definition complete. Current orientation persisted as SolidWorks *Front."
         DefineStandardFrontFromHolderAndPotCom = True
@@ -2721,6 +2851,452 @@ On Error GoTo ErrHandler
 
 ErrHandler:
     TryGetComponentViewWidthHeightInches = False
+End Function
+
+Private Function EnsurePotBlocksCloserThanHoldersInActiveView( _
+    ByVal model As Object, _
+    ByVal holderIndexes As Collection, _
+    ByVal potIndexes As Collection, _
+    ByVal oppositeViewName As String, _
+    ByVal oppositeViewId As Long, _
+    ByRef flippedToOpposite As Boolean) As Boolean
+
+On Error GoTo ErrHandler
+
+    EnsurePotBlocksCloserThanHoldersInActiveView = False
+    flippedToOpposite = False
+
+    If model Is Nothing Then Exit Function
+    If holderIndexes Is Nothing Then Exit Function
+    If potIndexes Is Nothing Then Exit Function
+    If holderIndexes.count = 0 Then Exit Function
+    If potIndexes.count = 0 Then
+        LogLine "Pot/front check skipped: no pot CAD indexes found."
+        Exit Function
+    End If
+
+    Dim holderAvg As Double
+    Dim holderMin As Double
+    Dim holderMax As Double
+
+    Dim potAvg As Double
+    Dim potMin As Double
+    Dim potMax As Double
+
+    Dim currentDelta As Double
+
+    If TryGetPotHolderActiveViewFrontDelta( _
+            model, _
+            holderIndexes, _
+            potIndexes, _
+            holderAvg, holderMin, holderMax, _
+            potAvg, potMin, potMax, _
+            currentDelta) = False Then
+
+        LogLine "Pot/front check failed: could not calculate active-view depth."
+        Exit Function
+
+    End If
+
+    LogLine "Pot/front active-view depth check BEFORE flip:"
+    LogLine "  holder avg/min/max=" & _
+            FormatNumberForCsv(holderAvg) & "/" & _
+            FormatNumberForCsv(holderMin) & "/" & _
+            FormatNumberForCsv(holderMax)
+
+    LogLine "  pot    avg/min/max=" & _
+            FormatNumberForCsv(potAvg) & "/" & _
+            FormatNumberForCsv(potMin) & "/" & _
+            FormatNumberForCsv(potMax)
+
+    LogLine "  front delta=" & FormatNumberForCsv(currentDelta) & _
+            "  requirement=" & IIf(POT_FRONT_REQUIRE_EVERY_POT_AHEAD_OF_EVERY_HOLDER, _
+                                   "every pot ahead of every holder", _
+                                   "average pot ahead of average holder")
+
+    ' In active-view coordinates, larger depth = closer to the viewed/front face.
+    If currentDelta > POT_FRONT_DEPTH_MIN_DELTA_IN Then
+        EnsurePotBlocksCloserThanHoldersInActiveView = True
+        Exit Function
+    End If
+
+    ' Current candidate has pots behind holders, so switch to the opposite face.
+    LogLine "Pot/front check: pots are NOT closer than holders. Switching to opposite face: " & oppositeViewName
+
+    model.ShowNamedView2 oppositeViewName, oppositeViewId
+    StabilizeActiveView model, 100
+
+    flippedToOpposite = True
+
+    Dim newDelta As Double
+
+    If TryGetPotHolderActiveViewFrontDelta( _
+            model, _
+            holderIndexes, _
+            potIndexes, _
+            holderAvg, holderMin, holderMax, _
+            potAvg, potMin, potMax, _
+            newDelta) = False Then
+
+        LogLine "Pot/front check failed after flip: could not calculate active-view depth."
+        Exit Function
+
+    End If
+
+    LogLine "Pot/front active-view depth check AFTER flip:"
+    LogLine "  holder avg/min/max=" & _
+            FormatNumberForCsv(holderAvg) & "/" & _
+            FormatNumberForCsv(holderMin) & "/" & _
+            FormatNumberForCsv(holderMax)
+
+    LogLine "  pot    avg/min/max=" & _
+            FormatNumberForCsv(potAvg) & "/" & _
+            FormatNumberForCsv(potMin) & "/" & _
+            FormatNumberForCsv(potMax)
+
+    LogLine "  front delta after flip=" & FormatNumberForCsv(newDelta)
+
+    If newDelta > POT_FRONT_DEPTH_MIN_DELTA_IN Then
+        EnsurePotBlocksCloserThanHoldersInActiveView = True
+    Else
+        LogLine "WARNING: Opposite face still does not put pots clearly in front of holders."
+        EnsurePotBlocksCloserThanHoldersInActiveView = False
+    End If
+
+    Exit Function
+
+ErrHandler:
+    LogLine "EnsurePotBlocksCloserThanHoldersInActiveView error: " & Err.Description
+    EnsurePotBlocksCloserThanHoldersInActiveView = False
+End Function
+
+Private Function EnforcePotBlocksCloserAfterFrontPersist( _
+    ByVal model As Object, _
+    ByVal holderIndexes As Collection, _
+    ByVal potIndexes As Collection) As Boolean
+
+On Error GoTo ErrHandler
+
+    EnforcePotBlocksCloserAfterFrontPersist = False
+
+    If model Is Nothing Then Exit Function
+    If holderIndexes Is Nothing Then Exit Function
+    If potIndexes Is Nothing Then Exit Function
+    If holderIndexes.count = 0 Then Exit Function
+    If potIndexes.count = 0 Then Exit Function
+
+    model.ShowNamedView2 "*Front", 1
+    StabilizeActiveView model, 100
+
+    Dim holderAvg As Double
+    Dim holderMin As Double
+    Dim holderMax As Double
+
+    Dim potAvg As Double
+    Dim potMin As Double
+    Dim potMax As Double
+
+    Dim delta As Double
+
+    If TryGetPotHolderActiveViewFrontDelta( _
+            model, _
+            holderIndexes, _
+            potIndexes, _
+            holderAvg, holderMin, holderMax, _
+            potAvg, potMin, potMax, _
+            delta) = False Then
+
+        LogLine "Final *Front pot verification failed: could not calculate depth."
+        Exit Function
+
+    End If
+
+    LogLine "Final *Front pot verification:"
+    LogLine "  holder avg/min/max=" & _
+            FormatNumberForCsv(holderAvg) & "/" & _
+            FormatNumberForCsv(holderMin) & "/" & _
+            FormatNumberForCsv(holderMax)
+
+    LogLine "  pot    avg/min/max=" & _
+            FormatNumberForCsv(potAvg) & "/" & _
+            FormatNumberForCsv(potMin) & "/" & _
+            FormatNumberForCsv(potMax)
+
+    LogLine "  final front delta=" & FormatNumberForCsv(delta)
+
+    If delta > POT_FRONT_DEPTH_MIN_DELTA_IN Then
+        LogLine "Final *Front verification OK: pot blocks are closer to front than holders."
+        EnforcePotBlocksCloserAfterFrontPersist = True
+        Exit Function
+    End If
+
+    ' If final *Front is still wrong, flip *Back and redefine that as *Front.
+    LogLine "Final *Front verification failed. Flipping *Back and redefining that as *Front."
+
+    model.ShowNamedView2 "*Back", 2
+    StabilizeActiveView model, 100
+
+    If PersistCurrentViewAsStandardFront(model) = False Then
+        LogLine "WARNING: Could not persist flipped *Back as new *Front."
+        Exit Function
+    End If
+
+    model.ShowNamedView2 "*Front", 1
+    StabilizeActiveView model, 100
+
+    Dim delta2 As Double
+
+    If TryGetPotHolderActiveViewFrontDelta( _
+            model, _
+            holderIndexes, _
+            potIndexes, _
+            holderAvg, holderMin, holderMax, _
+            potAvg, potMin, potMax, _
+            delta2) = False Then
+
+        LogLine "Final flipped *Front verification failed: could not calculate depth."
+        Exit Function
+
+    End If
+
+    LogLine "Final flipped *Front verification:"
+    LogLine "  holder avg/min/max=" & _
+            FormatNumberForCsv(holderAvg) & "/" & _
+            FormatNumberForCsv(holderMin) & "/" & _
+            FormatNumberForCsv(holderMax)
+
+    LogLine "  pot    avg/min/max=" & _
+            FormatNumberForCsv(potAvg) & "/" & _
+            FormatNumberForCsv(potMin) & "/" & _
+            FormatNumberForCsv(potMax)
+
+    LogLine "  final flipped front delta=" & FormatNumberForCsv(delta2)
+
+    If delta2 > POT_FRONT_DEPTH_MIN_DELTA_IN Then
+        LogLine "Final flipped *Front verification OK."
+        EnforcePotBlocksCloserAfterFrontPersist = True
+    Else
+        LogLine "WARNING: Pot blocks are still not clearly in front after final flip."
+        EnforcePotBlocksCloserAfterFrontPersist = False
+    End If
+
+    Exit Function
+
+ErrHandler:
+    LogLine "EnforcePotBlocksCloserAfterFrontPersist error: " & Err.Description
+    EnforcePotBlocksCloserAfterFrontPersist = False
+End Function
+
+Private Function TryGetPotHolderActiveViewFrontDelta( _
+    ByVal model As Object, _
+    ByVal holderIndexes As Collection, _
+    ByVal potIndexes As Collection, _
+    ByRef holderAvg As Double, _
+    ByRef holderMin As Double, _
+    ByRef holderMax As Double, _
+    ByRef potAvg As Double, _
+    ByRef potMin As Double, _
+    ByRef potMax As Double, _
+    ByRef frontDelta As Double) As Boolean
+
+On Error GoTo ErrHandler
+
+    TryGetPotHolderActiveViewFrontDelta = False
+
+    holderAvg = 0#
+    holderMin = 0#
+    holderMax = 0#
+
+    potAvg = 0#
+    potMin = 0#
+    potMax = 0#
+
+    frontDelta = 0#
+
+    If TryGetActiveViewDepthStatsForCadIndexes(model, holderIndexes, True, holderAvg, holderMin, holderMax) = False Then
+        Exit Function
+    End If
+
+    If TryGetActiveViewDepthStatsForCadIndexes(model, potIndexes, True, potAvg, potMin, potMax) = False Then
+        Exit Function
+    End If
+
+    If POT_FRONT_REQUIRE_EVERY_POT_AHEAD_OF_EVERY_HOLDER Then
+        ' Strict check:
+        ' The farthest-back pot must still be ahead of the closest/front-most holder.
+        frontDelta = potMin - holderMax
+    Else
+        ' Softer check:
+        ' Average pot depth must be ahead of average holder depth.
+        frontDelta = potAvg - holderAvg
+    End If
+
+    TryGetPotHolderActiveViewFrontDelta = True
+    Exit Function
+
+ErrHandler:
+    TryGetPotHolderActiveViewFrontDelta = False
+End Function
+
+Private Function TryGetActiveViewDepthStatsForCadIndexes( _
+    ByVal model As Object, _
+    ByVal cadIndexes As Collection, _
+    ByVal preferMassCenter As Boolean, _
+    ByRef avgDepth As Double, _
+    ByRef minDepth As Double, _
+    ByRef maxDepth As Double) As Boolean
+
+On Error GoTo ErrHandler
+
+    TryGetActiveViewDepthStatsForCadIndexes = False
+
+    avgDepth = 0#
+    minDepth = 0#
+    maxDepth = 0#
+
+    If model Is Nothing Then Exit Function
+    If cadIndexes Is Nothing Then Exit Function
+    If cadIndexes.count = 0 Then Exit Function
+
+    Dim total As Double
+    Dim countVal As Long
+    Dim firstVal As Boolean
+
+    total = 0#
+    countVal = 0
+    firstVal = True
+
+    Dim i As Long
+    Dim cadIdx As Long
+
+    For i = 1 To cadIndexes.count
+
+        cadIdx = CLng(cadIndexes(i))
+
+        Dim px As Double
+        Dim py As Double
+        Dim pz As Double
+
+        If TryGetCadCenterPointForFrontCheck(cadIdx, preferMassCenter, px, py, pz) Then
+
+            Dim depth As Double
+
+            If TryProjectPointToActiveViewDepth(model, px, py, pz, depth) Then
+
+                If firstVal Then
+                    minDepth = depth
+                    maxDepth = depth
+                    firstVal = False
+                Else
+                    If depth < minDepth Then minDepth = depth
+                    If depth > maxDepth Then maxDepth = depth
+                End If
+
+                total = total + depth
+                countVal = countVal + 1
+
+            End If
+
+        End If
+
+    Next i
+
+    If countVal > 0 Then
+        avgDepth = total / CDbl(countVal)
+        TryGetActiveViewDepthStatsForCadIndexes = True
+    End If
+
+    Exit Function
+
+ErrHandler:
+    TryGetActiveViewDepthStatsForCadIndexes = False
+End Function
+
+Private Function TryProjectPointToActiveViewDepth( _
+    ByVal model As Object, _
+    ByVal px As Double, _
+    ByVal py As Double, _
+    ByVal pz As Double, _
+    ByRef viewDepth As Double) As Boolean
+
+On Error GoTo ErrHandler
+
+    TryProjectPointToActiveViewDepth = False
+    viewDepth = 0#
+
+    If model Is Nothing Then Exit Function
+
+    Dim swView As Object
+    Set swView = model.ActiveView
+
+    If swView Is Nothing Then Exit Function
+
+    Dim mView As Variant
+    mView = swView.Orientation3.ArrayData
+
+    If IsEmpty(mView) Then Exit Function
+    If IsArray(mView) = False Then Exit Function
+    If UBound(mView) < 8 Then Exit Function
+
+    ' Same orientation convention used elsewhere in your macro:
+    ' view X     = p dot [m0, m3, m6]
+    ' view Y     = p dot [m1, m4, m7]
+    ' view depth = p dot [m2, m5, m8]
+    '
+    ' In SolidWorks active-view coordinates, larger view depth is closer
+    ' to the viewed/front face.
+    viewDepth = (px * CDbl(mView(2))) + _
+                (py * CDbl(mView(5))) + _
+                (pz * CDbl(mView(8)))
+
+    TryProjectPointToActiveViewDepth = True
+    Exit Function
+
+ErrHandler:
+    TryProjectPointToActiveViewDepth = False
+End Function
+
+Private Function TryGetCadCenterPointForFrontCheck( _
+    ByVal cadIdx As Long, _
+    ByVal preferMassCenter As Boolean, _
+    ByRef px As Double, _
+    ByRef py As Double, _
+    ByRef pz As Double) As Boolean
+
+On Error GoTo ErrHandler
+
+    TryGetCadCenterPointForFrontCheck = False
+
+    px = 0#
+    py = 0#
+    pz = 0#
+
+    If cadIdx <= 0 Or cadIdx > PartCount Then Exit Function
+
+    ' Prefer actual center of mass, because you specifically asked for center of mass.
+    If preferMassCenter Then
+        If parts(cadIdx).hasMassCenter Then
+            px = parts(cadIdx).MassCenterX
+            py = parts(cadIdx).MassCenterY
+            pz = parts(cadIdx).MassCenterZ
+            TryGetCadCenterPointForFrontCheck = True
+            Exit Function
+        End If
+    End If
+
+    ' Fallback to assembly bounding-box center.
+    If parts(cadIdx).hasAsmCenter Then
+        px = parts(cadIdx).AsmCenterX
+        py = parts(cadIdx).AsmCenterY
+        pz = parts(cadIdx).AsmCenterZ
+        TryGetCadCenterPointForFrontCheck = True
+        Exit Function
+    End If
+
+    Exit Function
+
+ErrHandler:
+    TryGetCadCenterPointForFrontCheck = False
 End Function
 
 Private Sub ApplyCmsTopView(ByVal model As Object)
@@ -4932,6 +5508,223 @@ ErrHandler:
     SaveModelCopyAs = False
 End Function
 
+Private Sub SaveStlWithMainBaseOrientation(ByVal model As Object, _
+                                           ByVal stlPath As String, _
+                                           Optional ByVal label As String = "")
+On Error GoTo ErrHandler
+
+    If model Is Nothing Then Exit Sub
+    If stlPath = "" Then Exit Sub
+
+    Dim orientM(0 To 8) As Double
+    Dim gotOrient As Boolean
+
+    gotOrient = False
+
+    If MATCH_STUDIO_STL_MATCH_MAIN_BASE_ORIENTATION And POST_ROTATE_STL_TO_CORRECTED_FRONT Then
+        gotOrient = TryCaptureCorrectedFrontOrientationMatrix(model, orientM)
+
+        If gotOrient Then
+            LogLine "STL orientation matrix captured from corrected SolidWorks *Front for: " & label
+        Else
+            LogLine "WARNING: Could not capture corrected *Front matrix for STL: " & label
+        End If
+    End If
+
+    SaveModelAs model, stlPath
+
+    If gotOrient Then
+        If ReorientBinaryStlFileToMatrix(stlPath, orientM) Then
+            LogLine "STL post-rotated to match corrected BASE orientation:"
+            LogLine "  " & stlPath
+        Else
+            LogLine "WARNING: STL post-rotation failed or STL was not binary:"
+            LogLine "  " & stlPath
+        End If
+    End If
+
+    On Error Resume Next
+    ApplyCmsTopView model
+    On Error GoTo 0
+
+    Exit Sub
+
+ErrHandler:
+    LogLine "SaveStlWithMainBaseOrientation error (" & label & "): " & Err.Description
+
+    On Error Resume Next
+    SaveModelAs model, stlPath
+    ApplyCmsTopView model
+End Sub
+
+Private Function TryCaptureCorrectedFrontOrientationMatrix(ByVal model As Object, _
+                                                          ByRef m() As Double) As Boolean
+On Error GoTo ErrHandler
+
+    TryCaptureCorrectedFrontOrientationMatrix = False
+
+    If model Is Nothing Then Exit Function
+
+    Dim errs As Long
+    swApp.ActivateDoc3 model.GetTitle, False, 0, errs
+    EnsureSwHidden
+
+    ' Important:
+    ' This assumes your earlier front-definition logic has already persisted
+    ' the desired orientation as SolidWorks *Front.
+    model.ShowNamedView2 "*Front", 1
+    StabilizeActiveView model, 50
+
+    Dim swView As Object
+    Set swView = model.ActiveView
+
+    If swView Is Nothing Then Exit Function
+
+    Dim v As Variant
+    v = swView.Orientation3.ArrayData
+
+    If IsEmpty(v) Then Exit Function
+    If IsArray(v) = False Then Exit Function
+    If UBound(v) < 8 Then Exit Function
+
+    Dim i As Long
+
+    For i = 0 To 8
+        m(i) = CDbl(v(i))
+    Next i
+
+    TryCaptureCorrectedFrontOrientationMatrix = True
+    Exit Function
+
+ErrHandler:
+    LogLine "TryCaptureCorrectedFrontOrientationMatrix error: " & Err.Description
+    TryCaptureCorrectedFrontOrientationMatrix = False
+End Function
+
+Private Function ReorientBinaryStlFileToMatrix(ByVal stlPath As String, _
+                                               ByRef m() As Double) As Boolean
+On Error GoTo ErrHandler
+
+    ReorientBinaryStlFileToMatrix = False
+
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    If stlPath = "" Then Exit Function
+    If fso.FileExists(stlPath) = False Then Exit Function
+
+    Dim f As Integer
+    f = FreeFile
+
+    Open stlPath For Binary Access Read Write As #f
+
+    Dim hdr As BinaryStlHeader
+    Get #f, 1, hdr
+
+    If hdr.TriangleCount <= 0 Then
+        Close #f
+        LogLine "STL reorient skipped: triangle count <= 0."
+        Exit Function
+    End If
+
+    Dim expectedLen As Double
+    expectedLen = 84# + CDbl(hdr.TriangleCount) * 50#
+
+    If CDbl(LOF(f)) <> expectedLen Then
+        Close #f
+        LogLine "STL reorient skipped: file does not look like binary STL. Size=" & _
+                CStr(LOF(f)) & " expected=" & CStr(expectedLen)
+        Exit Function
+    End If
+
+    Dim tri As BinaryStlTriangle
+
+    If Len(tri) <> 50 Then
+        Close #f
+        LogLine "STL reorient skipped: BinaryStlTriangle size is " & CStr(Len(tri)) & ", expected 50."
+        Exit Function
+    End If
+
+    Dim i As Long
+    Dim triPos As Long
+
+    For i = 0 To hdr.TriangleCount - 1
+
+        triPos = 85 + i * 50
+
+        Get #f, triPos, tri
+
+        TransformStlTriangleByMatrix tri, m
+
+        Put #f, triPos, tri
+
+    Next i
+
+    Close #f
+
+    ReorientBinaryStlFileToMatrix = True
+    Exit Function
+
+ErrHandler:
+    LogLine "ReorientBinaryStlFileToMatrix error: " & Err.Description
+
+    On Error Resume Next
+    Close #f
+
+    ReorientBinaryStlFileToMatrix = False
+End Function
+
+Private Sub TransformStlTriangleByMatrix(ByRef tri As BinaryStlTriangle, _
+                                         ByRef m() As Double)
+On Error Resume Next
+
+    TransformStlVectorByMatrix tri.nX, tri.nY, tri.nZ, m
+    NormalizeStlVector tri.nX, tri.nY, tri.nZ
+
+    TransformStlVectorByMatrix tri.x1, tri.y1, tri.z1, m
+    TransformStlVectorByMatrix tri.x2, tri.y2, tri.z2, m
+    TransformStlVectorByMatrix tri.x3, tri.y3, tri.z3, m
+End Sub
+
+Private Sub TransformStlVectorByMatrix(ByRef x As Single, _
+                                       ByRef y As Single, _
+                                       ByRef z As Single, _
+                                       ByRef m() As Double)
+On Error Resume Next
+
+    Dim ox As Double
+    Dim oy As Double
+    Dim oz As Double
+
+    ox = CDbl(x)
+    oy = CDbl(y)
+    oz = CDbl(z)
+
+    ' Same projection convention already used elsewhere in your macro:
+    ' view X = m(0), m(3), m(6)
+    ' view Y = m(1), m(4), m(7)
+    ' view Z = m(2), m(5), m(8)
+    x = CSng((ox * m(0)) + (oy * m(3)) + (oz * m(6)))
+    y = CSng((ox * m(1)) + (oy * m(4)) + (oz * m(7)))
+    z = CSng((ox * m(2)) + (oy * m(5)) + (oz * m(8)))
+End Sub
+
+Private Sub NormalizeStlVector(ByRef x As Single, _
+                               ByRef y As Single, _
+                               ByRef z As Single)
+On Error Resume Next
+
+    Dim L As Double
+
+    L = Sqr(CDbl(x) * CDbl(x) + CDbl(y) * CDbl(y) + CDbl(z) * CDbl(z))
+
+    If L <= 0.0000001 Then Exit Sub
+
+    x = CSng(CDbl(x) / L)
+    y = CSng(CDbl(y) / L)
+    z = CSng(CDbl(z) / L)
+End Sub
+
 Private Sub ExportIndividualHolderAndClampingDxfs(ByVal outputFolder As String)
 On Error Resume Next
     LogLine "ExportIndividualHolderAndClampingDxfs skipped. DXFs created during XT export."
@@ -5329,7 +6122,7 @@ On Error GoTo ErrHandler
 
     If CREATE_MATCH_STUDIO_HOLDERS_STL Then
         LogLine "Exporting HOLDERS package STL for Match Studio overlay."
-        SaveModelAs swModel, holdersStlPath
+        SaveStlWithMainBaseOrientation swModel, holdersStlPath, "HOLDERS"
     End If
 
     If FAST_BATCH_EXPORT And FAST_SKIP_HOLDERS_PACKAGE_DXF Then
@@ -5496,7 +6289,7 @@ On Error GoTo ErrHandler
     LogLine "Fast Match Studio STL save while already isolated:"
     LogLine "  " & label & " -> " & stlPath
 
-    SaveModelAs model, stlPath
+    SaveStlWithMainBaseOrientation model, stlPath, label
 
     MatchStudioStlExported(key) = stlPath
 
@@ -5639,7 +6432,7 @@ On Error GoTo ErrHandler
     LogLine "Saving Match Studio component STL:"
     LogLine "  " & label & " -> " & stlPath
 
-    SaveModelAs swModel, stlPath
+    SaveStlWithMainBaseOrientation swModel, stlPath, label
 
 CleanExit:
     On Error Resume Next
@@ -5706,7 +6499,7 @@ On Error GoTo ErrHandler
     LogLine "  Components kept=" & CStr(keepNames.count)
     LogLine "  " & stlPath
 
-    SaveModelAs swModel, stlPath
+    SaveStlWithMainBaseOrientation swModel, stlPath, "MATCH SET"
 
 CleanExit:
     On Error Resume Next
@@ -12952,6 +13745,791 @@ On Error Resume Next
 
     uniques.Add val
 End Sub
+
+' ============================================================
+' CAD NAMING LIBRARY
+' Learns block names from BOM-matched jobs and uses them when no BOM exists.
+' ============================================================
+
+Private Function GetCadNamingLibraryPath() As String
+On Error GoTo ErrHandler
+
+    Dim root As String
+
+    root = ResolveMatchingRoot()
+
+    If root = "" Then root = LOCAL_WORKSPACE_ROOT
+
+    EnsureFolderDeep root
+
+    GetCadNamingLibraryPath = root & "\" & CAD_NAMING_LIBRARY_FILE
+    Exit Function
+
+ErrHandler:
+    GetCadNamingLibraryPath = LOCAL_WORKSPACE_ROOT & "\" & CAD_NAMING_LIBRARY_FILE
+End Function
+
+Private Sub EnsureCadNamingLibraryHeader(ByVal libPath As String)
+On Error GoTo ErrHandler
+
+    If libPath = "" Then Exit Sub
+
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    EnsureFolderDeep fso.GetParentFolderName(libPath)
+
+    If fso.FileExists(libPath) Then Exit Sub
+
+    Dim f As Integer
+    f = FreeFile
+
+    Open libPath For Output As #f
+
+    Print #f, "Version,JobNumber,QuoteName,Length,Width,Thickness,CenterX,CenterY,CenterZ,NormX,NormY,NormZ,ComponentName,LearnedOn"
+
+    Close #f
+
+    LogLine "Created CAD naming library: " & libPath
+    Exit Sub
+
+ErrHandler:
+    LogLine "EnsureCadNamingLibraryHeader error: " & Err.Description
+    On Error Resume Next
+    Close #f
+End Sub
+
+Private Sub LearnCadNamingLibraryFromCurrentJob()
+On Error GoTo ErrHandler
+
+    If USE_CAD_NAMING_LIBRARY = False Then Exit Sub
+    If LEARN_CAD_NAMING_LIBRARY_FROM_BOM = False Then Exit Sub
+    If PartCount <= 0 Then Exit Sub
+
+    Dim libPath As String
+    libPath = GetCadNamingLibraryPath()
+
+    EnsureCadNamingLibraryHeader libPath
+
+    Dim existing As Object
+    Set existing = LoadCadNamingLibraryKeyDict(libPath)
+
+    Dim f As Integer
+    f = FreeFile
+
+    Open libPath For Append As #f
+
+    Dim learnedCount As Long
+    learnedCount = 0
+
+    Dim i As Long
+
+    ' Learn normal export rows.
+    For i = 1 To ExportCount
+
+        If ExportRows(i).HasCad Then
+
+            If ShouldLearnCadLibraryQuote(ExportRows(i).quoteName) Then
+                If AppendCadNamingLibraryRow(f, existing, ExportRows(i).quoteName, ExportRows(i).CadPartIndex) Then
+                    learnedCount = learnedCount + 1
+                End If
+            End If
+
+        End If
+
+    Next i
+
+    ' Learn pullcore matches too.
+    For i = 1 To PullcoreMatchCount
+
+        If PullcoreMatches(i).CadPartIndex > 0 Then
+
+            If ShouldLearnCadLibraryQuote(PullcoreMatches(i).quoteName) Then
+                If AppendCadNamingLibraryRow(f, existing, PullcoreMatches(i).quoteName, PullcoreMatches(i).CadPartIndex) Then
+                    learnedCount = learnedCount + 1
+                End If
+            End If
+
+        End If
+
+    Next i
+
+    ' Learn package-style parts if found.
+    Dim idx As Long
+
+    idx = FindBestJBlockIndex()
+    If idx > 0 Then
+        If AppendCadNamingLibraryRow(f, existing, "J BLOCK", idx) Then learnedCount = learnedCount + 1
+    End If
+
+    idx = FindBestEjectorCamIndex()
+    If idx > 0 Then
+        If AppendCadNamingLibraryRow(f, existing, "EJECTOR CAM", idx) Then learnedCount = learnedCount + 1
+    End If
+
+    idx = FindBestPartByNameAndDims(PULLCORE_STOP_NAME_KEYS, 0, 0, 0, 0)
+    If idx > 0 Then
+        If AppendCadNamingLibraryRow(f, existing, "PULLCORE STOP", idx) Then learnedCount = learnedCount + 1
+    End If
+
+    idx = FindBestPartByNameAndDims(FLIPPER_CAM_COVER_NAME_KEYS, _
+                                    FLIPPER_CAM_COVER_TARGET_THICKNESS, _
+                                    FLIPPER_CAM_COVER_TARGET_WIDTH, _
+                                    FLIPPER_CAM_COVER_TARGET_LENGTH, _
+                                    FLIPPER_CAM_COVER_DIM_TOL)
+    If idx > 0 Then
+        If AppendCadNamingLibraryRow(f, existing, "FLIPPER CAM COVER PLATE", idx) Then learnedCount = learnedCount + 1
+    End If
+
+    Close #f
+
+    LogLine "CAD naming library learned rows=" & learnedCount
+    LogLine "CAD naming library path: " & libPath
+
+    Exit Sub
+
+ErrHandler:
+    LogLine "LearnCadNamingLibraryFromCurrentJob error: " & Err.Description
+    On Error Resume Next
+    Close #f
+End Sub
+
+Private Function ShouldLearnCadLibraryQuote(ByVal quoteName As String) As Boolean
+On Error Resume Next
+
+    Dim q As String
+    q = NormalizeText(quoteName)
+
+    If q = "" Then Exit Function
+    If q = "MAIN ASSEMBLY" Then Exit Function
+    If q = "HOLDERS" Then Exit Function
+
+    ' Learn all meaningful named blocks/details.
+    ShouldLearnCadLibraryQuote = True
+End Function
+
+Private Function AppendCadNamingLibraryRow(ByVal f As Integer, _
+                                           ByVal existing As Object, _
+                                           ByVal quoteName As String, _
+                                           ByVal cadIdx As Long) As Boolean
+On Error GoTo ErrHandler
+
+    AppendCadNamingLibraryRow = False
+
+    If cadIdx <= 0 Or cadIdx > PartCount Then Exit Function
+    If Trim(quoteName) = "" Then Exit Function
+
+    Dim key As String
+    key = CurrentJobNumber & "|" & NormalizeKey(quoteName) & "|" & NormalizeKey(parts(cadIdx).componentName)
+
+    If Not existing Is Nothing Then
+        If existing.Exists(key) Then Exit Function
+    End If
+
+    Dim cx As Double
+    Dim cy As Double
+    Dim cz As Double
+    Dim nx As Double
+    Dim ny As Double
+    Dim nz As Double
+
+    cx = 0#: cy = 0#: cz = 0#
+    nx = 0.5: ny = 0.5: nz = 0.5
+
+    TryGetLibraryCadCenterPointInches cadIdx, True, cx, cy, cz
+    TryGetCurrentPartNormLocation cadIdx, nx, ny, nz
+
+    Print #f, CsvText("1") & "," & _
+              CsvText(CurrentJobNumber) & "," & _
+              CsvText(quoteName) & "," & _
+              FormatNumberForCsv(parts(cadIdx).Length) & "," & _
+              FormatNumberForCsv(parts(cadIdx).Width) & "," & _
+              FormatNumberForCsv(parts(cadIdx).Thickness) & "," & _
+              FormatNumberForCsv(cx) & "," & _
+              FormatNumberForCsv(cy) & "," & _
+              FormatNumberForCsv(cz) & "," & _
+              FormatNumberForCsv(nx) & "," & _
+              FormatNumberForCsv(ny) & "," & _
+              FormatNumberForCsv(nz) & "," & _
+              CsvText(parts(cadIdx).componentName) & "," & _
+              CsvText(Format(Now, "yyyy-mm-dd hh:nn:ss"))
+
+    If Not existing Is Nothing Then existing(key) = True
+
+    LogLine "CAD library learned: " & quoteName & _
+            " -> " & parts(cadIdx).componentName & _
+            " L/W/T=" & FormatNumberForCsv(parts(cadIdx).Length) & "/" & _
+            FormatNumberForCsv(parts(cadIdx).Width) & "/" & _
+            FormatNumberForCsv(parts(cadIdx).Thickness) & _
+            " Norm=" & FormatNumberForCsv(nx) & "/" & _
+            FormatNumberForCsv(ny) & "/" & _
+            FormatNumberForCsv(nz)
+
+    AppendCadNamingLibraryRow = True
+    Exit Function
+
+ErrHandler:
+    LogLine "AppendCadNamingLibraryRow error: " & Err.Description
+    AppendCadNamingLibraryRow = False
+End Function
+
+Private Function LoadCadNamingLibraryKeyDict(ByVal libPath As String) As Object
+On Error GoTo ErrHandler
+
+    Dim dict As Object
+    Set dict = CreateObject("Scripting.Dictionary")
+
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    If fso.FileExists(libPath) = False Then
+        Set LoadCadNamingLibraryKeyDict = dict
+        Exit Function
+    End If
+
+    Dim ts As Object
+    Set ts = fso.OpenTextFile(libPath, 1, False)
+
+    Dim line As String
+    Dim fields As Collection
+    Dim key As String
+
+    If Not ts.AtEndOfStream Then line = ts.ReadLine ' header
+
+    Do While Not ts.AtEndOfStream
+
+        line = ts.ReadLine
+
+        Set fields = CsvSplitToCollection(line)
+
+        If Not fields Is Nothing Then
+            If fields.count >= 13 Then
+                key = CStr(fields(2)) & "|" & NormalizeKey(CStr(fields(3))) & "|" & NormalizeKey(CStr(fields(13)))
+                dict(key) = True
+            End If
+        End If
+
+    Loop
+
+    ts.Close
+
+    Set LoadCadNamingLibraryKeyDict = dict
+    Exit Function
+
+ErrHandler:
+    Set LoadCadNamingLibraryKeyDict = CreateObject("Scripting.Dictionary")
+End Function
+
+Private Function LoadCadNamingLibrary(ByRef lib() As CadNameLibEntry, _
+                                      ByRef libCount As Long) As Boolean
+On Error GoTo ErrHandler
+
+    LoadCadNamingLibrary = False
+    libCount = 0
+
+    ReDim lib(1 To 1)
+
+    Dim libPath As String
+    libPath = GetCadNamingLibraryPath()
+
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    If fso.FileExists(libPath) = False Then
+        LogLine "CAD naming library not found: " & libPath
+        Exit Function
+    End If
+
+    Dim ts As Object
+    Set ts = fso.OpenTextFile(libPath, 1, False)
+
+    Dim line As String
+    Dim fields As Collection
+
+    If Not ts.AtEndOfStream Then line = ts.ReadLine ' header
+
+    Do While Not ts.AtEndOfStream
+
+        line = ts.ReadLine
+
+        If Trim(line) <> "" Then
+
+            Set fields = CsvSplitToCollection(line)
+
+            If Not fields Is Nothing Then
+
+                If fields.count >= 13 Then
+
+                    If Val(CStr(fields(4))) > 0 And Val(CStr(fields(5))) > 0 And Val(CStr(fields(6))) > 0 Then
+
+                        libCount = libCount + 1
+                        ReDim Preserve lib(1 To libCount)
+
+                        lib(libCount).sourceJob = CStr(fields(2))
+                        lib(libCount).quoteName = CStr(fields(3))
+
+                        lib(libCount).Length = CDbl(Val(CStr(fields(4))))
+                        lib(libCount).Width = CDbl(Val(CStr(fields(5))))
+                        lib(libCount).Thickness = CDbl(Val(CStr(fields(6))))
+
+                        lib(libCount).CenterX = CDbl(Val(CStr(fields(7))))
+                        lib(libCount).CenterY = CDbl(Val(CStr(fields(8))))
+                        lib(libCount).CenterZ = CDbl(Val(CStr(fields(9))))
+
+                        lib(libCount).NormX = CDbl(Val(CStr(fields(10))))
+                        lib(libCount).NormY = CDbl(Val(CStr(fields(11))))
+                        lib(libCount).NormZ = CDbl(Val(CStr(fields(12))))
+
+                        lib(libCount).sourceComponent = CStr(fields(13))
+
+                    End If
+
+                End If
+
+            End If
+
+        End If
+
+    Loop
+
+    ts.Close
+
+    LoadCadNamingLibrary = (libCount > 0)
+
+    LogLine "Loaded CAD naming library rows=" & libCount & " from " & libPath
+    Exit Function
+
+ErrHandler:
+    LogLine "LoadCadNamingLibrary error: " & Err.Description
+    LoadCadNamingLibrary = False
+    libCount = 0
+End Function
+
+Private Function TryBuildExportRowsFromCadNamingLibrary() As Boolean
+On Error GoTo ErrHandler
+
+    TryBuildExportRowsFromCadNamingLibrary = False
+
+    If USE_CAD_NAMING_LIBRARY = False Then Exit Function
+    If PartCount <= 0 Then Exit Function
+
+    Dim lib() As CadNameLibEntry
+    Dim libCount As Long
+
+    If LoadCadNamingLibrary(lib, libCount) = False Then
+        LogLine "No-BOM library fallback failed: library empty or missing."
+        Exit Function
+    End If
+
+    Dim usedQuoteCounts As Object
+    Set usedQuoteCounts = CreateObject("Scripting.Dictionary")
+
+    Dim matchedCount As Long
+    matchedCount = 0
+
+    Dim i As Long
+
+    For i = 1 To PartCount
+
+        If parts(i).UsedForBomMatch = False Then
+
+            Dim bestQuote As String
+            Dim bestScore As Double
+            Dim bestDimDiff As Double
+            Dim bestLocDist As Double
+            Dim secondScore As Double
+
+            If FindBestLibraryQuoteForCadPart(i, lib, libCount, usedQuoteCounts, _
+                                               bestQuote, bestScore, secondScore, _
+                                               bestDimDiff, bestLocDist) Then
+
+                If bestScore + CAD_LIB_AMBIGUOUS_SCORE_GAP > secondScore Then
+                    LogLine "WARNING: CAD library ambiguous match for " & parts(i).componentName & _
+                            ". Best='" & bestQuote & "' score=" & FormatNumberForCsv(bestScore) & _
+                            " second=" & FormatNumberForCsv(secondScore)
+                End If
+
+                AddExportRowFromCadPart bestQuote, i
+                parts(i).UsedForBomMatch = True
+
+                IncrementDictionaryLong usedQuoteCounts, NormalizeKey(bestQuote)
+
+                matchedCount = matchedCount + 1
+
+                LogLine "CAD library matched: " & parts(i).componentName & _
+                        " -> '" & bestQuote & "'" & _
+                        " score=" & FormatNumberForCsv(bestScore) & _
+                        " dimDiff=" & FormatNumberForCsv(bestDimDiff) & _
+                        " locDist=" & FormatNumberForCsv(bestLocDist) & _
+                        " L/W/T=" & FormatNumberForCsv(parts(i).Length) & "/" & _
+                        FormatNumberForCsv(parts(i).Width) & "/" & _
+                        FormatNumberForCsv(parts(i).Thickness)
+
+            End If
+
+        End If
+
+    Next i
+
+    TryBuildExportRowsFromCadNamingLibrary = (matchedCount > 0)
+
+    LogLine "CAD naming library fallback matched count=" & matchedCount
+    Exit Function
+
+ErrHandler:
+    LogLine "TryBuildExportRowsFromCadNamingLibrary error: " & Err.Description
+    TryBuildExportRowsFromCadNamingLibrary = False
+End Function
+
+Private Function FindBestLibraryQuoteForCadPart(ByVal cadIdx As Long, _
+                                                ByRef lib() As CadNameLibEntry, _
+                                                ByVal libCount As Long, _
+                                                ByVal usedQuoteCounts As Object, _
+                                                ByRef bestQuote As String, _
+                                                ByRef bestScore As Double, _
+                                                ByRef secondScore As Double, _
+                                                ByRef bestDimDiff As Double, _
+                                                ByRef bestLocDist As Double) As Boolean
+On Error GoTo ErrHandler
+
+    FindBestLibraryQuoteForCadPart = False
+
+    bestQuote = ""
+    bestScore = 1E+99
+    secondScore = 1E+99
+    bestDimDiff = 0#
+    bestLocDist = 0#
+
+    If cadIdx <= 0 Or cadIdx > PartCount Then Exit Function
+    If libCount <= 0 Then Exit Function
+
+    Dim j As Long
+
+    For j = 1 To libCount
+
+        If ShouldUseCadLibraryQuoteForFallback(lib(j).quoteName) Then
+
+            Dim qKey As String
+            qKey = NormalizeKey(lib(j).quoteName)
+
+            Dim alreadyUsed As Long
+            alreadyUsed = 0
+
+            If Not usedQuoteCounts Is Nothing Then
+                If usedQuoteCounts.Exists(qKey) Then alreadyUsed = CLng(usedQuoteCounts(qKey))
+            End If
+
+            If alreadyUsed < CAD_LIB_MAX_MATCHES_PER_QUOTE Then
+
+                Dim dimDiff As Double
+                Dim locDist As Double
+                Dim sc As Double
+
+                sc = CadLibraryScoreForPart(cadIdx, lib(j), dimDiff, locDist)
+
+                If sc < bestScore Then
+                    secondScore = bestScore
+                    bestScore = sc
+                    bestQuote = lib(j).quoteName
+                    bestDimDiff = dimDiff
+                    bestLocDist = locDist
+                ElseIf sc < secondScore Then
+                    secondScore = sc
+                End If
+
+            End If
+
+        End If
+
+    Next j
+
+    If bestQuote <> "" Then
+        If bestScore <= CAD_LIB_MAX_SCORE Then
+            FindBestLibraryQuoteForCadPart = True
+        End If
+    End If
+
+    Exit Function
+
+ErrHandler:
+    FindBestLibraryQuoteForCadPart = False
+End Function
+
+Private Function ShouldUseCadLibraryQuoteForFallback(ByVal quoteName As String) As Boolean
+On Error Resume Next
+
+    Dim q As String
+    q = NormalizeText(quoteName)
+
+    If q = "" Then Exit Function
+    If q = "MAIN ASSEMBLY" Then Exit Function
+    If q = "HOLDERS" Then Exit Function
+
+    ShouldUseCadLibraryQuoteForFallback = True
+End Function
+
+Private Function CadLibraryScoreForPart(ByVal cadIdx As Long, _
+                                        ByRef e As CadNameLibEntry, _
+                                        ByRef dimDiffOut As Double, _
+                                        ByRef locDistOut As Double) As Double
+On Error GoTo ErrHandler
+
+    CadLibraryScoreForPart = 1E+99
+    dimDiffOut = 0#
+    locDistOut = 0#
+
+    If cadIdx <= 0 Or cadIdx > PartCount Then Exit Function
+
+    Dim dL As Double
+    Dim dW As Double
+    Dim dT As Double
+
+    dL = Abs(parts(cadIdx).Length - e.Length)
+    dW = Abs(parts(cadIdx).Width - e.Width)
+    dT = Abs(parts(cadIdx).Thickness - e.Thickness)
+
+    If dL > CAD_LIB_MAX_SINGLE_DIM_DIFF_IN Then Exit Function
+    If dW > CAD_LIB_MAX_SINGLE_DIM_DIFF_IN Then Exit Function
+    If dT > CAD_LIB_MAX_SINGLE_DIM_DIFF_IN Then Exit Function
+
+    dimDiffOut = dL + dW + dT
+
+    If dimDiffOut > CAD_LIB_MAX_TOTAL_DIM_DIFF_IN Then Exit Function
+
+    Dim nx As Double
+    Dim ny As Double
+    Dim nz As Double
+
+    If TryGetCurrentPartNormLocation(cadIdx, nx, ny, nz) Then
+
+        locDistOut = Sqr((nx - e.NormX) ^ 2 + _
+                         (ny - e.NormY) ^ 2 + _
+                         (nz - e.NormZ) ^ 2)
+
+        If locDistOut > CAD_LIB_MAX_NORM_DISTANCE Then Exit Function
+
+    Else
+
+        ' If location is unavailable, let size decide but penalize it.
+        locDistOut = 0.25
+
+    End If
+
+    CadLibraryScoreForPart = _
+        (dimDiffOut * CAD_LIB_SCORE_DIM_WEIGHT) + _
+        (locDistOut * CAD_LIB_SCORE_LOC_WEIGHT)
+
+    Exit Function
+
+ErrHandler:
+    CadLibraryScoreForPart = 1E+99
+End Function
+
+Private Function TryGetCurrentPartNormLocation(ByVal cadIdx As Long, _
+                                               ByRef nx As Double, _
+                                               ByRef ny As Double, _
+                                               ByRef nz As Double) As Boolean
+On Error GoTo ErrHandler
+
+    TryGetCurrentPartNormLocation = False
+
+    nx = 0.5
+    ny = 0.5
+    nz = 0.5
+
+    If cadIdx <= 0 Or cadIdx > PartCount Then Exit Function
+
+    Dim minX As Double
+    Dim minY As Double
+    Dim minZ As Double
+    Dim maxX As Double
+    Dim maxY As Double
+    Dim maxZ As Double
+
+    If TryGetCurrentCadCenterBounds(minX, minY, minZ, maxX, maxY, maxZ) = False Then Exit Function
+
+    Dim cx As Double
+    Dim cy As Double
+    Dim cz As Double
+
+    If TryGetLibraryCadCenterPointInches(cadIdx, True, cx, cy, cz) = False Then Exit Function
+
+    If Abs(maxX - minX) > 0.000001 Then nx = (cx - minX) / (maxX - minX)
+    If Abs(maxY - minY) > 0.000001 Then ny = (cy - minY) / (maxY - minY)
+    If Abs(maxZ - minZ) > 0.000001 Then nz = (cz - minZ) / (maxZ - minZ)
+
+    If nx < 0# Then nx = 0#
+    If nx > 1# Then nx = 1#
+
+    If ny < 0# Then ny = 0#
+    If ny > 1# Then ny = 1#
+
+    If nz < 0# Then nz = 0#
+    If nz > 1# Then nz = 1#
+
+    TryGetCurrentPartNormLocation = True
+    Exit Function
+
+ErrHandler:
+    TryGetCurrentPartNormLocation = False
+End Function
+
+Private Function TryGetCurrentCadCenterBounds(ByRef minX As Double, _
+                                              ByRef minY As Double, _
+                                              ByRef minZ As Double, _
+                                              ByRef maxX As Double, _
+                                              ByRef maxY As Double, _
+                                              ByRef maxZ As Double) As Boolean
+On Error GoTo ErrHandler
+
+    TryGetCurrentCadCenterBounds = False
+
+    Dim firstVal As Boolean
+    firstVal = True
+
+    Dim i As Long
+    Dim cx As Double
+    Dim cy As Double
+    Dim cz As Double
+
+    For i = 1 To PartCount
+
+        If TryGetLibraryCadCenterPointInches(i, True, cx, cy, cz) Then
+
+            If firstVal Then
+                minX = cx: maxX = cx
+                minY = cy: maxY = cy
+                minZ = cz: maxZ = cz
+                firstVal = False
+            Else
+                If cx < minX Then minX = cx
+                If cx > maxX Then maxX = cx
+
+                If cy < minY Then minY = cy
+                If cy > maxY Then maxY = cy
+
+                If cz < minZ Then minZ = cz
+                If cz > maxZ Then maxZ = cz
+            End If
+
+        End If
+
+    Next i
+
+    TryGetCurrentCadCenterBounds = Not firstVal
+    Exit Function
+
+ErrHandler:
+    TryGetCurrentCadCenterBounds = False
+End Function
+
+Private Function TryGetLibraryCadCenterPointInches(ByVal cadIdx As Long, _
+                                                   ByVal preferMassCenter As Boolean, _
+                                                   ByRef cx As Double, _
+                                                   ByRef cy As Double, _
+                                                   ByRef cz As Double) As Boolean
+On Error GoTo ErrHandler
+
+    TryGetLibraryCadCenterPointInches = False
+
+    cx = 0#
+    cy = 0#
+    cz = 0#
+
+    If cadIdx <= 0 Or cadIdx > PartCount Then Exit Function
+
+    If preferMassCenter Then
+        If parts(cadIdx).hasMassCenter Then
+            cx = parts(cadIdx).MassCenterX
+            cy = parts(cadIdx).MassCenterY
+            cz = parts(cadIdx).MassCenterZ
+            TryGetLibraryCadCenterPointInches = True
+            Exit Function
+        End If
+    End If
+
+    If parts(cadIdx).hasAsmCenter Then
+        cx = parts(cadIdx).AsmCenterX
+        cy = parts(cadIdx).AsmCenterY
+        cz = parts(cadIdx).AsmCenterZ
+        TryGetLibraryCadCenterPointInches = True
+        Exit Function
+    End If
+
+    Exit Function
+
+ErrHandler:
+    TryGetLibraryCadCenterPointInches = False
+End Function
+
+Private Sub IncrementDictionaryLong(ByVal dict As Object, ByVal key As String)
+On Error Resume Next
+
+    If dict Is Nothing Then Exit Sub
+    If key = "" Then Exit Sub
+
+    If dict.Exists(key) Then
+        dict(key) = CLng(dict(key)) + 1
+    Else
+        dict(key) = 1
+    End If
+End Sub
+
+Private Function CsvSplitToCollection(ByVal line As String) As Collection
+On Error GoTo ErrHandler
+
+    Dim result As New Collection
+
+    Dim i As Long
+    Dim ch As String
+    Dim token As String
+    Dim inQuotes As Boolean
+
+    token = ""
+    inQuotes = False
+
+    i = 1
+
+    Do While i <= Len(line)
+
+        ch = Mid(line, i, 1)
+
+        If ch = Chr(34) Then
+
+            If inQuotes And i < Len(line) Then
+                If Mid(line, i + 1, 1) = Chr(34) Then
+                    token = token & Chr(34)
+                    i = i + 1
+                Else
+                    inQuotes = False
+                End If
+            Else
+                inQuotes = True
+            End If
+
+        ElseIf ch = "," And inQuotes = False Then
+
+            result.Add token
+            token = ""
+
+        Else
+
+            token = token & ch
+
+        End If
+
+        i = i + 1
+
+    Loop
+
+    result.Add token
+
+    Set CsvSplitToCollection = result
+    Exit Function
+
+ErrHandler:
+    Set CsvSplitToCollection = New Collection
+End Function
 
 ' ============================================================
 ' CSV REPORTS
