@@ -198,6 +198,22 @@ Private Const CREATE_COMPONENT_EASM_WITH_XT As Boolean = False
 ' UPDATED: this is now honored for BASE/HOLDERS too in later DXF code.
 Private Const FORCE_ALL_DXF_VIEWS_1_TO_1 As Boolean = True
 
+' BASE DXF spacing fix:
+' 1:1 BASE views often cannot fit on 44 x 34 without overlap.
+' This expands only the MAIN ASSEMBLY / BASE DXF sheet and spreads projected views.
+Private Const BASE_DXF_AUTO_EXPAND_SHEET_TO_FIT_1_TO_1 As Boolean = True
+Private Const BASE_DXF_EXTRA_SIDE_GAP_IN As Double = 8#
+Private Const BASE_DXF_EXTRA_TOP_BOTTOM_GAP_IN As Double = 5#
+
+Private Const BASE_DXF_MIN_SHEET_WIDTH_IN As Double = 60#
+Private Const BASE_DXF_MIN_SHEET_HEIGHT_IN As Double = 44#
+
+' TCP/BCP DXF in-plane rotation adjustment.
+' Positive = counter-clockwise on the drawing sheet.
+' Try 180 if upside down, 90 or -90 if sideways.
+Private Const TCP_DXF_CENTER_ROTATION_DEG As Double = 0#
+Private Const BCP_DXF_CENTER_ROTATION_DEG As Double = 0#
+
 Private Const FREEZE_DXF_DRAWING_GRAPHICS As Boolean = True
 
 Private Const FLIP_ID_HOLDER_CENTER_VIEW_180 As Boolean = True
@@ -591,6 +607,9 @@ Private CurrentPullcoreStraightenCadIndex As Long
 Private PullCoreDimensionsReportPath As String
 Private PullcoreIdOdHeightAxisUsed As String
 
+Private BaseStlOrientationCaptured As Boolean
+Private BaseStlOrientationM(0 To 8) As Double
+
 ' ============================================================
 ' MAIN - BATCH CONTROLLER
 ' ============================================================
@@ -759,6 +778,12 @@ On Error GoTo ErrHandler
     CurrentPullcoreStraightenCadIndex = 0
     PullCoreDimensionsReportPath = ""
     PullcoreIdOdHeightAxisUsed = ""
+    BaseStlOrientationCaptured = False
+
+    Dim stlMi As Long
+    For stlMi = 0 To 8
+        BaseStlOrientationM(stlMi) = 0#
+    Next stlMi
 
     MainCadOpenedByMacro = False
     MainCadTitleForClose = ""
@@ -1058,6 +1083,10 @@ On Error GoTo ErrHandler
     LogStart "Set TCP-top orientation from matched TCP/BCP, then save BASE"
 
     EnsureCmsTopOrientationFromMatchedTcpBcp swModel, PERSIST_CMS_TOP_AS_STANDARD_VIEWS_BEFORE_BASE_SAVE
+
+    ' Capture the corrected BASE orientation once.
+    ' All Match Studio STLs will be post-rotated into this corrected coordinate frame.
+    CaptureBaseStlOrientationMatrix swModel
 
     UnsuppressAllAssemblyComponents swModel
     ShowAllAssemblyComponents swModel
@@ -5518,27 +5547,48 @@ On Error GoTo ErrHandler
 
     Dim orientM(0 To 8) As Double
     Dim gotOrient As Boolean
+    Dim i As Long
 
     gotOrient = False
 
     If MATCH_STUDIO_STL_MATCH_MAIN_BASE_ORIENTATION And POST_ROTATE_STL_TO_CORRECTED_FRONT Then
-        gotOrient = TryCaptureCorrectedFrontOrientationMatrix(model, orientM)
 
-        If gotOrient Then
-            LogLine "STL orientation matrix captured from corrected SolidWorks *Front for: " & label
+        ' Prefer the saved BASE orientation captured after standard Top/Front were corrected.
+        ' This prevents each STL from using the imported/original component layout.
+        If BaseStlOrientationCaptured Then
+
+            For i = 0 To 8
+                orientM(i) = BaseStlOrientationM(i)
+            Next i
+
+            gotOrient = True
+
+            LogLine "STL orientation using captured corrected BASE matrix for: " & label
+
         Else
-            LogLine "WARNING: Could not capture corrected *Front matrix for STL: " & label
+
+            gotOrient = TryCaptureCorrectedFrontOrientationMatrix(model, orientM)
+
+            If gotOrient Then
+                LogLine "STL orientation matrix captured from current corrected *Front for: " & label
+            Else
+                LogLine "WARNING: Could not capture corrected *Front matrix for STL: " & label
+            End If
+
         End If
+
     End If
 
+    ' SolidWorks writes STL in model/original coordinates.
+    ' The post-rotation below is what makes it match the corrected BASE orientation.
     SaveModelAs model, stlPath
 
     If gotOrient Then
-        If ReorientBinaryStlFileToMatrix(stlPath, orientM) Then
+        If ReorientStlFileToMatrix(stlPath, orientM) Then
             LogLine "STL post-rotated to match corrected BASE orientation:"
             LogLine "  " & stlPath
         Else
-            LogLine "WARNING: STL post-rotation failed or STL was not binary:"
+            LogLine "WARNING: STL post-rotation failed. File may still be in original imported layout:"
             LogLine "  " & stlPath
         End If
     End If
@@ -5556,6 +5606,72 @@ ErrHandler:
     SaveModelAs model, stlPath
     ApplyCmsTopView model
 End Sub
+
+Private Function CaptureBaseStlOrientationMatrix(ByVal model As Object) As Boolean
+On Error GoTo ErrHandler
+
+    CaptureBaseStlOrientationMatrix = False
+    BaseStlOrientationCaptured = False
+
+    If model Is Nothing Then Exit Function
+
+    Dim errs As Long
+    swApp.ActivateDoc3 model.GetTitle, False, 0, errs
+    EnsureSwHidden
+
+    ' Use corrected SolidWorks *Front as the STL coordinate-frame source.
+    ' Earlier code has already redefined *Top and *Front.
+    model.ShowNamedView2 "*Front", 1
+    StabilizeActiveView model, 50
+
+    Dim swView As Object
+    Set swView = model.ActiveView
+
+    If swView Is Nothing Then Exit Function
+
+    Dim v As Variant
+    v = swView.Orientation3.ArrayData
+
+    If IsEmpty(v) Then Exit Function
+    If IsArray(v) = False Then Exit Function
+    If UBound(v) < 8 Then Exit Function
+
+    Dim i As Long
+
+    For i = 0 To 8
+        BaseStlOrientationM(i) = CDbl(v(i))
+    Next i
+
+    BaseStlOrientationCaptured = True
+    CaptureBaseStlOrientationMatrix = True
+
+    LogLine "BASE STL orientation matrix captured from corrected SolidWorks *Front:"
+    LogLine "  [" & _
+            FormatNumberForCsv(BaseStlOrientationM(0)) & "," & _
+            FormatNumberForCsv(BaseStlOrientationM(1)) & "," & _
+            FormatNumberForCsv(BaseStlOrientationM(2)) & "; " & _
+            FormatNumberForCsv(BaseStlOrientationM(3)) & "," & _
+            FormatNumberForCsv(BaseStlOrientationM(4)) & "," & _
+            FormatNumberForCsv(BaseStlOrientationM(5)) & "; " & _
+            FormatNumberForCsv(BaseStlOrientationM(6)) & "," & _
+            FormatNumberForCsv(BaseStlOrientationM(7)) & "," & _
+            FormatNumberForCsv(BaseStlOrientationM(8)) & "]"
+
+CleanExit:
+    On Error Resume Next
+    model.ShowNamedView2 CMS_TOP_VIEW_NAME, -1
+    If Err.Number <> 0 Then
+        Err.Clear
+        model.ShowNamedView2 "*Top", 5
+    End If
+    Exit Function
+
+ErrHandler:
+    LogLine "CaptureBaseStlOrientationMatrix error: " & Err.Description
+    BaseStlOrientationCaptured = False
+    CaptureBaseStlOrientationMatrix = False
+    Resume CleanExit
+End Function
 
 Private Function TryCaptureCorrectedFrontOrientationMatrix(ByVal model As Object, _
                                                           ByRef m() As Double) As Boolean
@@ -5723,6 +5839,250 @@ On Error Resume Next
     x = CSng(CDbl(x) / L)
     y = CSng(CDbl(y) / L)
     z = CSng(CDbl(z) / L)
+End Sub
+
+Private Function ReorientStlFileToMatrix(ByVal stlPath As String, _
+                                         ByRef m() As Double) As Boolean
+On Error GoTo ErrHandler
+
+    ReorientStlFileToMatrix = False
+
+    ' Try binary STL first.
+    If ReorientBinaryStlFileToMatrix(stlPath, m) Then
+        LogLine "STL reorient: binary STL rotated."
+        ReorientStlFileToMatrix = True
+        Exit Function
+    End If
+
+    ' If SolidWorks exported ASCII STL, rotate that too.
+    If ReorientAsciiStlFileToMatrix(stlPath, m) Then
+        LogLine "STL reorient: ASCII STL rotated."
+        ReorientStlFileToMatrix = True
+        Exit Function
+    End If
+
+    LogLine "STL reorient failed: file was not successfully processed as binary or ASCII STL."
+    Exit Function
+
+ErrHandler:
+    LogLine "ReorientStlFileToMatrix error: " & Err.Description
+    ReorientStlFileToMatrix = False
+End Function
+
+Private Function ReorientAsciiStlFileToMatrix(ByVal stlPath As String, _
+                                              ByRef m() As Double) As Boolean
+On Error GoTo ErrHandler
+
+    ReorientAsciiStlFileToMatrix = False
+
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    If stlPath = "" Then Exit Function
+    If fso.FileExists(stlPath) = False Then Exit Function
+
+    Dim txt As String
+    txt = ReadAllTextFile(stlPath)
+
+    If Trim(txt) = "" Then Exit Function
+
+    ' Quick ASCII STL sanity checks.
+    If InStr(1, Left$(txt, 512), "solid", vbTextCompare) = 0 Then Exit Function
+    If InStr(1, txt, "vertex", vbTextCompare) = 0 Then Exit Function
+    If InStr(1, txt, "facet normal", vbTextCompare) = 0 Then Exit Function
+
+    txt = Replace(txt, vbCrLf, vbLf)
+    txt = Replace(txt, vbCr, vbLf)
+
+    Dim lines() As String
+    lines = Split(txt, vbLf)
+
+    Dim outLines() As String
+    ReDim outLines(LBound(lines) To UBound(lines))
+
+    Dim i As Long
+    Dim rawLine As String
+    Dim t As String
+    Dim indent As String
+    Dim toks() As String
+
+    Dim x As Double
+    Dim y As Double
+    Dim z As Double
+
+    For i = LBound(lines) To UBound(lines)
+
+        rawLine = lines(i)
+        t = Trim(rawLine)
+        indent = LeadingWhitespace(rawLine)
+
+        If t <> "" Then
+
+            toks = Split(NormalizeSpaces(t), " ")
+
+            If UBound(toks) >= 4 Then
+
+                If LCase$(toks(0)) = "facet" And LCase$(toks(1)) = "normal" Then
+
+                    x = ParseStlNumber(toks(2))
+                    y = ParseStlNumber(toks(3))
+                    z = ParseStlNumber(toks(4))
+
+                    TransformDoubleVectorByMatrix x, y, z, m
+                    NormalizeDoubleVector x, y, z
+
+                    outLines(i) = indent & "facet normal " & _
+                                  StlNumber(x) & " " & _
+                                  StlNumber(y) & " " & _
+                                  StlNumber(z)
+
+                ElseIf LCase$(toks(0)) = "vertex" And UBound(toks) >= 3 Then
+
+                    x = ParseStlNumber(toks(1))
+                    y = ParseStlNumber(toks(2))
+                    z = ParseStlNumber(toks(3))
+
+                    TransformDoubleVectorByMatrix x, y, z, m
+
+                    outLines(i) = indent & "vertex " & _
+                                  StlNumber(x) & " " & _
+                                  StlNumber(y) & " " & _
+                                  StlNumber(z)
+
+                Else
+
+                    outLines(i) = rawLine
+
+                End If
+
+            ElseIf UBound(toks) >= 3 Then
+
+                If LCase$(toks(0)) = "vertex" Then
+
+                    x = ParseStlNumber(toks(1))
+                    y = ParseStlNumber(toks(2))
+                    z = ParseStlNumber(toks(3))
+
+                    TransformDoubleVectorByMatrix x, y, z, m
+
+                    outLines(i) = indent & "vertex " & _
+                                  StlNumber(x) & " " & _
+                                  StlNumber(y) & " " & _
+                                  StlNumber(z)
+
+                Else
+
+                    outLines(i) = rawLine
+
+                End If
+
+            Else
+
+                outLines(i) = rawLine
+
+            End If
+
+        Else
+
+            outLines(i) = rawLine
+
+        End If
+
+    Next i
+
+    Dim f As Integer
+    f = FreeFile
+
+    Open stlPath For Output As #f
+    Print #f, Join(outLines, vbCrLf)
+    Close #f
+
+    ReorientAsciiStlFileToMatrix = True
+    Exit Function
+
+ErrHandler:
+    LogLine "ReorientAsciiStlFileToMatrix error: " & Err.Description
+
+    On Error Resume Next
+    Close #f
+
+    ReorientAsciiStlFileToMatrix = False
+End Function
+
+Private Function LeadingWhitespace(ByVal s As String) As String
+On Error Resume Next
+
+    Dim i As Long
+    Dim ch As String
+
+    For i = 1 To Len(s)
+        ch = Mid$(s, i, 1)
+
+        If ch <> " " And ch <> vbTab Then
+            LeadingWhitespace = Left$(s, i - 1)
+            Exit Function
+        End If
+    Next i
+
+    LeadingWhitespace = s
+End Function
+
+Private Function ParseStlNumber(ByVal s As String) As Double
+On Error Resume Next
+
+    s = Trim$(s)
+    s = Replace(s, "D", "E")
+    s = Replace(s, "d", "E")
+
+    ' Val handles STL-style decimal points regardless of Windows locale.
+    ParseStlNumber = Val(s)
+End Function
+
+Private Function StlNumber(ByVal v As Double) As String
+On Error Resume Next
+
+    If Abs(v) < 0.000000000001 Then v = 0#
+
+    StlNumber = Replace(Format$(v, "0.#########"), ",", ".")
+End Function
+
+Private Sub TransformDoubleVectorByMatrix(ByRef x As Double, _
+                                          ByRef y As Double, _
+                                          ByRef z As Double, _
+                                          ByRef m() As Double)
+On Error Resume Next
+
+    Dim ox As Double
+    Dim oy As Double
+    Dim oz As Double
+
+    ox = x
+    oy = y
+    oz = z
+
+    ' Same convention as the binary STL transform and drawing-view projection:
+    ' corrected X = model dot [m0, m3, m6]
+    ' corrected Y = model dot [m1, m4, m7]
+    ' corrected Z = model dot [m2, m5, m8]
+    x = (ox * m(0)) + (oy * m(3)) + (oz * m(6))
+    y = (ox * m(1)) + (oy * m(4)) + (oz * m(7))
+    z = (ox * m(2)) + (oy * m(5)) + (oz * m(8))
+End Sub
+
+Private Sub NormalizeDoubleVector(ByRef x As Double, _
+                                  ByRef y As Double, _
+                                  ByRef z As Double)
+On Error Resume Next
+
+    Dim L As Double
+
+    L = Sqr((x * x) + (y * y) + (z * z))
+
+    If L <= 0.0000001 Then Exit Sub
+
+    x = x / L
+    y = y / L
+    z = z / L
 End Sub
 
 Private Sub ExportIndividualHolderAndClampingDxfs(ByVal outputFolder As String)
@@ -6632,12 +6992,20 @@ On Error GoTo ErrHandler
     Dim parentFallback As String
 
     Select Case NormalizeKey(quoteName)
-        Case "IDHOLDER", "ODHOLDER"
+
+        Case "IDHOLDER", "ODHOLDER", _
+             "TCP", "BCP", _
+             "TOPSMED", "BOTTOMSMED", "BOTSMED", _
+             "TOPSMEDPLATE", "BOTTOMSMEDPLATE", "BOTSMEDPLATE", _
+             "TOPCLAMPINGPLATE", "BOTTOMCLAMPINGPLATE", "BOTCLAMPINGPLATE"
+
             parentPrimary = "*Top"
             parentFallback = CMS_TOP_VIEW_NAME
+
         Case Else
             parentPrimary = CMS_TOP_VIEW_NAME
             parentFallback = "*Top"
+
     End Select
 
     CreateProjectedDxfFromXtPath xtPath, dxfPath, quoteName, _
@@ -6748,10 +7116,11 @@ On Error GoTo ErrHandler
     ' Native assembly, not X_T.
     tempNativePath = tempFolder & "\" & CurrentJobNumber & "_" & NormalizeKey(quoteName) & "_TOPVIEW_TEMP.sldasm"
 
-    ApplyCmsTopView assyModel
+    ' Force the actual SolidWorks standard TOP view before saving the temp native source.
+    assyModel.ShowNamedView2 "*Top", 5
     StabilizeActiveView assyModel, 100
 
-    LogLine quoteName & " clamping plate DXF: saving native temp SLDASM:"
+    LogLine quoteName & " clamping plate DXF: saving native temp SLDASM from SolidWorks *Top:"
     LogLine "  " & tempNativePath
 
     If SaveModelCopyAs(assyModel, tempNativePath) = False Then GoTo CleanExit
@@ -6765,7 +7134,7 @@ On Error GoTo ErrHandler
     End If
 
     CreateProjectedDxfFromNativePath tempNativePath, dxfPath, quoteName, _
-                                     CMS_TOP_VIEW_NAME, "*Top", _
+                                     "*Top", CMS_TOP_VIEW_NAME, _
                                      True, False, False, False, False
 
     CreateClampingPlateDxfFromAssemblyTopView = fso.FileExists(dxfPath)
@@ -7099,10 +7468,54 @@ On Error GoTo ErrHandler
 
     End If
 
+    Dim sheetWIn As Double
+    Dim sheetHIn As Double
+
+    sheetWIn = E_SHEET_WIDTH_IN
+    sheetHIn = E_SHEET_HEIGHT_IN
+
+    Dim baseExtraX As Double
+    Dim baseExtraY As Double
+
+    baseExtraX = 0#
+    baseExtraY = 0#
+
+    If IsMainBaseDxfQuote(quoteName) Then
+
+        baseExtraX = BASE_DXF_EXTRA_SIDE_GAP_IN
+        baseExtraY = BASE_DXF_EXTRA_TOP_BOTTOM_GAP_IN
+
+        If BASE_DXF_AUTO_EXPAND_SHEET_TO_FIT_1_TO_1 Then
+
+            Dim neededBaseW As Double
+            Dim neededBaseH As Double
+
+            neededBaseW = ((partL + (2# * partT) + _
+                           (2# * (DXF_PROJECTED_VIEW_GAP_IN + baseExtraX))) * scaleVal) + _
+                           (2# * DXF_MARGIN_IN)
+
+            neededBaseH = ((partW + (2# * partT) + _
+                           (2# * (DXF_PROJECTED_VIEW_GAP_IN + baseExtraY))) * scaleVal) + _
+                           (2# * DXF_MARGIN_IN)
+
+            If sheetWIn < neededBaseW Then sheetWIn = neededBaseW
+            If sheetHIn < neededBaseH Then sheetHIn = neededBaseH
+
+            If sheetWIn < BASE_DXF_MIN_SHEET_WIDTH_IN Then sheetWIn = BASE_DXF_MIN_SHEET_WIDTH_IN
+            If sheetHIn < BASE_DXF_MIN_SHEET_HEIGHT_IN Then sheetHIn = BASE_DXF_MIN_SHEET_HEIGHT_IN
+
+            LogLine "BASE DXF sheet expanded/spread to prevent overlap:"
+            LogLine "  sheet W/H=" & FormatNumberForCsv(sheetWIn) & "/" & FormatNumberForCsv(sheetHIn)
+            LogLine "  extra side/top gap=" & FormatNumberForCsv(baseExtraX) & "/" & FormatNumberForCsv(baseExtraY)
+
+        End If
+
+    End If
+
     Dim swDraw As Object
     Set swDraw = swApp.NewDocument(SW_DRAWING_TEMPLATE_PATH, 0, _
-                                   E_SHEET_WIDTH_IN / INCHES_PER_METER, _
-                                   E_SHEET_HEIGHT_IN / INCHES_PER_METER)
+                                   sheetWIn / INCHES_PER_METER, _
+                                   sheetHIn / INCHES_PER_METER)
 
     If swDraw Is Nothing Then
         LogLine "DXF skipped. Could not create drawing."
@@ -7115,7 +7528,7 @@ On Error GoTo ErrHandler
     swApp.ActivateDoc3 drawTitle, False, 0, errs
     EnsureSwHidden
 
-    SetupDrawingAsESize swDraw
+    SetupDrawingAsESize swDraw, sheetWIn, sheetHIn
 
     If FREEZE_DXF_DRAWING_GRAPHICS Then
         FreezeDxfDrawingGraphics swDraw
@@ -7125,14 +7538,14 @@ On Error GoTo ErrHandler
     Dim centerX As Double
     Dim centerY As Double
 
-    centerX = E_SHEET_WIDTH_IN / 2#
-    centerY = E_SHEET_HEIGHT_IN / 2#
+    centerX = sheetWIn / 2#
+    centerY = sheetHIn / 2#
 
     Dim projectedXOffset As Double
     Dim projectedYOffset As Double
 
-    projectedXOffset = ((partL / 2#) + DXF_PROJECTED_VIEW_GAP_IN + (partT / 2#)) * scaleVal
-    projectedYOffset = ((partW / 2#) + DXF_PROJECTED_VIEW_GAP_IN + (partT / 2#)) * scaleVal
+    projectedXOffset = ((partL / 2#) + DXF_PROJECTED_VIEW_GAP_IN + baseExtraX + (partT / 2#)) * scaleVal
+    projectedYOffset = ((partW / 2#) + DXF_PROJECTED_VIEW_GAP_IN + baseExtraY + (partT / 2#)) * scaleVal
 
     If IsHoldersDxfQuote(quoteName) Then
         projectedXOffset = projectedXOffset + (HOLDERS_SIDE_VIEW_EXTRA_GAP_IN * scaleVal)
@@ -7162,8 +7575,8 @@ On Error GoTo ErrHandler
     yBottom = centerY - projectedYOffset
 
     If xLeft < DXF_MARGIN_IN Then xLeft = DXF_MARGIN_IN
-    If xRight > E_SHEET_WIDTH_IN - DXF_MARGIN_IN Then xRight = E_SHEET_WIDTH_IN - DXF_MARGIN_IN
-    If yTop > E_SHEET_HEIGHT_IN - DXF_MARGIN_IN Then yTop = E_SHEET_HEIGHT_IN - DXF_MARGIN_IN
+    If xRight > sheetWIn - DXF_MARGIN_IN Then xRight = sheetWIn - DXF_MARGIN_IN
+    If yTop > sheetHIn - DXF_MARGIN_IN Then yTop = sheetHIn - DXF_MARGIN_IN
     If yBottom < DXF_MARGIN_IN Then yBottom = DXF_MARGIN_IN
 
     Dim parentView As Object
@@ -7187,6 +7600,42 @@ On Error GoTo ErrHandler
 
     parentPreProjectionAngleRad = 0#
     qKey = NormalizeKey(quoteName)
+
+    Select Case qKey
+
+        Case "TCP", _
+             "TOPSMED", _
+             "TOPSMEDPLATE", _
+             "TOPCLAMPING", _
+             "TOPCLAMPINGPLATE"
+
+            If Abs(TCP_DXF_CENTER_ROTATION_DEG) > 0.000001 Then
+                parentPreProjectionAngleRad = parentPreProjectionAngleRad + DegToRad(TCP_DXF_CENTER_ROTATION_DEG)
+
+                LogLine "TCP DXF: rotating center/base view " & _
+                        Format(TCP_DXF_CENTER_ROTATION_DEG, "0.00") & _
+                        " deg BEFORE projected views are created."
+            End If
+
+        Case "BCP", _
+             "BOTTOMSMED", _
+             "BOTSMED", _
+             "BOTTOMSMEDPLATE", _
+             "BOTSMEDPLATE", _
+             "BOTTOMCLAMPING", _
+             "BOTCLAMPING", _
+             "BOTTOMCLAMPINGPLATE", _
+             "BOTCLAMPINGPLATE"
+
+            If Abs(BCP_DXF_CENTER_ROTATION_DEG) > 0.000001 Then
+                parentPreProjectionAngleRad = parentPreProjectionAngleRad + DegToRad(BCP_DXF_CENTER_ROTATION_DEG)
+
+                LogLine "BCP DXF: rotating center/base view " & _
+                        Format(BCP_DXF_CENTER_ROTATION_DEG, "0.00") & _
+                        " deg BEFORE projected views are created."
+            End If
+
+    End Select
 
     If rotateJBlockParentBeforeProjection Then
         parentPreProjectionAngleRad = parentPreProjectionAngleRad + PI_VALUE
@@ -7305,7 +7754,7 @@ On Error GoTo ErrHandler
     Dim saveErrs As Long
     Dim saveWarns As Long
 
-    ForceAllDxfScales1To1 swDraw
+    ForceAllDxfScales1To1 swDraw, sheetWIn, sheetHIn
 
     LogLine "Saving DXF: " & dxfPath
     EnsureSwHidden
@@ -7848,27 +8297,37 @@ On Error Resume Next
     SetDrawingViewSolid viewRight
 End Sub
 
-Private Sub SetupDrawingAsESize(ByVal swDraw As Object)
+Private Sub SetupDrawingAsESize(ByVal swDraw As Object, _
+                                Optional ByVal sheetWIn As Double = 0#, _
+                                Optional ByVal sheetHIn As Double = 0#)
 On Error Resume Next
 
     If swDraw Is Nothing Then Exit Sub
+
+    If sheetWIn <= 0# Then sheetWIn = E_SHEET_WIDTH_IN
+    If sheetHIn <= 0# Then sheetHIn = E_SHEET_HEIGHT_IN
 
     Dim swSheet As Object
     Set swSheet = swDraw.GetCurrentSheet
 
     If Not swSheet Is Nothing Then
-        swSheet.SetSize 12, E_SHEET_WIDTH_IN / INCHES_PER_METER, E_SHEET_HEIGHT_IN / INCHES_PER_METER
+        swSheet.SetSize 12, sheetWIn / INCHES_PER_METER, sheetHIn / INCHES_PER_METER
     End If
 
-    ForceDrawingSheetScale1To1 swDraw
+    ForceDrawingSheetScale1To1 swDraw, sheetWIn, sheetHIn
 
     swDraw.GraphicsRedraw2
 End Sub
 
-Private Sub ForceDrawingSheetScale1To1(ByVal swDraw As Object)
+Private Sub ForceDrawingSheetScale1To1(ByVal swDraw As Object, _
+                                       Optional ByVal sheetWIn As Double = 0#, _
+                                       Optional ByVal sheetHIn As Double = 0#)
 On Error Resume Next
 
     If swDraw Is Nothing Then Exit Sub
+
+    If sheetWIn <= 0# Then sheetWIn = E_SHEET_WIDTH_IN
+    If sheetHIn <= 0# Then sheetHIn = E_SHEET_HEIGHT_IN
 
     Dim swSheet As Object
     Set swSheet = swDraw.GetCurrentSheet
@@ -7888,26 +8347,30 @@ On Error Resume Next
     sheetName = CStr(swSheet.GetName)
 
     If sheetName <> "" Then
+
         Err.Clear
         swDraw.SetupSheet5 sheetName, 12, 12, 1#, 1#, False, "", _
-                           E_SHEET_WIDTH_IN / INCHES_PER_METER, _
-                           E_SHEET_HEIGHT_IN / INCHES_PER_METER, "", False
+                           sheetWIn / INCHES_PER_METER, _
+                           sheetHIn / INCHES_PER_METER, "", False
         Err.Clear
 
         Err.Clear
         swDraw.SetupSheet4 sheetName, 12, 12, 1#, 1#, False, "", _
-                           E_SHEET_WIDTH_IN / INCHES_PER_METER, _
-                           E_SHEET_HEIGHT_IN / INCHES_PER_METER, ""
+                           sheetWIn / INCHES_PER_METER, _
+                           sheetHIn / INCHES_PER_METER, ""
         Err.Clear
+
     End If
 End Sub
 
-Private Sub ForceAllDxfScales1To1(ByVal swDraw As Object)
+Private Sub ForceAllDxfScales1To1(ByVal swDraw As Object, _
+                                  Optional ByVal sheetWIn As Double = 0#, _
+                                  Optional ByVal sheetHIn As Double = 0#)
 On Error Resume Next
 
     If swDraw Is Nothing Then Exit Sub
 
-    ForceDrawingSheetScale1To1 swDraw
+    ForceDrawingSheetScale1To1 swDraw, sheetWIn, sheetHIn
 
     Dim v As Object
     Set v = swDraw.GetFirstView
@@ -7919,7 +8382,7 @@ On Error Resume Next
         Set v = v.GetNextView
     Loop
 
-    ForceDrawingSheetScale1To1 swDraw
+    ForceDrawingSheetScale1To1 swDraw, sheetWIn, sheetHIn
 
     swDraw.ForceRebuild3 False
     swDraw.GraphicsRedraw2
