@@ -33,6 +33,20 @@ Option Explicit
 ' USER SETTINGS
 ' ============================================================
 Private Const ROOT_JOB_PATH As String = "C:\Users\lenovo\Desktop\000000005.May 2026"
+
+' --- Dynamic recent-month job search ---
+' Searches this parent folder for month folders such as:
+'   000000006.June 2026
+'   000000005.May 2026
+'   000000004.April 2026
+Private Const JOB_MONTH_PARENT_FOLDER As String = "C:\Users\lenovo\Downloads"
+
+' 2 means: current month + previous 2 months.
+Private Const PREVIOUS_MONTH_COUNT As Long = 2
+
+' If no matching month folders are found, search the parent folder directly.
+Private Const SEARCH_PARENT_IF_NO_MONTH_FOLDERS As Boolean = True
+
 Private Const EXTRACT_FOLDER_NAME As String = "_EXTRACTED_ZIP"
 Private Const LOCAL_WORKSPACE_ROOT As String = "C:\CMS_Local_Workspace"
 
@@ -367,7 +381,7 @@ On Error GoTo ErrHandler
     JobBaseName = ""
 
     LogStart "Find job folder"
-    NetworkJobFolder = FindJobFolderByText(ROOT_JOB_PATH, CurrentJobNumber)
+    NetworkJobFolder = FindJobFolderInRecentMonths(CurrentJobNumber)
     LogLine "Job folder result: " & NetworkJobFolder
     If NetworkJobFolder = "" Then
         LogErrorText "Could not find job folder for: " & CurrentJobNumber
@@ -880,6 +894,168 @@ End Sub
 ' ============================================================
 ' FIND JOB FOLDER (by C number)
 ' ============================================================
+Private Function FindJobFolderInRecentMonths(ByVal jobSearchText As String) As String
+On Error GoTo ErrHandler
+
+    FindJobFolderInRecentMonths = ""
+
+    Dim roots As Collection
+    Set roots = GetRecentMonthJobRoots()
+
+    Dim i As Long
+    Dim rootPath As String
+    Dim foundPath As String
+
+    LogLine "Recent-month job root count: " & roots.Count
+
+    For i = 1 To roots.Count
+        rootPath = CStr(roots(i))
+        LogLine "Searching month folder " & i & "/" & roots.Count & ": " & rootPath
+
+        foundPath = FindJobFolderByText(rootPath, jobSearchText)
+
+        If foundPath <> "" Then
+            FindJobFolderInRecentMonths = foundPath
+            LogLine "Found job in recent-month folder: " & foundPath
+            Exit Function
+        End If
+    Next i
+
+    ' Fallback to the old fixed ROOT_JOB_PATH, if it exists.
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    If ROOT_JOB_PATH <> "" Then
+        If fso.FolderExists(ROOT_JOB_PATH) Then
+            LogLine "Recent-month search did not find job. Trying ROOT_JOB_PATH fallback: " & ROOT_JOB_PATH
+
+            foundPath = FindJobFolderByText(ROOT_JOB_PATH, jobSearchText)
+
+            If foundPath <> "" Then
+                FindJobFolderInRecentMonths = foundPath
+                LogLine "Found job in ROOT_JOB_PATH fallback: " & foundPath
+                Exit Function
+            End If
+        End If
+    End If
+
+    LogLine "Job not found in current/previous month folders: " & jobSearchText
+    Exit Function
+
+ErrHandler:
+    LogLine "FindJobFolderInRecentMonths error: " & Err.Description
+    FindJobFolderInRecentMonths = ""
+End Function
+
+Private Function GetRecentMonthJobRoots() As Collection
+On Error GoTo ErrHandler
+
+    Dim result As New Collection
+    Dim dict As Object
+    Set dict = CreateObject("Scripting.Dictionary")
+
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    Dim parentPath As String
+    parentPath = JOB_MONTH_PARENT_FOLDER
+
+    If parentPath = "" Then parentPath = DOWNLOADS_FOLDER
+
+    If fso.FolderExists(parentPath) = False Then
+        LogLine "Recent-month parent folder does not exist: " & parentPath
+        Set GetRecentMonthJobRoots = result
+        Exit Function
+    End If
+
+    Dim i As Long
+    Dim d As Date
+    Dim monthLabel As String
+
+    ' i = 0 is current month.
+    ' i = 1 is previous month.
+    ' i = 2 is two months ago.
+    For i = 0 To PREVIOUS_MONTH_COUNT
+        d = DateAdd("m", -i, Date)
+        monthLabel = EnglishMonthYearLabel(d)
+
+        LogLine "Looking for month folder containing: " & monthLabel
+
+        AddMatchingMonthFolders fso.GetFolder(parentPath), monthLabel, result, dict, 0, 2
+    Next i
+
+    If result.Count = 0 And SEARCH_PARENT_IF_NO_MONTH_FOLDERS Then
+        LogLine "No recent month folders found. Adding parent folder directly: " & parentPath
+        AddUniqueFolder result, dict, parentPath
+    End If
+
+    Set GetRecentMonthJobRoots = result
+    Exit Function
+
+ErrHandler:
+    LogLine "GetRecentMonthJobRoots error: " & Err.Description
+    Set GetRecentMonthJobRoots = New Collection
+End Function
+
+Private Sub AddMatchingMonthFolders(ByVal folder As Object, _
+                                    ByVal monthLabel As String, _
+                                    ByRef result As Collection, _
+                                    ByRef dict As Object, _
+                                    ByVal depth As Long, _
+                                    ByVal maxDepth As Long)
+On Error Resume Next
+
+    If folder Is Nothing Then Exit Sub
+    If depth > maxDepth Then Exit Sub
+
+    Dim subFolder As Object
+    Dim folderNameUpper As String
+    Dim monthUpper As String
+
+    monthUpper = UCase$(monthLabel)
+
+    For Each subFolder In folder.SubFolders
+        folderNameUpper = UCase$(subFolder.Name)
+
+        ' Matches folders like:
+        '   000000005.May 2026
+        '   May 2026
+        '   Jobs - May 2026
+        If InStr(folderNameUpper, monthUpper) > 0 Then
+            AddUniqueFolder result, dict, subFolder.path
+        End If
+
+        If depth < maxDepth Then
+            AddMatchingMonthFolders subFolder, monthLabel, result, dict, depth + 1, maxDepth
+        End If
+    Next subFolder
+End Sub
+
+Private Sub AddUniqueFolder(ByRef result As Collection, ByRef dict As Object, ByVal folderPath As String)
+On Error Resume Next
+
+    If folderPath = "" Then Exit Sub
+
+    Dim key As String
+    key = LCase$(folderPath)
+
+    If dict.Exists(key) = False Then
+        dict.Add key, True
+        result.Add folderPath
+        LogLine "Added recent-month search folder: " & folderPath
+    End If
+End Sub
+
+Private Function EnglishMonthYearLabel(ByVal d As Date) As String
+    Dim monthNames As Variant
+
+    monthNames = Array("", _
+        "January", "February", "March", "April", "May", "June", _
+        "July", "August", "September", "October", "November", "December")
+
+    EnglishMonthYearLabel = CStr(monthNames(Month(d))) & " " & CStr(Year(d))
+End Function
+
 Private Function FindJobFolderByText(ByVal rootPath As String, ByVal searchText As String) As String
 On Error GoTo ErrHandler
     Dim fso As Object
@@ -2152,8 +2328,14 @@ On Error GoTo ErrHandler
     Dim vBodies As Variant
     vBodies = partModel.GetBodies2(swSolidBody, False)
     If IsEmpty(vBodies) Then Exit Sub
-    Dim i As Long, swBody As Object, vBox As Variant
-    Dim dx As Double, dy As Double, dz As Double, massV As Double
+
+    Dim i As Long
+    Dim swBody As Object
+    Dim vBox As Variant
+    Dim dx As Double, dy As Double, dz As Double
+    Dim cx As Double, cy As Double, cz As Double
+    Dim massV As Double
+
     For i = 0 To UBound(vBodies)
         Set swBody = vBodies(i)
         If Not swBody Is Nothing Then
@@ -2162,13 +2344,24 @@ On Error GoTo ErrHandler
                 dx = Abs(CDbl(vBox(3)) - CDbl(vBox(0))) * INCHES_PER_METER
                 dy = Abs(CDbl(vBox(4)) - CDbl(vBox(1))) * INCHES_PER_METER
                 dz = Abs(CDbl(vBox(5)) - CDbl(vBox(2))) * INCHES_PER_METER
+
+                cx = ((CDbl(vBox(0)) + CDbl(vBox(3))) / 2#) * INCHES_PER_METER
+                cy = ((CDbl(vBox(1)) + CDbl(vBox(4))) / 2#) * INCHES_PER_METER
+                cz = ((CDbl(vBox(2)) + CDbl(vBox(5))) / 2#) * INCHES_PER_METER
+
                 massV = GetBodyMassOrVolumeValue(swBody)
-                AddCadPart baseName & " [" & swBody.Name & "]", partModel.GetPathName, "", swBody.Name, _
-                           dx, dy, dz, massV, False, 0#, 0#, 0#, True
+
+                AddCadPart baseName & " [" & swBody.Name & "]", _
+                           partModel.GetPathName, "", swBody.Name, _
+                           dx, dy, dz, massV, _
+                           True, cx, cy, cz, _
+                           True
             End If
         End If
     Next i
+
     Exit Sub
+
 ErrHandler:
     LogLine "ScanPartBodies error: " & Err.Description
 End Sub
@@ -3695,90 +3888,487 @@ Private Function StdFullPlateName(ByVal pos As Long, ByVal nFull As Long) As Str
     End Select
 End Function
 
+Private Function StdPartLooksLikeEjectorSideCue(ByVal idx As Long) As Boolean
+    Dim s As String
+    s = StdCleanName(parts(idx).componentName)
+
+    If InStr(s, " EJECTOR ") > 0 Then StdPartLooksLikeEjectorSideCue = True: Exit Function
+    If InStr(s, " EJ ") > 0 Then StdPartLooksLikeEjectorSideCue = True: Exit Function
+    If InStr(s, " PIN PLATE ") > 0 Then StdPartLooksLikeEjectorSideCue = True: Exit Function
+    If InStr(s, " PIN PLT ") > 0 Then StdPartLooksLikeEjectorSideCue = True: Exit Function
+    If InStr(s, " EJECTOR RETAINER ") > 0 Then StdPartLooksLikeEjectorSideCue = True: Exit Function
+    If InStr(s, " KNOCKOUT ") > 0 Then StdPartLooksLikeEjectorSideCue = True: Exit Function
+    If InStr(s, " KO ") > 0 Then StdPartLooksLikeEjectorSideCue = True: Exit Function
+    If InStr(s, " RAIL ") > 0 Then StdPartLooksLikeEjectorSideCue = True: Exit Function
+    If InStr(s, " RAILS ") > 0 Then StdPartLooksLikeEjectorSideCue = True: Exit Function
+    If InStr(s, " RISER ") > 0 Then StdPartLooksLikeEjectorSideCue = True: Exit Function
+    If InStr(s, " RISERS ") > 0 Then StdPartLooksLikeEjectorSideCue = True: Exit Function
+    If InStr(s, " SPACER ") > 0 Then StdPartLooksLikeEjectorSideCue = True: Exit Function
+    If InStr(s, " SUPPORT PLATE ") > 0 Then StdPartLooksLikeEjectorSideCue = True: Exit Function
+    If InStr(s, " SUPPORT PLT ") > 0 Then StdPartLooksLikeEjectorSideCue = True: Exit Function
+    If InStr(s, " BOTTOM CLAMP ") > 0 Then StdPartLooksLikeEjectorSideCue = True: Exit Function
+    If InStr(s, " BOT CLAMP ") > 0 Then StdPartLooksLikeEjectorSideCue = True: Exit Function
+    If InStr(s, " BCP ") > 0 Then StdPartLooksLikeEjectorSideCue = True: Exit Function
+    If InStr(s, " CORE ") > 0 Then StdPartLooksLikeEjectorSideCue = True: Exit Function
+    If InStr(s, " MOVABLE ") > 0 Then StdPartLooksLikeEjectorSideCue = True: Exit Function
+    If InStr(s, " MOVEABLE ") > 0 Then StdPartLooksLikeEjectorSideCue = True: Exit Function
+End Function
+
+Private Function StdPartLooksLikeInjectionSideCue(ByVal idx As Long) As Boolean
+    Dim s As String
+    s = StdCleanName(parts(idx).componentName)
+
+    If InStr(s, " TOP CLAMP ") > 0 Then StdPartLooksLikeInjectionSideCue = True: Exit Function
+    If InStr(s, " TCP ") > 0 Then StdPartLooksLikeInjectionSideCue = True: Exit Function
+    If InStr(s, " MANIFOLD ") > 0 Then StdPartLooksLikeInjectionSideCue = True: Exit Function
+    If InStr(s, " HOT RUNNER ") > 0 Then StdPartLooksLikeInjectionSideCue = True: Exit Function
+    If InStr(s, " SPRUE ") > 0 Then StdPartLooksLikeInjectionSideCue = True: Exit Function
+    If InStr(s, " LOCATING RING ") > 0 Then StdPartLooksLikeInjectionSideCue = True: Exit Function
+    If InStr(s, " LOCATION RING ") > 0 Then StdPartLooksLikeInjectionSideCue = True: Exit Function
+    If InStr(s, " NOZZLE ") > 0 Then StdPartLooksLikeInjectionSideCue = True: Exit Function
+    If InStr(s, " CAVITY ") > 0 Then StdPartLooksLikeInjectionSideCue = True: Exit Function
+    If InStr(s, " STATIONARY ") > 0 Then StdPartLooksLikeInjectionSideCue = True: Exit Function
+    If InStr(s, " FIXED ") > 0 Then StdPartLooksLikeInjectionSideCue = True: Exit Function
+End Function
+
+Private Function StdMeanCenterForList(ByRef idx() As Long, ByVal n As Long, ByVal axis As Integer) As Double
+    Dim i As Long
+    Dim s As Double
+
+    If n < 1 Then Exit Function
+
+    For i = 1 To n
+        s = s + PartAxisCenter(idx(i), axis)
+    Next i
+
+    StdMeanCenterForList = s / n
+End Function
+
+Private Function StdNameIsSupportLike(ByVal nm As String) As Boolean
+    Dim s As String
+    s = StdCleanName(nm)
+
+    If InStr(s, " SUPPORT ") > 0 Then StdNameIsSupportLike = True: Exit Function
+    If InStr(s, " SUP PLT ") > 0 Then StdNameIsSupportLike = True: Exit Function
+    If InStr(s, " SUPPORT PLT ") > 0 Then StdNameIsSupportLike = True: Exit Function
+    If InStr(s, " SUPPORT PLATE ") > 0 Then StdNameIsSupportLike = True: Exit Function
+End Function
+
+Private Function StdDefaultInjectionExtraName(ByVal partIdx As Long, ByVal ordinal As Long) As String
+    Dim s As String
+    s = StdCleanName(parts(partIdx).componentName)
+
+    If InStr(s, " MANIFOLD ") > 0 Or InStr(s, " HOT RUNNER ") > 0 Then
+        StdDefaultInjectionExtraName = "Manifold Plate"
+        Exit Function
+    End If
+
+    If InStr(s, " RUNNER STRIPPER ") > 0 Then
+        StdDefaultInjectionExtraName = "Runner Stripper Plate"
+        Exit Function
+    End If
+
+    If InStr(s, " STRIPPER ") > 0 Then
+        StdDefaultInjectionExtraName = "Stripper Plate"
+        Exit Function
+    End If
+
+    If ordinal = 1 Then
+        StdDefaultInjectionExtraName = """X"" Plate"
+    ElseIf ordinal = 2 Then
+        StdDefaultInjectionExtraName = """Y"" Plate"
+    Else
+        StdDefaultInjectionExtraName = "Extra Plate " & ordinal
+    End If
+End Function
+
+Private Sub AssignStdGeometryNamesFromPartingLine(ByRef fullIdx() As Long, _
+                                                  ByVal nFull As Long, _
+                                                  ByRef outName() As String, _
+                                                  ByVal hasFunctionalAnchor As Boolean, _
+                                                  ByVal sideReason As String)
+On Error GoTo ErrHandler
+
+    Dim i As Long
+    Dim nm As String
+
+    If nFull < 1 Then Exit Sub
+
+    ' 1) First use any direct CAD component names.
+    For i = 1 To nFull
+        nm = StandardPlateNameStd(parts(fullIdx(i)).componentName)
+        If nm <> "" Then outName(i) = nm
+    Next i
+
+    ' 2) If there is no ejector/injection-side anchor, use the old position
+    '    fallback but log that this is low confidence.
+    If Not hasFunctionalAnchor Then
+        For i = 1 To nFull
+            If outName(i) = "" Then outName(i) = StdFullPlateName(i, nFull)
+        Next i
+
+        LogLine "NO-BOM geometry naming: LOW confidence. Reason: " & sideReason & _
+                ". Used stack-order fallback."
+        Exit Sub
+    End If
+
+    ' At this point fullIdx is sorted injection side -> ejector side.
+    ' Therefore:
+    '   first full plate = top/injection clamp side
+    '   last full plate  = bottom/ejector clamp side
+
+    If outName(1) = "" Then outName(1) = "Top Clamp Plate"
+
+    If nFull >= 2 Then
+        If outName(nFull) = "" Then outName(nFull) = "Bottom Clamp Plate"
+    End If
+
+    If nFull = 1 Then Exit Sub
+
+    If nFull = 2 Then
+        LogLine "NO-BOM geometry naming: only 2 full plates found. A/B plates cannot be separated."
+        Exit Sub
+    End If
+
+    If nFull = 3 Then
+        If outName(2) = "" Then outName(2) = """A"" Plate"
+        LogLine "NO-BOM geometry naming: only 3 full plates found. Named middle as A Plate; B Plate may be missing/combined."
+        Exit Sub
+    End If
+
+    Dim aPos As Long
+    Dim bPos As Long
+    Dim supportStart As Long
+    Dim p As Long
+    Dim extraOrd As Long
+
+    If nFull = 4 Then
+        ' Common simple stack:
+        ' Top Clamp / A / B / Bottom Clamp
+        aPos = 2
+        bPos = 3
+    Else
+        ' Common ejector-side stack:
+        ' Top Clamp / optional X-Manifold-Stripper / A / B / Support / Bottom Clamp
+        '
+        ' Because this is no-BOM, the safest parting-line rule is:
+        '   Support Plate = full plate directly before Bottom Clamp
+        '   B Plate       = full plate directly before Support
+        '   A Plate       = full plate directly before B
+        supportStart = nFull - 1
+
+        ' If CAD already identified the plate before that as Support, keep both as support.
+        ' Example:
+        ' Top / A / B / Support / Support / Bottom
+        If nFull >= 6 Then
+            If StdNameIsSupportLike(outName(nFull - 2)) Then supportStart = nFull - 2
+        End If
+
+        If supportStart < 4 Then supportStart = 4
+
+        For p = supportStart To nFull - 1
+            If outName(p) = "" Then outName(p) = "Support Plate"
+        Next p
+
+        bPos = supportStart - 1
+        aPos = bPos - 1
+    End If
+
+    If aPos >= 2 And aPos <= nFull - 1 Then
+        If outName(aPos) = "" Then outName(aPos) = """A"" Plate"
+    End If
+
+    If bPos >= 2 And bPos <= nFull - 1 Then
+        If outName(bPos) = "" Then outName(bPos) = """B"" Plate"
+    End If
+
+    ' Any unnamed full plates between Top Clamp and A Plate become injection-side extras:
+    ' X Plate, Y Plate, Manifold if name suggests it, etc.
+    extraOrd = 1
+    For p = 2 To aPos - 1
+        If outName(p) = "" Then
+            outName(p) = StdDefaultInjectionExtraName(fullIdx(p), extraOrd)
+            extraOrd = extraOrd + 1
+        End If
+    Next p
+
+    ' Any unnamed full plates between B Plate and Bottom Clamp become support-side extras.
+    For p = bPos + 1 To nFull - 1
+        If outName(p) = "" Then outName(p) = "Support Plate"
+    Next p
+
+    LogLine "NO-BOM geometry naming: " & sideReason & ". Named plates from injection side to ejector side."
+
+    Exit Sub
+
+ErrHandler:
+    LogLine "AssignStdGeometryNamesFromPartingLine error: " & Err.Description
+End Sub
+
 Private Sub BuildStdFromGeometry()
+On Error GoTo ErrHandler
+
     If PartCount < 1 Then Exit Sub
 
-    ' Base footprint and base W/L from the largest-footprint part.
-    Dim i As Long, fp As Double, baseFoot As Double, baseW As Double, baseL As Double
-    baseFoot = 0: baseW = 0: baseL = 0
+    Dim i As Long
+    Dim fp As Double
+    Dim baseFoot As Double
+    Dim baseW As Double
+    Dim baseL As Double
+
+    baseFoot = 0
+    baseW = 0
+    baseL = 0
+
+    ' Largest footprint becomes the base footprint reference.
     For i = 1 To PartCount
         fp = parts(i).Width * parts(i).Length
-        If fp > baseFoot Then baseFoot = fp: baseW = parts(i).Width: baseL = parts(i).Length
+        If fp > baseFoot Then
+            baseFoot = fp
+            baseW = parts(i).Width
+            baseL = parts(i).Length
+        End If
     Next i
+
     If baseFoot <= 0 Then Exit Sub
 
-    Dim fullIdx(1 To 60) As Long, nFull As Long
-    Dim railIdx(1 To 60) As Long, nRail As Long
-    Dim ejIdx(1 To 60) As Long, nEj As Long
-    nFull = 0: nRail = 0: nEj = 0
-    Dim t As Double, w As Double, l As Double
+    Dim fullIdx() As Long
+    Dim railIdx() As Long
+    Dim ejIdx() As Long
+    Dim cueEjIdx() As Long
+    Dim cueInjIdx() As Long
+
+    ReDim fullIdx(1 To PartCount)
+    ReDim railIdx(1 To PartCount)
+    ReDim ejIdx(1 To PartCount)
+    ReDim cueEjIdx(1 To PartCount)
+    ReDim cueInjIdx(1 To PartCount)
+
+    Dim nFull As Long
+    Dim nRail As Long
+    Dim nEj As Long
+    Dim nCueEj As Long
+    Dim nCueInj As Long
+
+    Dim t As Double
+    Dim w As Double
+    Dim l As Double
+
+    nFull = 0
+    nRail = 0
+    nEj = 0
+    nCueEj = 0
+    nCueInj = 0
+
+    ' Classify geometry:
+    '   fullIdx = full-footprint mold plates
+    '   railIdx = long/narrow rail blocks
+    '   ejIdx = medium/larger ejector-pack plates
     For i = 1 To PartCount
-        t = parts(i).Thickness: w = parts(i).Width: l = parts(i).Length
+        t = parts(i).Thickness
+        w = parts(i).Width
+        l = parts(i).Length
+        fp = w * l
+
+        If StdPartLooksLikeEjectorSideCue(i) Then
+            nCueEj = nCueEj + 1
+            cueEjIdx(nCueEj) = i
+        End If
+
+        If StdPartLooksLikeInjectionSideCue(i) Then
+            nCueInj = nCueInj + 1
+            cueInjIdx(nCueInj) = i
+        End If
+
         If t >= STD_MIN_PLATE_THICKNESS Then
-            fp = w * l
             If fp >= (1 - STD_FOOTPRINT_TOL) * baseFoot Then
-                nFull = nFull + 1: fullIdx(nFull) = i
-            ElseIf (l >= STD_RAIL_MIN_LENGTH_FRAC * baseL) And (w <= STD_RAIL_MAX_WIDTH_FRAC * baseW) And (t >= STD_RAIL_MIN_THICK) Then
-                nRail = nRail + 1: railIdx(nRail) = i
+                nFull = nFull + 1
+                fullIdx(nFull) = i
+
+            ElseIf (l >= STD_RAIL_MIN_LENGTH_FRAC * baseL) And _
+                   (w <= STD_RAIL_MAX_WIDTH_FRAC * baseW) And _
+                   (t >= STD_RAIL_MIN_THICK) Then
+                nRail = nRail + 1
+                railIdx(nRail) = i
+
             ElseIf fp >= STD_EJECTOR_MIN_FOOT_FRAC * baseFoot Then
-                nEj = nEj + 1: ejIdx(nEj) = i
+                nEj = nEj + 1
+                ejIdx(nEj) = i
             End If
         End If
     Next i
+
     If nFull < 1 Then Exit Sub
 
-    ' Stack axis = axis with greatest center spread among full plates.
-    Dim ax As Integer, bestRange As Double, a As Integer, mn As Double, mx As Double, v As Double
-    bestRange = -1: ax = 3
+    ' Determine the stack axis from the full plates.
+    Dim ax As Integer
+    Dim bestRange As Double
+    Dim a As Integer
+    Dim mn As Double
+    Dim mx As Double
+    Dim v As Double
+
+    ax = 3
+    bestRange = -1
+
     For a = 1 To 3
-        mn = 1E+30: mx = -1E+30
+        mn = 1E+30
+        mx = -1E+30
+
         For i = 1 To nFull
             v = PartAxisCenter(fullIdx(i), a)
             If v < mn Then mn = v
             If v > mx Then mx = v
         Next i
-        If (mx - mn) > bestRange Then bestRange = (mx - mn): ax = a
+
+        If (mx - mn) > bestRange Then
+            bestRange = (mx - mn)
+            ax = a
+        End If
     Next a
 
+    ' Sort full plates by stack coordinate descending.
     StdSortByAxisDesc fullIdx, nFull, ax
 
-    ' Direction: the end nearer the ejector plates is the bottom.
-    Dim topIsFirst As Boolean
-    topIsFirst = True
-    If nEj > 0 Then
-        Dim ejMean As Double
-        ejMean = 0
-        For i = 1 To nEj: ejMean = ejMean + PartAxisCenter(ejIdx(i), ax): Next i
-        ejMean = ejMean / nEj
-        If Abs(PartAxisCenter(fullIdx(1), ax) - ejMean) < Abs(PartAxisCenter(fullIdx(nFull), ax) - ejMean) Then topIsFirst = False
-    End If
-    If Not topIsFirst Then StdReverse fullIdx, nFull
+    Dim firstC As Double
+    Dim lastC As Double
+    Dim anchorMean As Double
+    Dim reverseNeeded As Boolean
+    Dim hasFunctionalAnchor As Boolean
+    Dim sideReason As String
 
-    ' Name full plates top -> bottom.
+    reverseNeeded = False
+    hasFunctionalAnchor = False
+    sideReason = "no functional side anchor"
+
+    firstC = PartAxisCenter(fullIdx(1), ax)
+    lastC = PartAxisCenter(fullIdx(nFull), ax)
+
+    If bestRange < 0.001 Then
+        sideReason = "no usable stack-center spread"
+        hasFunctionalAnchor = False
+
+    ElseIf (nRail + nEj) > 0 Then
+        ' Rails/ejector-pack geometry is the strongest no-BOM B-side clue.
+        Dim railMean As Double
+        Dim ejMean As Double
+        Dim totalN As Long
+
+        anchorMean = 0
+        totalN = 0
+
+        If nRail > 0 Then
+            railMean = StdMeanCenterForList(railIdx, nRail, ax)
+            anchorMean = anchorMean + railMean * nRail
+            totalN = totalN + nRail
+        End If
+
+        If nEj > 0 Then
+            ejMean = StdMeanCenterForList(ejIdx, nEj, ax)
+            anchorMean = anchorMean + ejMean * nEj
+            totalN = totalN + nEj
+        End If
+
+        If totalN > 0 Then anchorMean = anchorMean / totalN
+
+        ' If the ejector pack is closer to the first end, then first end is B-side.
+        ' Reverse so fullIdx becomes injection side -> ejector side.
+        If Abs(anchorMean - firstC) < Abs(anchorMean - lastC) Then reverseNeeded = True
+
+        hasFunctionalAnchor = True
+        sideReason = "ejector side found from rails/ejector-pack geometry"
+
+    ElseIf nCueEj > 0 Then
+        ' CAD names like EJECTOR, RAIL, KO, BOTTOM CLAMP, CORE, etc.
+        anchorMean = StdMeanCenterForList(cueEjIdx, nCueEj, ax)
+
+        If Abs(anchorMean - firstC) < Abs(anchorMean - lastC) Then reverseNeeded = True
+
+        hasFunctionalAnchor = True
+        sideReason = "ejector side found from CAD name cues"
+
+    ElseIf nCueInj > 0 Then
+        ' CAD names like TOP CLAMP, SPRUE, MANIFOLD, CAVITY, STATIONARY, etc.
+        anchorMean = StdMeanCenterForList(cueInjIdx, nCueInj, ax)
+
+        ' If injection cue is closer to last end, reverse so injection side becomes first.
+        If Abs(anchorMean - lastC) < Abs(anchorMean - firstC) Then reverseNeeded = True
+
+        hasFunctionalAnchor = True
+        sideReason = "injection side found from CAD name cues"
+    End If
+
+    If reverseNeeded Then StdReverse fullIdx, nFull
+
+    ' Name the full plates based on the parting-line/ejector-side logic.
+    Dim plateName() As String
+    ReDim plateName(1 To nFull)
+
+    AssignStdGeometryNamesFromPartingLine fullIdx, nFull, plateName, hasFunctionalAnchor, sideReason
+
     For i = 1 To nFull
-        AddStdPlateFromCad fullIdx(i), StdFullPlateName(i, nFull)
+        If Trim(plateName(i)) <> "" Then
+            AddStdPlateFromCad fullIdx(i), plateName(i)
+            LogLine "NO-BOM full plate " & i & " -> " & plateName(i) & _
+                    "  CAD=" & parts(fullIdx(i)).componentName & _
+                    "  T=" & FormatNumberForCsv(parts(fullIdx(i)).Thickness) & _
+                    " W=" & FormatNumberForCsv(parts(fullIdx(i)).Width) & _
+                    " L=" & FormatNumberForCsv(parts(fullIdx(i)).Length)
+        Else
+            LogLine "NO-BOM full plate " & i & " unnamed: " & parts(fullIdx(i)).componentName
+        End If
     Next i
 
-    ' Rails (one line, qty = number of rail blocks).
+    ' Rails: one quote/sheet line with qty = rail count.
     If nRail > 0 Then
-        AddStdPlate "Rails", parts(railIdx(1)).Thickness, parts(railIdx(1)).Width, parts(railIdx(1)).Length, nRail
+        AddStdPlate "Rails", _
+                    parts(railIdx(1)).Thickness, _
+                    parts(railIdx(1)).Width, _
+                    parts(railIdx(1)).Length, _
+                    nRail
+        LogLine "NO-BOM rails -> qty " & nRail & _
+                " T=" & FormatNumberForCsv(parts(railIdx(1)).Thickness) & _
+                " W=" & FormatNumberForCsv(parts(railIdx(1)).Width) & _
+                " L=" & FormatNumberForCsv(parts(railIdx(1)).Length)
     End If
 
-    ' Ejector plates: top one = Pin Plate (retainer), next = Ejector Plate.
+    ' Ejector-pack plates: order them from injection side toward ejector side.
     If nEj > 0 Then
         StdSortByAxisDesc ejIdx, nEj, ax
-        If Not topIsFirst Then StdReverse ejIdx, nEj
+
+        Dim injC As Double
+        injC = PartAxisCenter(fullIdx(1), ax)
+
+        If nEj > 1 Then
+            If Abs(PartAxisCenter(ejIdx(1), ax) - injC) > _
+               Abs(PartAxisCenter(ejIdx(nEj), ax) - injC) Then
+                StdReverse ejIdx, nEj
+            End If
+        End If
+
         Dim j As Long
         For j = 1 To nEj
             If j = 1 Then
                 AddStdPlateFromCad ejIdx(j), "Pin Plate"
+                LogLine "NO-BOM ejector pack " & j & " -> Pin Plate  CAD=" & parts(ejIdx(j)).componentName
             Else
                 AddStdPlateFromCad ejIdx(j), "Ejector Plate"
+                LogLine "NO-BOM ejector pack " & j & " -> Ejector Plate  CAD=" & parts(ejIdx(j)).componentName
             End If
         Next j
     End If
 
-    LogLine "Standard base (geometry): full=" & nFull & " rails=" & nRail & " ejector=" & nEj & " (stack axis " & ax & ")"
+    LogLine "Standard base NO-BOM geometry: full=" & nFull & _
+            " rails=" & nRail & _
+            " ejectorPack=" & nEj & _
+            " stackAxis=" & ax & _
+            " centerRange=" & FormatNumberForCsv(bestRange) & _
+            " anchor=" & sideReason
+
+    Exit Sub
+
+ErrHandler:
+    LogLine "BuildStdFromGeometry error: " & Err.Description
 End Sub
 
 Private Function StdSteelTypeFor(ByVal grade As String) As String
