@@ -1,0 +1,10 @@
+CNum=C18617
+QuoteNum=C-18617
+CustJob=858800004
+SimilarTo=
+ShipDate=
+RootPath=\\Mycloudex2ultra\mexico\Cameron's stuff\RON'S QUOTES\000000007.July 2026
+JobFolder=BMS-858800004-C18617
+CustomerPrefix=
+CustomerName=
+AttachDir=\\Mycloudex2ultra\mexico\Downloads\000000007. July-2026\BMS-858800004-C18617

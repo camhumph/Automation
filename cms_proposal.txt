@@ -1,0 +1,9 @@
+To=cms1engineering@gmail.com
+CustomerPrefix=
+CustomerName=
+CustJob=858800004
+CNum=C-18617
+Items=Leader Pin (140), Ejector Bushing (108), Internal 109 (503), Snap Ring (520), Sleeve Bearing, Safety Strap (110)
+Total=180.260
+Sent=0
+GatedBy=PROPOSAL_EMAIL_MODE:OFF

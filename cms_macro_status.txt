@@ -1,0 +1,6 @@
+Status=DONE
+Message=Batch completed successfully: 1 job(s)
+Time=2026-07-15 16:05:44
+CurrentJobNumber=C18617
+CurrentJobFolder=C:\CMS_Local_Workspace\C18617
+RunLogPath=C:\CMS_Local_Workspace\C18617\CMS_Base_Export_Log.txt

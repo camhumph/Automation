@@ -1,0 +1,11 @@
+Found=1
+Subject=BMS-858800004-C18617
+CustJob=858800004
+CNum=C18617
+SimilarTo=
+ShipDate=
+Attachments=0
+AttachDir=\\Mycloudex2ultra\mexico\Downloads\000000007. July-2026\BMS-858800004-C18617
+LocalJobFolder=
+CadPath=\\Mycloudex2ultra\mexico\Downloads\000000007. July-2026\BMS-858800004-C18617\HTE 858800004_mold base_RFQ 071326.stp
+Error=
